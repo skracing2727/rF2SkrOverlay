@@ -61,6 +61,7 @@
 </header>
 
 <nav>
+  <a href="#why">Why in-game</a>
   <a href="#install">Install</a>
   <a href="#controls">Controls</a>
   <a href="#radar">Radar</a>
@@ -85,6 +86,24 @@ map, an FFB frequency graph and a few audio cues. It learns from your own drivin
 shift points, best laps) and saves it per car and track.</p>
 <p>Every panel can be shown or hidden and moved or resized in game, and the layout is remembered separately for each
 car. The pictures below are drawn diagrams to show the layout and colours; they are not screenshots.</p>
+
+<!-- ============================================================ -->
+<h2 id="why">Why it draws inside the game</h2>
+<p>Most sim-racing overlays (SimHub dashboards, Discord, MSI Afterburner's on-screen display and many HUD apps) are a
+separate, transparent window laid on top of the game. That costs more than it looks.</p>
+<p>Windows can deliver a game's frames to the screen in two ways. With <strong>Independent Flip</strong>, each finished
+frame goes straight to the display, and a G-Sync/FreeSync monitor can refresh the moment a frame is ready. With
+<strong>Composed Flip</strong>, every frame first goes through the Windows desktop compositor (DWM) so it can be
+layered with whatever else is on screen. As soon as another window sits over the game, even a fully transparent,
+click-through one that draws nothing, Windows has to use Composed Flip for every frame for as long as that window is
+there. That adds latency and takes the direct hand-off away from variable refresh, which is why transparent overlays
+get blamed for stutter and input lag.</p>
+<p>rF2SkrOverlayPublic doesn't use a window at all. It hooks rFactor 2's own DirectX 11 output and draws the HUD
+into each frame just before the game hands it to Windows, so the game keeps the direct path. It still does a small
+amount of drawing work every frame; the <a href="#perf">frame-time stats</a> panel shows what your frames cost.</p>
+<p><strong>Tip:</strong> cap your frame rate a few FPS below your monitor's refresh rate (rFactor 2's own limiter or
+RTSS). Frames above the refresh rate are never shown, cause tearing, and push a G-Sync/FreeSync monitor out of its
+variable-refresh range.</p>
 
 <!-- ============================================================ -->
 <h2 id="install">Installing</h2>

@@ -20,6 +20,17 @@ layout is remembered for each car. Works on Linux/Proton too, with a built-in fo
 *Both pictures are drawn by the real plugin from simulated race data. A short video of resizing a panel is
 attached to each release.*
 
+## Why it exists
+
+Most overlays (SimHub dashboards, Discord, Afterburner's OSD, many HUD apps) are a separate transparent window on
+top of the game. Any window over the game, even an invisible click-through one, forces Windows to send every frame
+through the desktop compositor (*Composed Flip*) instead of straight to the display (*Independent Flip*). That
+adds latency and takes the direct hand-off away from G-Sync/FreeSync, which is why transparent overlays get blamed
+for stutter and input lag.
+
+rF2SkrOverlay has no window. It hooks rFactor 2's own DirectX 11 output and draws the HUD into each frame before the
+game hands it to Windows, so the game keeps the direct path to your monitor. The guide explains this in more detail.
+
 ## Download and install
 
 Get the latest zip from [Releases](../../releases), then drop `rF2SkrOverlayPublic.dll` into
