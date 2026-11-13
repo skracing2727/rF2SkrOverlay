@@ -1,0 +1,5 @@
+// DejaVu Sans Mono (Bitstream Vera licence, see FONT-LICENSE.html), built
+// into the DLL so text works on systems without Consolas.
+#include "FontResources.h"
+IDR_FONT_DEJAVU_MONO      RCDATA "fonts\\DejaVuSansMono.ttf"
+IDR_FONT_DEJAVU_MONO_BOLD RCDATA "fonts\\DejaVuSansMono-Bold.ttf"
