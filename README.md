@@ -2,6 +2,8 @@
 
 A free in-car HUD for rFactor 2, drawn straight into the game: no extra windows, nothing to alt-tab to.
 
+![Every panel of the HUD switched on](docs/hud.png)
+
 - Radar with side proximity bars
 - Gear, speed and shift light, with ABS/TC and tyre lockup indicators
 - Pedal trace
@@ -12,6 +14,11 @@ A free in-car HUD for rFactor 2, drawn straight into the game: no extra windows,
 
 Every panel can be dragged, resized and switched on or off in game (Ctrl+Shift+2 for layout mode), and the
 layout is remembered for each car. Works on Linux/Proton too, with a built-in font.
+
+![Layout mode: drag a panel to move it, drag its corner square to resize it](docs/layout_mode.png)
+
+*Both pictures are drawn by the real plugin from simulated race data. A short video of resizing a panel is
+attached to each release.*
 
 ## Download and install
 
