@@ -262,6 +262,11 @@ void FuelStore::OnTelemetry(const TelemInfoV01& info)
     {
         m_key = key;
         LoadFuelStats(vehKey, info.mTrackName);
+        {
+            char dir[MAX_PATH];
+            GetFuelStatsDir(dir, sizeof(dir));
+            sprintf_s(m_state.profilePath, "%s\\%s_profile.txt", dir, m_key.c_str());
+        }
         m_lastLapNumber = info.mLapNumber;
         m_haveLapStartFuel = true;
         m_fuelAtLapStart = info.mFuel;
@@ -334,6 +339,9 @@ void FuelStore::OnTelemetry(const TelemInfoV01& info)
     m_state.valid = true;
     m_state.fuelLoad = info.mFuel;
     m_state.fuelPerLap = m_learnedFuelPerLap;
+    m_state.fuelAtLapStart = m_fuelAtLapStart;
+    m_state.lastLapTimeSeconds = m_lastLapTimeSeconds;
+    m_state.telemLapNumber = info.mLapNumber;
     m_state.timeLeftSeconds = (m_hasLearnedValue && m_learnedFuelPerLap > 0.01 && m_lastLapTimeSeconds > 0.0)
         ? (info.mFuel / m_learnedFuelPerLap) * m_lastLapTimeSeconds
         : -1.0;
@@ -463,6 +471,7 @@ void FuelStore::OnScoring(const ScoringInfoV01& info)
         m_inStint = true;
     }
     m_wasInPits = inPits;
+    m_state.inPits = inPits;
 
     if (m_stintStartLaps < 0)
         m_stintStartLaps = player->mTotalLaps;   // first sample of the session

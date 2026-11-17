@@ -42,6 +42,7 @@ namespace
         { "Delta-speed strip",     "ShowMiniSector",     'M', false, false },
         { "Relative timing",       "ShowRelativeTiming", 'T', true,  false },
         { "Fuel + tyres",          "ShowFuelTyre",       'U', true,  false },
+        { "Brake cue + beep",      "ShowBrakeCue",       'B', false, false },
 
         { "DRS sign + beep",       "ShowDrs",            'D', true,  false },
         { "Clock",                 "ShowClock",          'C', true,  false },
@@ -84,6 +85,7 @@ namespace
     bool g_mapSectorsDragging = false; // the track map mini-sector count slider
     bool g_coverGreyDragging = false;   // the cover box shade slider
     bool g_coverAlphaDragging = false;  // the cover box opacity slider
+    bool g_beepDropDragging = false;    // the brake beep minimum speed drop slider
     float g_listScrollGrabPx = 0.0f; // cursor offset from the thumb's top while dragging
     // Wheel buttons that step the track map colour mode. Read through winmm's joystick API, which sees buttons 1-32 of
     // every game controller. joyGetPosEx is slow (a fraction of a ms per
@@ -251,6 +253,7 @@ namespace
         g_entries[Shortcuts::MiniSector].key = cfg.miniSector;
         g_entries[Shortcuts::RelativeTiming].key = cfg.relativeTiming;
         g_entries[Shortcuts::FuelTyre].key = cfg.fuelTyre;
+        g_entries[Shortcuts::BrakeCue].key = cfg.brakeCue;
 
         g_entries[Shortcuts::Drs].key = cfg.drs;
         g_entries[Shortcuts::Clock].key = cfg.clock;
@@ -281,6 +284,7 @@ namespace
             g_entries[Shortcuts::MiniSector].visible = cfg.showMiniSector;
             g_entries[Shortcuts::RelativeTiming].visible = cfg.showRelativeTiming;
             g_entries[Shortcuts::FuelTyre].visible = cfg.showFuelTyre;
+            g_entries[Shortcuts::BrakeCue].visible = cfg.showBrakeCue;
 
             g_entries[Shortcuts::Drs].visible = cfg.showDrs;
             g_entries[Shortcuts::Clock].visible = cfg.showClock;
@@ -781,6 +785,14 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
             }
         }
 
+        const int beepDropLabelRow = n;
+        char beepDropLabel[64];
+        if (g_brakeCueConfig.minSpeedDropKmh < 0.5f)
+            strcpy_s(beepDropLabel, "Brake beep: every braking point");
+        else
+            sprintf_s(beepDropLabel, "Brake beep: only stops losing %.0f+ km/h", g_brakeCueConfig.minSpeedDropKmh);
+        addInfo(beepDropLabel);
+
         // Cover boxes: how many (each placed and sized in layout mode), and
         // their one shared shade.
         int coverGreyRow = -1;
@@ -849,7 +861,7 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
         {
             rowStep[i] = rowIsInfo[i] ? infoLineStep : lineStep;
             if (i == carsSliderLabelRow || i == mapRotLabelRow || i == mapSectorsLabelRow
-                || i == coverGreyRow || i == coverAlphaRow)
+                || i == coverGreyRow || i == coverAlphaRow || i == beepDropLabelRow)
                 rowStep[i] += carsSliderBarExtraPx;
             rowY[i] = cumulativeY;
             cumulativeY += rowStep[i];
@@ -1083,6 +1095,49 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
                     renderer.AddFilledRoundedRect(trackLeft + (knobX - trackLeft) * 0.5f, trackY,
                                                   (knobX - trackLeft) * 0.5f, trackHalfH, trackHalfH, 0.0f,
                                                   grey, grey, grey, 1.0f);
+                    renderer.AddFilledCircle(knobX, trackY, knobR,
+                                             sliderActive ? 1.0f : 0.85f, sliderActive ? 0.85f : 0.8f, 0.2f, 1.0f);
+                }
+
+                if (i == beepDropLabelRow)
+                {
+                    // 0..150 km/h in 5 km/h steps; written to the INI on release.
+                    BrakeCueConfig& bcc = g_brakeCueConfig;
+                    const float kMin = BrakeCueConfig::kMinSpeedDropMin;
+                    const float kMax = BrakeCueConfig::kMinSpeedDropMax;
+                    const float trackY = y + infoLineStep + carsSliderBarExtraPx * 0.5f;
+                    const float trackLeft = leftX;
+                    const float trackRight = leftX + widest;
+                    const float trackHalfH = 3.0f * listScale;
+                    const float knobR = 9.0f * listScale;
+                    float valueFrac = (bcc.minSpeedDropKmh - kMin) / (kMax - kMin);
+                    if (valueFrac < 0.0f) valueFrac = 0.0f;
+                    if (valueFrac > 1.0f) valueFrac = 1.0f;
+                    const float knobX = trackLeft + (trackRight - trackLeft) * valueFrac;
+                    const bool nearSlider = haveCursor
+                        && cursorX >= trackLeft - knobR && cursorX <= trackRight + knobR
+                        && cursorY >= trackY - knobR * 1.6f && cursorY <= trackY + knobR * 1.6f;
+                    if (clickEdge && nearSlider)
+                        g_beepDropDragging = true;
+                    if (!clickNow && g_beepDropDragging)
+                    {
+                        g_beepDropDragging = false;
+                        Config::WriteFloat("BrakeCue", "MinSpeedDropKmh", bcc.minSpeedDropKmh);
+                    }
+                    if (g_beepDropDragging && haveCursor)
+                    {
+                        float f = (cursorX - trackLeft) / (trackRight - trackLeft);
+                        if (f < 0.0f) f = 0.0f;
+                        if (f > 1.0f) f = 1.0f;
+                        bcc.minSpeedDropKmh = floorf((kMin + f * (kMax - kMin)) / 5.0f + 0.5f) * 5.0f;
+                    }
+                    const bool sliderActive = g_beepDropDragging || nearSlider;
+                    renderer.AddFilledRoundedRect(trackLeft + (trackRight - trackLeft) * 0.5f, trackY,
+                                                  (trackRight - trackLeft) * 0.5f, trackHalfH, trackHalfH, 0.0f,
+                                                  0.4f, 0.4f, 0.45f, 0.8f);
+                    renderer.AddFilledRoundedRect(trackLeft + (knobX - trackLeft) * 0.5f, trackY,
+                                                  (knobX - trackLeft) * 0.5f, trackHalfH, trackHalfH, 0.0f,
+                                                  0.35f, 0.85f, 1.0f, 0.9f);
                     renderer.AddFilledCircle(knobX, trackY, knobR,
                                              sliderActive ? 1.0f : 0.85f, sliderActive ? 0.85f : 0.8f, 0.2f, 1.0f);
                 }

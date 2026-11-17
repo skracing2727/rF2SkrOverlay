@@ -16,6 +16,10 @@
 #include "LapDelta.h"
 #include "RelativeTiming.h"
 #include "FuelTyrePanel.h"
+#include "FuelSave.h"
+#include "TyreSave.h"
+#include "EngineTemps.h"
+#include "BrakeCue.h"
 #include "MiniSector.h"
 #include "TyreTemps.h"
 #include "FfbGraph.h"
@@ -1222,6 +1226,11 @@ namespace
                     { DRAWN("Relative"); RelativeTiming::Draw(g_renderer, sw, sh); }
                 if (Shortcuts::Visible(Shortcuts::FuelTyre))
                     { DRAWN("Fuel + tyres"); FuelTyrePanel::Draw(g_renderer, sw, sh); }
+                { DRAWN("Fuel save"); FuelSave::Draw(g_renderer, sw, sh); }
+                { DRAWN("Tyre target"); TyreSave::Draw(g_renderer, sw, sh); }
+                { DRAWN("Engine temps"); EngineTemps::Draw(g_renderer, sw, sh); }
+                if (Shortcuts::Visible(Shortcuts::BrakeCue))
+                    { DRAWN("Brake cue"); BrakeCue::Draw(g_renderer, sw, sh); }
             }
             // Frametime stats deliberately draw everywhere, menus included.
             if (Shortcuts::Visible(Shortcuts::Perf))

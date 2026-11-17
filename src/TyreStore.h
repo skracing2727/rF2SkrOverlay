@@ -26,6 +26,9 @@ namespace TyreStore
     // axles differ) and its colour. Returns false when this car has never
     // reported telemetry -- the caller shows a dash rather than a guess.
     bool Get(long id, char* out, unsigned int outSize, float& r, float& g, float& b);
+    // The REAR compound's colour, for drawing a split set ("M/S") with each
+    // letter in its own colour. False when the car has no sample.
+    bool GetRearColour(long id, float& r, float& g, float& b);
 
     void Clear();
 }

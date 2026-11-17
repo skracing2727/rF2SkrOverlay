@@ -340,6 +340,10 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
     // else instead shows whichever cars are physically CLOSEST by distance,
     // which is what's actually useful when nobody's racing for position.
     const bool isRaceSession = info.mSession >= 10 && info.mSession <= 13;
+    // Race, but listed in track order (RelativeTimingConfig::raceTrackOrder):
+    // gaps and row choice then work as in practice, while the lap markers
+    // and places gained still use the race bookkeeping.
+    const bool standingsOrder = isRaceSession && !g_relativeTimingConfig.raceTrackOrder;
 
     // Guards the trend against the discontinuity when a car crosses the
     // half-lap wrap boundary: the gap legitimately flips by a whole lap
@@ -354,6 +358,13 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
 
     // Computes one vehicle's row: the time gap, its trend, and the lap-time
     // comparison. Negative gap = v is ahead of the player, positive = behind.
+    // Retired or disqualified (mFinishStatus 2/3) cars are left out of the
+    // tower entirely: they are not racing anyone any more.
+    auto isRetired = [](const VehicleScoringInfoV01* v)
+    {
+        return !v->mIsPlayer && (v->mFinishStatus == 2 || v->mFinishStatus == 3);
+    };
+
     auto computeRow = [&](const VehicleScoringInfoV01* v) -> Row
     {
         Row row;
@@ -445,7 +456,7 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
         }
 
         double gap = 0.0;
-        if (isRaceSession)
+        if (standingsOrder)
         {
             // Prefer the SDK's own behind-leader bookkeeping over the
             // reconstructed lap trace: it is exactly what the game's own
@@ -702,7 +713,7 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
     }
     newState.stintLapsFractional = totalLapsFractional - m_stintStartTotalLaps;
 
-    if (isRaceSession)
+    if (standingsOrder)
     {
         const int numVehicles = static_cast<int>(info.mNumVehicles);
 
@@ -759,7 +770,7 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
             {
                 if (info.mVehicle[i].mPlace == p) { v = &info.mVehicle[i]; break; }
             }
-            if (!v) continue;
+            if (!v || isRetired(v)) continue;
 
             newState.rows[newState.rowCount++] = computeRow(v);
         }
@@ -776,7 +787,7 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
         for (long i = 0; i < info.mNumVehicles; ++i)
         {
             const VehicleScoringInfoV01* v = &info.mVehicle[i];
-            if (v->mIsPlayer) continue;
+            if (v->mIsPlayer || isRetired(v)) continue;
 
             const Row candidate = computeRow(v);
             // A car in the pit lane has no meaningful track position.
@@ -881,7 +892,10 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
         Row candidates[kMaxCandidates];
         int candidateCount = 0;
         for (long i = 0; i < info.mNumVehicles && candidateCount < kMaxCandidates; ++i)
+        {
+            if (isRetired(&info.mVehicle[i])) continue;
             candidates[candidateCount++] = computeRow(&info.mVehicle[i]);
+        }
 
         std::sort(candidates, candidates + candidateCount, [](const Row& a, const Row& b)
         {
@@ -1164,12 +1178,15 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         char name[28];
         char lapTime[16];
         char gap[16];
+        char lapDiff[8];    // "+1" / "-1" laps vs you; empty on your lap
         bool isPlayer;
         bool differentLap;
+        bool lapAhead;      // a lap or more ahead of you: its own colour
         long carId;
         char tyre[8];
         bool haveTyre;
         float tyreR, tyreG, tyreB;
+        float tyreRearR, tyreRearG, tyreRearB;  // split set: the rear letter's colour
         float gapR, gapG, gapB;
         float lapR, lapG, lapB;
         int placeChangeSign;
@@ -1206,6 +1223,12 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         }
 
         FormatLapTime(row.lastLapTime, rt.lapTime, sizeof(rt.lapTime));
+        // Laps ahead (+) or behind (-) you, in its own column next to the
+        // on-track gap; nothing for a car on your lap.
+        if (!row.isPlayer && row.lapDelta != 0)
+            sprintf_s(rt.lapDiff, "%+d", row.lapDelta);
+        else
+            rt.lapDiff[0] = '\0';
 
         // Smoothly interpolated between the last two real ~5Hz scoring
         // samples rather than snapping straight to the newest one, so the
@@ -1252,6 +1275,9 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         if (cfg.showTyre)
             rt.haveTyre = TyreStore::Get(row.carId, rt.tyre, sizeof(rt.tyre),
                                          rt.tyreR, rt.tyreG, rt.tyreB);
+        rt.tyreRearR = rt.tyreR; rt.tyreRearG = rt.tyreG; rt.tyreRearB = rt.tyreB;
+        if (rt.haveTyre && rt.tyre[1] == '/')
+            TyreStore::GetRearColour(row.carId, rt.tyreRearR, rt.tyreRearG, rt.tyreRearB);
         // Blue for any car not on your lap -- one you are lapping, or one
         // lapping you (the blue-flag case, where it matters most).
         // Blue specifically means "this car is a lap down" (classic blue-flag
@@ -1261,6 +1287,7 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         // already the sign-correct "they are behind you" test; lapDelta's
         // sign is for the +/-NL display text only.
         rt.differentLap = row.lapDown;
+        rt.lapAhead = row.lapDelta > 0;
         rt.placeChangeSign = row.placeChangeSign;
         rt.placeChangeAlpha = row.placeChangeAlpha;
 
@@ -1402,6 +1429,7 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     const float nameW = renderer.MeasureText("WWWWWWWWWWWWWWWWWWWW", textHeightPx); // 14-char truncated name + " (you)"/" +99L" suffix
     const float lapW = renderer.MeasureText("99:59.9", textHeightPx);
     const float gapW = renderer.MeasureText("+999.9", textHeightPx);
+    const float lapDiffW = renderer.MeasureText("+99", textHeightPx);
 
     const float colGap = columnGapPx;
     // "S/M" is the widest the compound column can print (a split strategy);
@@ -1410,7 +1438,7 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     const float tyreW = cfg.showTyre ? renderer.MeasureText("S/M", textHeightPx) : 0.0f;
     const float tyreAdvance = cfg.showTyre ? (tyreW + colGap) : 0.0f;
     const float gainW = renderer.MeasureText("+99", textHeightPx);
-    const float tableW = placeW + colGap + gainW + colGap + nameW + colGap + gapW + colGap + lapW + tyreAdvance;
+    const float tableW = placeW + colGap + gainW + colGap + nameW + colGap + gapW + colGap + lapDiffW + colGap + lapW + tyreAdvance;
 
     // Footer: the session's fastest lap, who set it, in purple.
     char fastestBuf[80] = "";
@@ -1463,6 +1491,7 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         float rowR = cfg.colorR, rowG = cfg.colorG, rowB = cfg.colorB;
         if (rt.isPlayer)          { rowR = cfg.playerR;  rowG = cfg.playerG;  rowB = cfg.playerB; }
         else if (rt.differentLap) { rowR = cfg.lapDownR; rowG = cfg.lapDownG; rowB = cfg.lapDownB; }
+        else if (rt.lapAhead)     { rowR = cfg.lapUpR;   rowG = cfg.lapUpG;   rowB = cfg.lapUpB; }
 
         // Whole-row background highlight for a recently confirmed position
         // change -- faint green for a gain, faint red for a loss, fading out
@@ -1497,11 +1526,28 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         x += nameW + colGap;
         renderer.AddText(x + gapW, y, rt.gap, textHeightPx, rt.gapR, rt.gapG, rt.gapB, 1.0f, Renderer::HAlign::Right);
         x += gapW + colGap;
+        if (rt.lapDiff[0])
+            renderer.AddText(x + lapDiffW, y, rt.lapDiff, textHeightPx, rowR, rowG, rowB, 1.0f, Renderer::HAlign::Right);
+        x += lapDiffW + colGap;
         renderer.AddText(x + lapW, y, rt.lapTime, textHeightPx, rt.lapR, rt.lapG, rt.lapB, 1.0f, Renderer::HAlign::Right);
         if (cfg.showTyre)
         {
             x += lapW + colGap;
-            if (rt.haveTyre)
+            if (rt.haveTyre && rt.tyre[1] == '/' && rt.tyre[2])
+            {
+                // Split set: front letter, "/", rear letter, each in its
+                // own compound colour (F1 colours: S red, M yellow, H white,
+                // I green, W blue).
+                const char front[2] = { rt.tyre[0], 0 };
+                const char rear[2] = { rt.tyre[2], 0 };
+                float tx = x;
+                renderer.AddText(tx, y, front, textHeightPx, rt.tyreR, rt.tyreG, rt.tyreB, 1.0f, Renderer::HAlign::Left);
+                tx += renderer.MeasureText(front, textHeightPx);
+                renderer.AddText(tx, y, "/", textHeightPx, cfg.colorR, cfg.colorG, cfg.colorB, 1.0f, Renderer::HAlign::Left);
+                tx += renderer.MeasureText("/", textHeightPx);
+                renderer.AddText(tx, y, rear, textHeightPx, rt.tyreRearR, rt.tyreRearG, rt.tyreRearB, 1.0f, Renderer::HAlign::Left);
+            }
+            else if (rt.haveTyre)
             {
                 renderer.AddText(x, y, rt.tyre, textHeightPx,
                                  rt.tyreR, rt.tyreG, rt.tyreB, 1.0f, Renderer::HAlign::Left);

@@ -198,6 +198,24 @@ bool TyreStore::Get(long id, char* out, unsigned int outSize, float& r, float& g
     return found;
 }
 
+bool TyreStore::GetRearColour(long id, float& r, float& g, float& b)
+{
+    if (!g_lockReady)
+        return false;
+    bool found = false;
+    EnterCriticalSection(&g_lock);
+    const Entry* e = Find(id);
+    if (e && e->haveSample)
+    {
+        r = e->rear.r;
+        g = e->rear.g;
+        b = e->rear.b;
+        found = true;
+    }
+    LeaveCriticalSection(&g_lock);
+    return found;
+}
+
 void TyreStore::Clear()
 {
     if (!g_lockReady)

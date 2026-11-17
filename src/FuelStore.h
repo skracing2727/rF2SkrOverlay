@@ -40,6 +40,11 @@ public:
         int sessionLaps = 0;
         int stintLaps = 0;
         double stintTimeSeconds = -1.0; // elapsed since the current stint started (pit exit, or session start)
+        double fuelAtLapStart = 0.0;     // litres at the start of the current telemetry lap
+        double lastLapTimeSeconds = 0.0; // last completed lap, 0 = none yet
+        long telemLapNumber = -1;
+        bool inPits = false;
+        char profilePath[MAX_PATH] = ""; // per car+track fuel-use profile file (FuelSave)
         double fuelPerLap = 0.0;        // liters/lap, learned
         double timeLeftSeconds = -1.0;  // -1 = not enough data yet
 

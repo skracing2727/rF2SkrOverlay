@@ -35,6 +35,7 @@ cl.exe /nologo /EHsc /std:c++17 /LD /O2 ^
   ..\src\GearDisplay.cpp ^
   ..\src\LapDelta.cpp ^
   ..\src\MiniSector.cpp ^
+  ..\src\BrakeCue.cpp ^
   ..\src\TyreTemps.cpp ^
   ..\src\FfbGraph.cpp ^
   ..\src\TrackMap.cpp ^
@@ -45,6 +46,9 @@ cl.exe /nologo /EHsc /std:c++17 /LD /O2 ^
   ..\src\CarState.cpp ^
   ..\src\FuelStore.cpp ^
   ..\src\FuelTyrePanel.cpp ^
+  ..\src\FuelSave.cpp ^
+  ..\src\TyreSave.cpp ^
+  ..\src\EngineTemps.cpp ^
   ..\src\TyreWear.cpp ^
   ..\src\SetupInfo.cpp ^
   ..\src\DrsCue.cpp ^

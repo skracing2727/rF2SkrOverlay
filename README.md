@@ -11,6 +11,7 @@ A free in-car HUD for rFactor 2, drawn straight into the game: no extra windows,
 - Relative timing
 - Fuel, tyre wear and brake bias
 - Tyre temperatures, track map and FFB spectrum
+- Optional braking-point beep from your best lap, with a reaction-time readout (off by default)
 
 Every panel can be dragged, resized and switched on or off in game (Ctrl+Shift+2 for layout mode), and the
 layout is remembered for each car. Works on Linux/Proton too, with a built-in font.

@@ -27,6 +27,10 @@ PitLimiterConfig g_pitLimiterConfig;
 LapDeltaConfig g_lapDeltaConfig;
 RelativeTimingConfig g_relativeTimingConfig;
 FuelTyrePanelConfig g_fuelTyrePanelConfig;
+FuelSaveConfig g_fuelSaveConfig;
+TyreSaveConfig g_tyreSaveConfig;
+EngineTempsConfig g_engineTempsConfig;
+BrakeCueConfig g_brakeCueConfig;
 DrsCueConfig g_drsCueConfig;
 
 namespace
@@ -244,6 +248,74 @@ namespace
 "; for this many seconds (requiring both avoids fading during a normal\n"
 "; lift-and-coast mid-corner), and fades back in over the same duration.\n"
 "IdleFadeSeconds=2.0\n"
+"\n"
+"[BrakeCue]\n"
+"; 1 = beep at your best lap's braking points, 0 = disabled entirely.\n"
+"Enabled=1\n"
+"\n"
+"; Brake input above this counts as \"braking\" for recording a point --\n"
+"; deliberately high so only real braking points get recorded, not a light dab.\n"
+"BrakeThreshold=0.2\n"
+"; Ignore a new point this close to the last one (0..1 brake input treated as\n"
+"; the same zone, e.g. pumping the brakes rather than a separate corner).\n"
+"MinPointSpacingMeters=15.0\n"
+"; Only beep for big stops: a braking point whose speed drop (on the reference\n"
+"; lap, from where braking began down to the slowest point before the next\n"
+"; braking point) is less than this many km/h stays silent. 0 = beep for all.\n"
+"; Also a slider in the shortcut list.\n"
+"MinSpeedDropKmh=50\n"
+"; Lead time: the beep fires this many SECONDS before the recorded point,\n"
+"; converted to a distance using your current speed -- so the warning is the\n"
+"; same amount of TIME whether you're approaching at 250 km/h or 90 km/h.\n"
+"; With AdaptiveLeadTimeEnabled=1 (below) this is only the starting value.\n"
+"LeadTimeSeconds=0.3\n"
+"\n"
+"BeepFrequencyHz=880\n"
+"BeepDurationMs=120\n"
+"\n"
+"; --- Reaction-time measurement and adaptive lead time ---\n"
+"; The gap between each beep and the brake pedal actually moving is timed,\n"
+"; and the beep's lead time is then set to your own rolling average -- so\n"
+"; the pedal moves AT the reference lap's braking point instead of a fixed\n"
+"; guess early or late. React slowly and the beep moves earlier; react\n"
+"; quickly and it moves later. Off by default: braking later than the\n"
+"; reference on purpose looks like a slow reaction, so the beep keeps moving\n"
+"; earlier. 0 = a fixed LeadTimeSeconds.\n"
+"AdaptiveLeadTimeEnabled=0\n"
+"; Brake input above this counts as \"the pedal has moved\" for that timing --\n"
+"; far lower than BrakeThreshold above, since this wants the first instant of\n"
+"; movement, not a committed braking point.\n"
+"ReactionThreshold=0.10\n"
+"; A beep with no pedal movement within this long is abandoned rather than\n"
+"; matched against whatever braking eventually follows (a missed corner, a\n"
+"; spin, or simply ignoring the cue).\n"
+"ReactionTimeoutSeconds=3.0\n"
+"; Individual measurements outside this range are discarded instead of\n"
+"; dragging the average around (a real reaction to a sound while driving is\n"
+"; ~0.15-0.6s). The ceiling also bounds how early the cue can ever be moved.\n"
+"ReactionMinSeconds=0.02\n"
+"ReactionMaxSeconds=1.5\n"
+"\n"
+"; On-screen readout: average reaction, most recent one, and the lead time\n"
+"; currently in use. Hidden until the first reaction has been measured.\n"
+"ShowReactionStats=1\n"
+"ReactionStatsCenterXFraction=0.5\n"
+"ReactionStatsCenterYFraction=0.982\n"
+"ReactionStatsTextHeightPixels=28.0\n"
+"; Panel size multiplier, set by dragging the corner handle in layout\n"
+"; mode and clamped there to 0.5-2.5. Scales text, padding\n"
+"; and gaps together, in proportion.\n"
+"ReactionStatsScale=1.0\n"
+"ReactionStatsColorR=1.0\n"
+"ReactionStatsColorG=1.0\n"
+"ReactionStatsColorB=1.0\n"
+"ReactionStatsBackgroundEnabled=1\n"
+"ReactionStatsBackgroundPaddingPixels=8.0\n"
+"ReactionStatsBackgroundCornerRadiusPixels=8.0\n"
+"ReactionStatsBackgroundR=0.08\n"
+"ReactionStatsBackgroundG=0.08\n"
+"ReactionStatsBackgroundB=0.08\n"
+"ReactionStatsBackgroundA=0.6\n"
 "\n"
 "[MiniSector]\n"
 "; Vertical position of the delta-speed strip. -1 means stacked directly\n"
@@ -826,6 +898,7 @@ namespace
 "MiniSector=F7\n"
 "RelativeTiming=F8\n"
 "FuelTyre=F10\n"
+"BrakeCue=F11\n"
 "; DRS beep AND the on-screen \"OPEN DRS\"/\"DRS ENGAGED\" sign, together --\n"
 "; one switch for the whole feature.\n"
 "Drs=D\n"
@@ -883,6 +956,7 @@ namespace
 "ShowMiniSector=0\n"
 "ShowRelativeTiming=1\n"
 "ShowFuelTyre=1\n"
+"ShowBrakeCue=0\n"
 "ShowDrs=1\n"
 "ShowClock=1\n"
 "ShowSideBar=1\n"
@@ -1104,6 +1178,7 @@ void Config::Load()
     sc.miniSector = ReadKey("Shortcuts", "MiniSector", sc.miniSector);
     sc.relativeTiming = ReadKey("Shortcuts", "RelativeTiming", sc.relativeTiming);
     sc.fuelTyre = ReadKey("Shortcuts", "FuelTyre", sc.fuelTyre);
+    sc.brakeCue = ReadKey("Shortcuts", "BrakeCue", sc.brakeCue);
     sc.drs = ReadKey("Shortcuts", "Drs", sc.drs);
     sc.clock = ReadKey("Shortcuts", "Clock", sc.clock);
     sc.sideBar = ReadKey("Shortcuts", "SideBar", sc.sideBar);
@@ -1146,6 +1221,7 @@ void Config::Load()
     sc.showMiniSector = ReadBool("Shortcuts", "ShowMiniSector", sc.showMiniSector);
     sc.showRelativeTiming = ReadBool("Shortcuts", "ShowRelativeTiming", sc.showRelativeTiming);
     sc.showFuelTyre = ReadBool("Shortcuts", "ShowFuelTyre", sc.showFuelTyre);
+    sc.showBrakeCue = ReadBool("Shortcuts", "ShowBrakeCue", sc.showBrakeCue);
     sc.showDrs = ReadBool("Shortcuts", "ShowDrs", sc.showDrs);
     sc.showClock = ReadBool("Shortcuts", "ShowClock", sc.showClock);
     sc.showSideBar = ReadBool("Shortcuts", "ShowSideBar", sc.showSideBar);
@@ -1276,6 +1352,37 @@ void Config::Load()
     p.steeringB = ReadFloat("PedalTrace", "SteeringB", p.steeringB);
     p.idleFadeSeconds = ReadFloat("PedalTrace", "IdleFadeSeconds", p.idleFadeSeconds);
     p.pointSpacingPx = ReadFloat("PedalTrace", "PointSpacingPixels", p.pointSpacingPx);
+
+    BrakeCueConfig& b = g_brakeCueConfig;
+    b.enabled = ReadBool("BrakeCue", "Enabled", b.enabled);
+    b.brakeThreshold = ReadFloat("BrakeCue", "BrakeThreshold", b.brakeThreshold);
+    b.minPointSpacingM = ReadFloat("BrakeCue", "MinPointSpacingMeters", b.minPointSpacingM);
+    b.minSpeedDropKmh = ReadFloat("BrakeCue", "MinSpeedDropKmh", b.minSpeedDropKmh);
+    if (b.minSpeedDropKmh < BrakeCueConfig::kMinSpeedDropMin) b.minSpeedDropKmh = BrakeCueConfig::kMinSpeedDropMin;
+    if (b.minSpeedDropKmh > BrakeCueConfig::kMinSpeedDropMax) b.minSpeedDropKmh = BrakeCueConfig::kMinSpeedDropMax;
+    b.leadTimeSec = ReadFloat("BrakeCue", "LeadTimeSeconds", b.leadTimeSec);
+    b.beepFrequencyHz = ReadInt("BrakeCue", "BeepFrequencyHz", b.beepFrequencyHz);
+    b.beepDurationMs = ReadInt("BrakeCue", "BeepDurationMs", b.beepDurationMs);
+    b.reactionThreshold = ReadFloat("BrakeCue", "ReactionThreshold", b.reactionThreshold);
+    b.reactionTimeoutSeconds = ReadFloat("BrakeCue", "ReactionTimeoutSeconds", b.reactionTimeoutSeconds);
+    b.adaptiveLeadTimeEnabled = ReadBool("BrakeCue", "AdaptiveLeadTimeEnabled", b.adaptiveLeadTimeEnabled);
+    b.reactionMinSeconds = ReadFloat("BrakeCue", "ReactionMinSeconds", b.reactionMinSeconds);
+    b.reactionMaxSeconds = ReadFloat("BrakeCue", "ReactionMaxSeconds", b.reactionMaxSeconds);
+    b.showReactionStats = ReadBool("BrakeCue", "ShowReactionStats", b.showReactionStats);
+    b.reactionStatsCenterXFraction = ReadFloat("BrakeCue", "ReactionStatsCenterXFraction", b.reactionStatsCenterXFraction);
+    b.reactionStatsCenterYFraction = ReadFloat("BrakeCue", "ReactionStatsCenterYFraction", b.reactionStatsCenterYFraction);
+    b.reactionStatsTextHeightPx = ReadFloat("BrakeCue", "ReactionStatsTextHeightPixels", b.reactionStatsTextHeightPx);
+    b.reactionStatsScale = ReadFloat("BrakeCue", "ReactionStatsScale", b.reactionStatsScale);
+    b.reactionStatsR = ReadFloat("BrakeCue", "ReactionStatsColorR", b.reactionStatsR);
+    b.reactionStatsG = ReadFloat("BrakeCue", "ReactionStatsColorG", b.reactionStatsG);
+    b.reactionStatsB = ReadFloat("BrakeCue", "ReactionStatsColorB", b.reactionStatsB);
+    b.reactionStatsBgEnabled = ReadBool("BrakeCue", "ReactionStatsBackgroundEnabled", b.reactionStatsBgEnabled);
+    b.reactionStatsBgPaddingPx = ReadFloat("BrakeCue", "ReactionStatsBackgroundPaddingPixels", b.reactionStatsBgPaddingPx);
+    b.reactionStatsBgCornerRadiusPx = ReadFloat("BrakeCue", "ReactionStatsBackgroundCornerRadiusPixels", b.reactionStatsBgCornerRadiusPx);
+    b.reactionStatsBgR = ReadFloat("BrakeCue", "ReactionStatsBackgroundR", b.reactionStatsBgR);
+    b.reactionStatsBgG = ReadFloat("BrakeCue", "ReactionStatsBackgroundG", b.reactionStatsBgG);
+    b.reactionStatsBgB = ReadFloat("BrakeCue", "ReactionStatsBackgroundB", b.reactionStatsBgB);
+    b.reactionStatsBgA = ReadFloat("BrakeCue", "ReactionStatsBackgroundA", b.reactionStatsBgA);
 
     MiniSectorConfig& ms = g_miniSectorConfig;
     ms.enabled = ReadBool("MiniSector", "Enabled", ms.enabled);
@@ -1506,6 +1613,9 @@ void Config::Load()
     pl.engageWarningEnabled = ReadBool("PitLimiter", "EngageWarningEnabled", pl.engageWarningEnabled);
     pl.engageWarningMaxDistanceM = ReadFloat("PitLimiter", "EngageWarningMaxDistanceMeters", pl.engageWarningMaxDistanceM);
     pl.engageWarningTextHeightPx = ReadFloat("PitLimiter", "EngageWarningTextHeightPixels", pl.engageWarningTextHeightPx);
+    pl.barXFraction = ReadFloat("PitLimiter", "BarXFraction", pl.barXFraction);
+    pl.barYFraction = ReadFloat("PitLimiter", "BarYFraction", pl.barYFraction);
+    pl.barScale = ReadFloat("PitLimiter", "BarScale", pl.barScale);
     pl.engageWarningXFraction = ReadFloat("PitLimiter", "EngageWarningXFraction", pl.engageWarningXFraction);
     pl.engageWarningYFraction = ReadFloat("PitLimiter", "EngageWarningYFraction", pl.engageWarningYFraction);
     pl.engageWarningBlinkPeriodSeconds = ReadFloat("PitLimiter", "EngageWarningBlinkPeriodSeconds", pl.engageWarningBlinkPeriodSeconds);
@@ -1695,6 +1805,9 @@ void Config::Load()
     rt.playerG = ReadFloat("RelativeTiming", "PlayerColorG", rt.playerG);
     rt.playerB = ReadFloat("RelativeTiming", "PlayerColorB", rt.playerB);
     rt.lapDownR = ReadFloat("RelativeTiming", "LapDownColorR", rt.lapDownR);
+    rt.lapUpR = ReadFloat("RelativeTiming", "LapUpColorR", rt.lapUpR);
+    rt.lapUpG = ReadFloat("RelativeTiming", "LapUpColorG", rt.lapUpG);
+    rt.lapUpB = ReadFloat("RelativeTiming", "LapUpColorB", rt.lapUpB);
     rt.lapDownG = ReadFloat("RelativeTiming", "LapDownColorG", rt.lapDownG);
     rt.lapDownB = ReadFloat("RelativeTiming", "LapDownColorB", rt.lapDownB);
     rt.gainingR = ReadFloat("RelativeTiming", "GainingColorR", rt.gainingR);
@@ -1710,6 +1823,7 @@ void Config::Load()
     rt.lapSlowerG = ReadFloat("RelativeTiming", "LapSlowerColorG", rt.lapSlowerG);
     rt.lapSlowerB = ReadFloat("RelativeTiming", "LapSlowerColorB", rt.lapSlowerB);
     rt.visibleCars = ReadFloat("RelativeTiming", "VisibleCars", rt.visibleCars);
+    rt.raceTrackOrder = ReadBool("RelativeTiming", "RaceTrackOrder", rt.raceTrackOrder);
     rt.trendWindowSeconds = ReadFloat("RelativeTiming", "TrendWindowSeconds", rt.trendWindowSeconds);
     rt.trackRelativeThresholdSeconds = ReadFloat("RelativeTiming", "TrackRelativeThresholdSeconds", rt.trackRelativeThresholdSeconds);
     rt.logSdkGapFields = ReadBool("RelativeTiming", "LogSdkGapFields", rt.logSdkGapFields);
@@ -1732,6 +1846,31 @@ void Config::Load()
     rt.bgG = ReadFloat("RelativeTiming", "BackgroundG", rt.bgG);
     rt.bgB = ReadFloat("RelativeTiming", "BackgroundB", rt.bgB);
     rt.bgA = ReadFloat("RelativeTiming", "BackgroundA", rt.bgA);
+
+    FuelSaveConfig& fs = g_fuelSaveConfig;
+    fs.enabled = ReadBool("FuelSave", "Enabled", fs.enabled);
+    fs.stintMinutes = ReadFloat("FuelSave", "StintMinutes", fs.stintMinutes);
+    fs.reserveLitres = ReadFloat("FuelSave", "ReserveLitres", fs.reserveLitres);
+    fs.barWindowLitres = ReadFloat("FuelSave", "BarWindowLitres", fs.barWindowLitres);
+    fs.centerXFraction = ReadFloat("FuelSave", "CenterXFraction", fs.centerXFraction);
+    fs.centerYFraction = ReadFloat("FuelSave", "CenterYFraction", fs.centerYFraction);
+    fs.scale = ReadFloat("FuelSave", "Scale", fs.scale);
+
+    TyreSaveConfig& ts = g_tyreSaveConfig;
+    ts.enabled = ReadBool("TyreSave", "Enabled", ts.enabled);
+    ts.targetWearPercent = ReadFloat("TyreSave", "TargetWearPercent", ts.targetWearPercent);
+    ts.targetMinutes = ReadFloat("TyreSave", "TargetMinutes", ts.targetMinutes);
+    ts.centerXFraction = ReadFloat("TyreSave", "CenterXFraction", ts.centerXFraction);
+    ts.centerYFraction = ReadFloat("TyreSave", "CenterYFraction", ts.centerYFraction);
+    ts.scale = ReadFloat("TyreSave", "Scale", ts.scale);
+
+    EngineTempsConfig& et = g_engineTempsConfig;
+    et.enabled = ReadBool("EngineTemps", "Enabled", et.enabled);
+    et.waterAmberMargin = ReadFloat("EngineTemps", "WaterAmberMargin", et.waterAmberMargin);
+    et.oilAmberMargin = ReadFloat("EngineTemps", "OilAmberMargin", et.oilAmberMargin);
+    et.centerXFraction = ReadFloat("EngineTemps", "CenterXFraction", et.centerXFraction);
+    et.centerYFraction = ReadFloat("EngineTemps", "CenterYFraction", et.centerYFraction);
+    et.scale = ReadFloat("EngineTemps", "Scale", et.scale);
 
     FuelTyrePanelConfig& ft = g_fuelTyrePanelConfig;
     ft.enabled = ReadBool("FuelTyrePanel", "Enabled", ft.enabled);

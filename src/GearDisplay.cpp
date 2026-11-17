@@ -1118,7 +1118,11 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                          &g_gearDisplayConfig.scale, "Scale");
     }
 
-    if (showAbsTc)
+    // Pit limiter on: the ABS/TC box steps aside; the PIT LIMITER bar drawn
+    // across the whole dashboard row further down takes over.
+    const bool pitSquare = state.speedLimiterOn && !absTcPlaceholder;
+    if (pitSquare) {}
+    else if (showAbsTc)
     {
         if (cfg.backgroundEnabled)
         {
@@ -1175,6 +1179,29 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                              0.05f, 0.05f, 0.05f, fade, Renderer::HAlign::Center);
     }
 
+    // While the PIT LIMITER bar sits over this row, the gear and speed
+    // panels are not drawn at all: text is layered above every filled box,
+    // so the digits would otherwise show through the bar. Moved clear of
+    // the row, the bar leaves them alone.
+    bool hideRowForPitBar = false;
+    if (pitSquare)
+    {
+        const PitLimiterConfig& pl = g_pitLimiterConfig;
+        if (pl.barXFraction < 0.0f || pl.barYFraction < 0.0f)
+            hideRowForPitBar = true;
+        else
+        {
+            const float rowLeft = cfg.absTcBoxEnabled ? (absTcCenterX - absTcPanelW * 0.5f) : (gearPanelCenterX - gearPanelW * 0.5f);
+            const float rowRight = cfg.speedEnabled ? (speedPanelCenterX + speedPanelW * 0.5f) : (gearPanelCenterX + gearPanelW * 0.5f);
+            const float bs = (pl.barScale > 0.05f) ? pl.barScale : 0.05f;
+            const float bhw = (rowRight - rowLeft) * 0.5f * bs, bhh = panelH * 0.5f * bs;
+            const float bx = screenWidth * pl.barXFraction, by = screenHeight * pl.barYFraction;
+            hideRowForPitBar = bx - bhw < rowRight && bx + bhw > rowLeft
+                            && by - bhh < panelCenterY + panelH * 0.5f && by + bhh > panelCenterY - panelH * 0.5f;
+        }
+    }
+    if (!hideRowForPitBar)
+    {
     if (cfg.backgroundEnabled)
     {
         renderer.AddFilledRoundedRect(gearPanelCenterX, panelCenterY, gearPanelW * 0.5f, panelH * 0.5f,
@@ -1204,6 +1231,54 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         const float speedY = panelCenterY - speedTextHeightPx * 0.5f;
         renderer.AddText(speedPanelCenterX, speedY, speedBuf, speedTextHeightPx, cfg.speedR, cfg.speedG, cfg.speedB, fade, Renderer::HAlign::Center);
 
+    }
+
+    } // !hideRowForPitBar
+
+    // Pit limiter engaged: one red-orange bar laid across the whole
+    // ABS/TC + gear + speed row (in the line of sight, unlike a side box),
+    // reading "PIT LIMITER" and speed minus the pit-lane limit. Flashes once
+    // more than half a km/h over the limit.
+    const bool pitBarPlaceholder = Layout::Active() && !pitSquare;
+    if (pitSquare || pitBarPlaceholder)
+    {
+        PitLimiterConfig& pl = g_pitLimiterConfig;
+        const double limitKmh = (state.learnedPitLimitKmh > 0.0) ? state.learnedPitLimitKmh : pl.speedLimitKmh;
+        const double speedKmhNow = state.speedMs * 3.6;
+        const double unitDiv = cfg.speedUnitsKmh ? 1.0 : 1.60934;
+        char barBuf[40];
+        sprintf_s(barBuf, "PIT LIMITER  %+.1f", pitSquare ? (speedKmhNow - limitKmh) / unitDiv : 0.0);
+
+        const float left = cfg.absTcBoxEnabled ? (absTcCenterX - absTcPanelW * 0.5f)
+                                               : (gearPanelCenterX - gearPanelW * 0.5f);
+        const float right = cfg.speedEnabled ? (speedPanelCenterX + speedPanelW * 0.5f)
+                                             : (gearPanelCenterX + gearPanelW * 0.5f);
+        // Default size is the dashboard row; BarScale grows/shrinks it, and
+        // BarX/YFraction move it (-1 = auto, over the row, resolved to real
+        // fractions the first time so a drag starts from where it is).
+        if (pl.barXFraction < 0.0f || pl.barYFraction < 0.0f)
+        {
+            pl.barXFraction = ((left + right) * 0.5f) / screenWidth;
+            pl.barYFraction = panelCenterY / screenHeight;
+        }
+        const float bs = (pl.barScale > 0.05f) ? pl.barScale : 0.05f;
+        const float barHalfW = (right - left) * 0.5f * bs;
+        const float barHalfH = panelH * 0.5f * bs;
+        const float cx = screenWidth * pl.barXFraction;
+        const float cy = screenHeight * pl.barYFraction;
+        Layout::Register("Pit limiter bar", "PitLimiter", "BarXFraction", "BarYFraction",
+                         &g_pitLimiterConfig.barXFraction, &g_pitLimiterConfig.barYFraction,
+                         cx, cy, barHalfW, barHalfH, &g_pitLimiterConfig.barScale, "BarScale");
+        float textH = barHalfH;
+        const float avail = barHalfW * 2.0f - bgPaddingPx * 2.0f * bs;
+        const float w = renderer.MeasureText(barBuf, textH);
+        if (w > avail && w > 0.0f) textH *= avail / w;
+        const bool over = pitSquare && speedKmhNow > limitKmh + 0.5;
+        const float a = (over && !blinkOn) ? 0.4f * fade : fade;
+        renderer.AddFilledRoundedRect(cx, cy, barHalfW, barHalfH,
+                                      bgCornerRadiusPx, 0.0f, 1.0f, 0.32f, 0.05f, pitBarPlaceholder ? 0.5f * fade : a);
+        renderer.AddText(cx, cy - textH * 0.5f, barBuf, textH,
+                         1.0f, 1.0f, 1.0f, fade, Renderer::HAlign::Center);
     }
 
     // --- Tyre lockup box, 2x2 grid immediately RIGHT of the speed panel ---

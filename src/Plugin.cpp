@@ -24,6 +24,7 @@
 #include "TyreWear.h"
 #include "SetupInfo.h"
 #include "DrsCue.h"
+#include "BrakeCue.h"
 #include "PitEntry.h"
 #include "RealtimeState.h"
 #include "InputLagEstimate.h"
@@ -38,6 +39,7 @@
 #include "FfbGraph.h"
 #include "Profiler.h"
 #include "TrackMap.h"
+#include "EngineTemps.h"
 #include "CarLayout.h"
 
 // Latched from scoring, read on the telemetry thread. -1 until the first
@@ -66,6 +68,7 @@ public:
         g_tyreWear.Init();
         g_setupInfo.Init();
         g_drsCue.Init();
+        g_brakeCue.Init();
         g_pitEntry.Init();
         g_miniSector.Init();
         g_tyreTemps.Init();
@@ -116,6 +119,7 @@ public:
         g_gearDisplay.FlushIfDirty();
         g_fuelStore.FlushIfDirty();
         g_lapDelta.FlushIfDirty();
+        g_brakeCue.FlushIfDirty();
         TrackMap::FlushIfDirty();
         CarLayout::FlushIfDirty();
         if (!Config::FlushPendingWrites())
@@ -125,9 +129,11 @@ public:
         g_pedalTrace.Clear();
         g_gearDisplay.Clear();
         g_lapDelta.Clear();
+        g_brakeCue.Clear();
         g_relativeTiming.Clear();
         g_fuelStore.Clear();
         g_tyreWear.Clear();
+        EngineTemps::Reset();
         g_setupInfo.Clear();
         g_drsCue.Clear();
         g_pitEntry.Clear();
@@ -169,6 +175,9 @@ public:
         g_inRealtime = false;
         g_carState.Clear();
         g_pedalTrace.Clear();
+        // Not a full Clear(): dropping to the monitor is still the same
+        // session, and the reference stays this session's best lap.
+        g_brakeCue.OnExitRealtime();
     }
 
     // Scoring: positions of all cars, ~5Hz (radar).
@@ -190,6 +199,7 @@ public:
 
         // Each call timed for the DLL-cost panel (Profiler.h).
         { PROF("Radar"); g_carState.Update(info); }
+        { PROF("Brake cue"); g_brakeCue.OnScoring(info); }
         { PROF("Lap delta"); g_lapDelta.OnScoring(info); }
         { PROF("Relative"); g_relativeTiming.OnScoring(info); }
         { PROF("Fuel"); g_fuelStore.OnScoring(info); }
@@ -229,6 +239,7 @@ public:
             g_gearDisplay.FlushIfDirty();
             g_fuelStore.FlushIfDirty();
             g_lapDelta.FlushIfDirty();
+            g_brakeCue.FlushIfDirty();
             TrackMap::FlushIfDirty();
             CarLayout::FlushIfDirty();
             if (!Config::FlushPendingWrites())
@@ -274,6 +285,7 @@ public:
             return;
 
         { PROF("Pedal trace"); g_pedalTrace.Update(info); }
+        { PROF("Brake cue"); g_brakeCue.OnTelemetry(info); }
         {
             PROF("FFB graph");
             g_ffbSpectrum.OnTelemetry(info.mLapNumber, static_cast<float>(sqrt(
@@ -282,6 +294,7 @@ public:
         { PROF("Gear + speed"); g_gearDisplay.Update(info); }
         { PROF("Fuel"); g_fuelStore.OnTelemetry(info); }
         { PROF("Tyre wear"); g_tyreWear.OnTelemetry(info); }
+        { PROF("Engine temps"); EngineTemps::OnTelemetry(info); }
         { PROF("Brake bias"); g_setupInfo.OnTelemetry(info); }
         { PROF("DRS"); g_drsCue.OnTelemetry(info); }
         { PROF("Input lag"); InputLagEstimate::OnTelemetry(info); }

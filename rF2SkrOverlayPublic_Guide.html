@@ -57,7 +57,7 @@
 
 <header>
   <h1>rF2SkrOverlayPublic</h1>
-  <p class="sub">In-car driving HUD for rFactor 2 &middot; version 26.11.13.1 &middot; by Paul Kiernan, Shamrock Kiernan Racing (SKR)</p>
+  <p class="sub">In-car driving HUD for rFactor 2 &middot; version 26.11.17.2 &middot; by Paul Kiernan, Shamrock Kiernan Racing (SKR)</p>
 </header>
 
 <nav>
@@ -162,6 +162,7 @@ used with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>).</p>
   <tr><td>ABS / TC indicator</td><td>Which of these can light the small box next to the gear digit. See <a href="#gear">Gear &amp; speed</a>.</td></tr>
   <tr><td>Track map rows</td><td>Colour mode, mini-sector count, and for the current circuit its rotation, mirror and re-record. See <a href="#map">Track map</a>.</td></tr>
   <tr><td>Cover box rows</td><td>How many cover boxes, their shade and their opacity. See <a href="#cover">Cover boxes</a>.</td></tr>
+  <tr><td>Brake beep slider</td><td>Which braking points beep, by how much speed they lose. See <a href="#brakebeep">Braking-point beep</a>.</td></tr>
 </table>
 
 <!-- ============================================================ -->
@@ -606,6 +607,25 @@ used with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>).</p>
 <div class="note">Have your audio device switched on before starting rFactor 2. The game itself can crash while
 loading a car if it starts with no sound device.</div>
 
+<h3 id="brakebeep">Braking-point beep</h3>
+<p>Beeps just before each place where you started braking on your best lap of the session, as a reminder of
+where your braking point was. It is <strong>off by default</strong>: switch on the <strong>Brake cue + beep</strong>
+row in the shortcut list (or set <code>ShowBrakeCue=1</code> in <code>[Shortcuts]</code>).</p>
+<ul>
+  <li>It needs one complete, valid lap first. When you set a faster lap, its braking points replace the old ones.</li>
+  <li>The beep comes 0.3 s before the braking point (<code>[BrakeCue] LeadTimeSeconds</code>), so that with a normal
+    reaction your foot reaches the pedal at about the right place.</li>
+  <li>Only big stops beep. The <strong>Brake beep</strong> slider in the shortcut list sets how much speed a stop
+    must lose on your best lap to get a beep, from every braking point up to 150 km/h. The default is 50 km/h.</li>
+  <li>A small <strong>Brake React</strong> box near the bottom of the screen shows how long you took to touch the
+    brake after each beep (the average and the last one). It moves and resizes in layout mode like the other panels,
+    and can be hidden with <code>[BrakeCue] ShowReactionStats=0</code>.</li>
+  <li>The pitch and length of the beep are <code>BeepFrequencyHz</code> and <code>BeepDurationMs</code> in
+    <code>[BrakeCue]</code>.</li>
+</ul>
+<div class="note">The beep follows your own best lap, not an ideal one. Treat it as a reminder, not a target: if
+you find you can brake later, do, and the next best lap moves the beeps with you.</div>
+
 <!-- ============================================================ -->
 <h2 id="perf">Frame-time stats and clock</h2>
 <p>A fixed-size box with FPS and frame time. More stats can be switched on in the <code>[FrameLatency]</code>
@@ -630,7 +650,7 @@ you last used in it.</p>
   <tr><td><code>FuelStats\</code></td><td>Learned fuel consumption per car class and track.</td></tr>
   <tr><td><code>PitLimits\</code></td><td>Learned pit-lane speed limit per car and track.</td></tr>
   <tr><td><code>PitEntryOffsets\</code></td><td>Learned pit-entry position per track, for the pit-limiter reminder.</td></tr>
-  <tr><td><code>BestLaps\</code></td><td>Your all-time best lap per car and track, for the delta bar.</td></tr>
+  <tr><td><code>BestLaps\</code></td><td>Your all-time best lap per car and track, for the delta bar, and the braking-point beep's brake traces (<code>.brake</code> files).</td></tr>
   <tr><td><code>ShiftPoints\</code></td><td>Learned shift points per car, for the shift cue.</td></tr>
 </table>
 <p>The log is <code>Bin64\rF2SkrOverlayPublic.log</code>. The previous run's log is kept as

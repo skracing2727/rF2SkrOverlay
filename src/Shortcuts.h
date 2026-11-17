@@ -32,6 +32,7 @@ namespace Shortcuts
         MiniSector,       // delta-speed strip
         RelativeTiming,
         FuelTyre,
+        BrakeCue,         // brake cue info AND its beep
         Drs,              // DRS "OPEN DRS"/"DRS ENGAGED" sign AND its beep
         Clock,
         SideBar,          // side proximity bars -- independent of the radar itself

@@ -107,6 +107,7 @@ struct ShortcutConfig
     int miniSector = 0;          // delta-speed strip
     int relativeTiming = 0;
     int fuelTyre = 0;
+    int brakeCue = 0;            // brake cue info AND its beep, together
     int drs = 0;                 // DRS beep AND the on-screen "OPEN DRS"/"DRS ENGAGED" sign, together
     // List and LayoutMode are the two most important bindings -- everything
     // else can be rediscovered from the on-screen list, but you need one of
@@ -151,6 +152,7 @@ struct ShortcutConfig
     bool showMiniSector = false;  // little used, so off unless asked for
     bool showRelativeTiming = true;
     bool showFuelTyre = true;
+    bool showBrakeCue = false;
     bool showDrs = true;
     bool showClock = true;
     bool showSideBar = true;
@@ -856,7 +858,7 @@ struct PitLimiterConfig
     // One long beep once speed drops to/under the limit while the limiter
     // isn't engaged yet, fired only once per "went from over to at/under"
     // transition so it doesn't repeat every frame while you sit under it.
-    bool engageBeepEnabled = true;
+    bool engageBeepEnabled = false;
     int engageBeepFrequencyHz = 1400;
     int engageBeepDurationMs = 600;
 
@@ -866,9 +868,15 @@ struct PitLimiterConfig
     // (PitEntryStore::distanceToLineM) -- a pit stop stays "requested"
     // for the whole lap, so without this a slow corner anywhere on track,
     // nowhere near the pits, would falsely trigger the reminder.
-    bool engageWarningEnabled = true;
+    bool engageWarningEnabled = false;
     float engageWarningMaxDistanceM = 400.0f;
     float engageWarningTextHeightPx = 80.0f;   // enlarged per request
+    // PIT LIMITER bar: centre position (fractions of screen; -1 = auto,
+    // laid over the gear/speed row) and size multiplier. Draggable/resizable
+    // in layout mode.
+    float barXFraction = -1.0f;
+    float barYFraction = -1.0f;
+    float barScale = 1.0f;
     float engageWarningXFraction = 0.5f;
     float engageWarningYFraction = 0.4f;
     float engageWarningR = 1.0f, engageWarningG = 0.9f, engageWarningB = 0.1f;
@@ -1193,6 +1201,10 @@ struct RelativeTimingConfig
     // Clamped to [kMinVisibleCars, kMaxVisibleCars] -- see RelativeTiming.h
     // for why kMaxRows has the headroom it does.
     float visibleCars = 6.0f;
+    // Races: list the cars in the order they are on TRACK around you (any
+    // lap, marked +1L / -1L), with on-track gaps -- instead of the places
+    // either side of yours in the standings. Off = the old standings window.
+    bool raceTrackOrder = true;
     static constexpr float kMinVisibleCars = 3.0f;
     static constexpr float kMaxVisibleCars = 12.0f;
 
@@ -1220,6 +1232,8 @@ struct RelativeTimingConfig
     // Place and name of a car at least a full lap behind the player (race
     // sessions only -- laps completed means nothing in practice).
     float lapDownR = 0.35f, lapDownG = 0.65f, lapDownB = 1.0f;      // blue
+    // A car a lap or more AHEAD of you (lapping you, or will).
+    float lapUpR = 1.0f, lapUpG = 0.45f, lapUpB = 0.35f;            // red
 
     // Gap-number colour follows the TREND, same idea as LapDelta's bar: a
     // positive trend always means the gap is moving in the player's favour
@@ -1400,6 +1414,78 @@ struct LayoutConfig
     // only be moved from within.
     float bannerPosXFraction = 0.5f;
     float bannerPosYFraction = 0.12f;
+};
+
+struct BrakeCueConfig
+{
+    bool enabled = true;
+
+    float brakeThreshold = 0.2f;       // brake input above this counts as "braking" -- lowered from 0.8 so the recorded point is where braking BEGINS rather than where it peaks, which also brings it close to reactionThreshold (0.1) so the two now mark nearly the same moment in one application
+    float minPointSpacingM = 15.0f;    // ignore a new point this close to the last one (pumped brakes, same zone)
+    // Only beep for big stops: a point whose speed drop on the reference lap
+    // (braking start down to the slowest speed before the next point) is
+    // below this stays silent. Slider in the shortcut list.
+    float minSpeedDropKmh = 50.0f;
+    static constexpr float kMinSpeedDropMin = 0.0f;
+    static constexpr float kMinSpeedDropMax = 150.0f;
+    float leadTimeSec = 0.3f;          // the beep fires this long before the reference point (the seed instead, if adaptiveLeadTimeEnabled)
+
+    int beepFrequencyHz = 880;         // A5 -- clear without being harsh
+    int beepDurationMs = 120;
+
+    // --- Reaction-time measurement and adaptive lead time ---
+
+    // Brake input above this counts as "the pedal has now moved", for timing
+    // the reaction to a beep. Deliberately far lower than brakeThreshold
+    // above (which only marks a genuinely committed braking point worth
+    // recording) -- this just wants the first instant of pedal movement.
+    float reactionThreshold = 0.10f;
+
+    // A beep with no pedal movement within this long is abandoned rather
+    // than matched against whatever braking eventually follows -- otherwise
+    // missing a corner entirely (off track, a spin, simply ignoring the cue)
+    // would record a multi-second "reaction".
+    float reactionTimeoutSeconds = 3.0f;
+
+    // Once a reaction has been measured, the beep fires the driver's OWN
+    // average reaction time before the reference point instead of
+    // leadTimeSec -- so the pedal actually moves AT the reference lap's
+    // brake point. Reacting slowly pushes the beep earlier, reacting quickly
+    // pulls it later.
+    //
+    // OFF by default: it cannot tell a slow reaction from braking later than
+    // the reference ON PURPOSE. Braking later and later as you find time
+    // reads as an ever slower "reaction", so the beep moves earlier, the gap
+    // grows again, and it runs away. A fixed
+    // leadTimeSec does not drift; the reference points themselves still move
+    // later whenever a faster lap is recorded.
+    bool adaptiveLeadTimeEnabled = false;
+
+    // Individual measurements outside this range are discarded rather than
+    // dragging the average around -- below the floor is not a reaction to
+    // anything (already braking, or noise), above the ceiling is a missed
+    // cue rather than a slow one. A real reaction to a sound while driving
+    // is ~0.15-0.6s, so the ceiling is already generous; it also doubles as
+    // the bound on how early the cue can ever be moved (see BrakeCue.cpp's
+    // LeadTimeSeconds).
+    float reactionMinSeconds = 0.02f;
+    float reactionMaxSeconds = 1.5f;
+
+    // On-screen "Brake React" readout: average and most recent measurement.
+    bool showReactionStats = true;
+    float reactionStatsCenterXFraction = 0.5f;
+    // Positioned below the pedals panel (PedalConfig::centerYFraction = 0.9516)
+    // with padding, so it sits comfortably at the bottom without competing for space.
+    float reactionStatsCenterYFraction = 0.982f;
+    float reactionStatsTextHeightPx = 28.0f;
+    // Size multiplier for the reaction-stats readout -- see the note on
+    // RadarConfig::scale.
+    float reactionStatsScale = 1.0f;
+    float reactionStatsR = 1.0f, reactionStatsG = 1.0f, reactionStatsB = 1.0f;
+    bool reactionStatsBgEnabled = true;
+    float reactionStatsBgPaddingPx = 8.0f;
+    float reactionStatsBgCornerRadiusPx = 8.0f;
+    float reactionStatsBgR = 0.08f, reactionStatsBgG = 0.08f, reactionStatsBgB = 0.08f, reactionStatsBgA = 0.6f;
 };
 
 struct DrsCueConfig
@@ -1625,7 +1711,42 @@ extern GearDisplayConfig g_gearDisplayConfig;
 extern PitLimiterConfig g_pitLimiterConfig;
 extern LapDeltaConfig g_lapDeltaConfig;
 extern RelativeTimingConfig g_relativeTimingConfig;
+// Fuel-save delta bar for stint-length fuel targets -- see FuelSave.h.
+struct FuelSaveConfig
+{
+    bool enabled = true;
+    float stintMinutes = 0.0f;      // target stint length; 0 = bar off
+    float reserveLitres = 0.5f;     // left in the tank at the stint's end
+    float barWindowLitres = 0.10f;  // delta that fills half the bar
+    float centerXFraction = 0.5f;
+    float centerYFraction = 0.22f;
+    float scale = 1.0f;
+};
+extern FuelSaveConfig g_fuelSaveConfig;
+// Tyre-wear target panel -- see TyreSave.h.
+struct TyreSaveConfig
+{
+    bool enabled = true;
+    float targetWearPercent = 70.0f;  // max wear (0 = fresh) to reach at the target time
+    float targetMinutes = 100.0f;     // how long the set must last; 0 = panel off
+    float centerXFraction = 0.85f;
+    float centerYFraction = 0.30f;
+    float scale = 1.0f;
+};
+extern TyreSaveConfig g_tyreSaveConfig;
+// Water / oil temperature box -- see EngineTemps.h.
+struct EngineTempsConfig
+{
+    bool enabled = true;
+    float waterAmberMargin = 6.0f;  // C above the learned normal that turns it amber
+    float oilAmberMargin = 8.0f;
+    float centerXFraction = 0.85f;
+    float centerYFraction = 0.45f;
+    float scale = 1.0f;
+};
+extern EngineTempsConfig g_engineTempsConfig;
 extern FuelTyrePanelConfig g_fuelTyrePanelConfig;
+extern BrakeCueConfig g_brakeCueConfig;
 extern DrsCueConfig g_drsCueConfig;
 
 
