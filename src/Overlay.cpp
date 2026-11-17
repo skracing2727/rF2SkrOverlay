@@ -19,6 +19,7 @@
 #include "FuelSave.h"
 #include "TyreSave.h"
 #include "EngineTemps.h"
+#include "FfbLevel.h"
 #include "BrakeCue.h"
 #include "MiniSector.h"
 #include "TyreTemps.h"
@@ -1229,6 +1230,7 @@ namespace
                 { DRAWN("Fuel save"); FuelSave::Draw(g_renderer, sw, sh); }
                 { DRAWN("Tyre target"); TyreSave::Draw(g_renderer, sw, sh); }
                 { DRAWN("Engine temps"); EngineTemps::Draw(g_renderer, sw, sh); }
+                { DRAWN("FFB strength"); FfbLevel::Draw(g_renderer, sw, sh); }
                 if (Shortcuts::Visible(Shortcuts::BrakeCue))
                     { DRAWN("Brake cue"); BrakeCue::Draw(g_renderer, sw, sh); }
             }

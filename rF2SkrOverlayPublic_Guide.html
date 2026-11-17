@@ -57,7 +57,7 @@
 
 <header>
   <h1>rF2SkrOverlayPublic</h1>
-  <p class="sub">In-car driving HUD for rFactor 2 &middot; version 26.11.17.2 &middot; by Paul Kiernan, Shamrock Kiernan Racing (SKR)</p>
+  <p class="sub">In-car driving HUD for rFactor 2 &middot; version 26.11.17.3 &middot; by Paul Kiernan, Shamrock Kiernan Racing (SKR)</p>
 </header>
 
 <nav>
@@ -70,6 +70,8 @@
   <a href="#delta">Lap delta</a>
   <a href="#relative">Relative timing</a>
   <a href="#fueltyre">Fuel &amp; tyres</a>
+  <a href="#stint">Stint targets</a>
+  <a href="#engine">Engine &amp; FFB boxes</a>
   <a href="#temps">Tyre temps</a>
   <a href="#map">Track map</a>
   <a href="#ffb">FFB spectrum</a>
@@ -438,6 +440,47 @@ used with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>).</p>
     <figcaption>Fuel, brake bias and tyre wear boxes (values are only examples).</figcaption>
   </figure>
 </div>
+
+<!-- ============================================================ -->
+<h2 id="stint">Stint targets: fuel saving and tyre wear</h2>
+<p>For long races run in fixed-length stints. Both are set in the INI, and both move and resize in layout mode.</p>
+<h3>Fuel-saving bar</h3>
+<p>Set the stint length you need the tank to last, and the bar tells you live through every lap whether you are
+using more or less fuel than that allows. The target litres per lap is worked out again at the start of each lap from
+the fuel in the tank, the stint time left and your last lap time.</p>
+<ul>
+  <li>The bar fills <span class="swatch" style="background:#3ccf4e"></span>green while you are under the target for
+    the distance covered so far, and <span class="swatch" style="background:#e53935"></span>red while you are over it.</li>
+  <li>The line under it shows the target per lap, what last lap used, and how long a stint your recent laps are
+    heading for.</li>
+  <li>Off until you set a stint length: <code>[FuelSave] StintMinutes=50</code> (for example). <code>ReserveLitres</code>
+    is how much should be left at the end (default 0.5), and <code>BarWindowLitres</code> how big a difference fills
+    half the bar (default 0.10).</li>
+</ul>
+<h3>Tyre-wear target</h3>
+<p>Set how worn a set of tyres may get, and how long it must last. One small box per tyre shows last lap's wear
+(green when under what that lap needed, red when over) and how much wear per lap each tyre can now afford. Each box is
+also tinted live through the lap. The clock starts again whenever fresh tyres go on.</p>
+<ul>
+  <li><code>[TyreSave] TargetWearPercent</code>: the most wear allowed, default 70%.</li>
+  <li><code>[TyreSave] TargetMinutes</code>: how long the set must last, default 100. Set it to 0 to hide the panel.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="engine">Engine temperatures and FFB strength</h2>
+<h3>Water and oil temperatures</h3>
+<p>rFactor 2 gives plugins the two temperatures and a flag for when the engine is already overheating, but not the
+car's limits. So the box learns what is normal for this car from your own driving at speed this session: white is
+normal, <span class="swatch" style="background:#ffb300"></span>amber is well above normal, and
+<span class="swatch" style="background:#e53935"></span>red means the game says the engine is overheating. How far
+above normal turns amber is <code>[EngineTemps] WaterAmberMargin</code> (default 6&nbsp;&deg;C) and
+<code>OilAmberMargin</code> (default 8&nbsp;&deg;C). Some cars report no temperatures to plugins; then the box just says "Engine temp OK", or "OVERHEATING" on red when the game says so.</p>
+<h3>FFB strength</h3>
+<p>The force rFactor 2 is sending to your wheel right now, as a percentage of full strength (held at its peak
+briefly so you can read it), the highest so far this lap, and last lap's highest along with how much of that lap
+was at 100% (clipping). If the clipping figure is high, turn the car's FFB strength down.</p>
+<p>Both boxes move and resize in layout mode. Turn one off with <code>Enabled=0</code> in its INI section
+(<code>[EngineTemps]</code> or <code>[FfbLevel]</code>).</p>
 
 <!-- ============================================================ -->
 <h2 id="temps">Tyre temperatures</h2>

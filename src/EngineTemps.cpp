@@ -3,6 +3,7 @@
 #include "Renderer.h"
 #include "Config.h"
 #include "Layout.h"
+#include "Log.h"
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -37,6 +38,8 @@ void EngineTemps::OnTelemetry(const TelemInfoV01& info)
     s_oil = o;
     s_overheating = info.mOverheating;
     s_valid = w > 1.0f || o > 1.0f;
+    static bool logged = false;
+    if (!logged) { logged = true; Log::Write("EngineTemps: first telemetry water %.1f oil %.1f", w, o); }
 
     const double v = sqrt(info.mLocalVel.x * info.mLocalVel.x + info.mLocalVel.z * info.mLocalVel.z);
     const float dt = static_cast<float>(info.mDeltaTime);
@@ -61,7 +64,11 @@ bool EngineTemps::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     EngineTempsConfig& cfg = g_engineTempsConfig;
     if (!cfg.enabled) return false;
     const bool placeholder = Layout::Active();
-    if (!s_valid && !placeholder) return false;
+    static int lastWhy = -1;
+    const int why = s_valid ? 1 : 0;
+    if (why != lastWhy) { lastWhy = why; Log::Write("EngineTemps: drawing %s", why ? "yes" : "no (no temperature data)"); }
+    // Drawn even with no data ("--"), so the box can always be found and a
+    // car that reports no temperatures shows as such instead of vanishing.
 
     const float s = static_cast<float>(screenHeight) / 2160.0f * (cfg.scale > 0.05f ? cfg.scale : 0.05f);
     const float textPx = 36.0f * s;
@@ -75,6 +82,20 @@ bool EngineTemps::Draw(Renderer& renderer, int screenWidth, int screenHeight)
 
     const bool prevBg = renderer.TextBackgroundEnabled();
     renderer.SetTextBackground(false);
+    // No temperatures from this car (some mods report 0 to plugins): the
+    // game's overheating flag is all there is, so show that as a status.
+    if (!s_valid)
+    {
+        const bool hotNow = s_overheating.load();
+        if (hotNow)
+            renderer.AddFilledRoundedRect(cx, cy, halfW, halfH, 8.0f * s, 0.0f, 0.85f, 0.12f, 0.1f, 0.9f);
+        else
+            renderer.AddFilledRoundedRect(cx, cy, halfW, halfH, 8.0f * s, 0.0f, 0.08f, 0.08f, 0.08f, 0.6f);
+        renderer.AddText(cx, cy - textPx * 0.5f, hotNow ? "OVERHEATING" : "Engine temp OK", textPx,
+                         hotNow ? 1.0f : 0.4f, hotNow ? 1.0f : 0.9f, hotNow ? 1.0f : 0.45f, 1.0f, Renderer::HAlign::Center);
+        renderer.SetTextBackground(prevBg);
+        return true;
+    }
     renderer.AddFilledRoundedRect(cx, cy, halfW, halfH, 8.0f * s, 0.0f, 0.08f, 0.08f, 0.08f, 0.6f);
 
     const bool learned = s_learnSeconds.load() >= kLearnMinSeconds;
@@ -89,7 +110,12 @@ bool EngineTemps::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         if (hot) { r = 1.0f; g = 0.3f; b = 0.25f; }
         else if (learned && vals[i] > norms[i] + margins[i]) { r = 1.0f; g = 0.75f; b = 0.15f; }
         char line[64];
-        if (learned)
+        if (!s_valid)
+        {
+            sprintf_s(line, "%s --", names[i]);
+            r = g = b = 0.7f;
+        }
+        else if (learned)
             sprintf_s(line, "%s %.0fC  (%+.0f)", names[i], vals[i], vals[i] - norms[i]);
         else
             sprintf_s(line, "%s %.0fC", names[i], vals[i]);

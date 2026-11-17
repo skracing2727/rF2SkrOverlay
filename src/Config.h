@@ -1745,6 +1745,15 @@ struct EngineTempsConfig
     float scale = 1.0f;
 };
 extern EngineTempsConfig g_engineTempsConfig;
+// FFB strength box -- see FfbLevel.h.
+struct FfbLevelConfig
+{
+    bool enabled = true;
+    float centerXFraction = 0.85f;
+    float centerYFraction = 0.55f;
+    float scale = 1.0f;
+};
+extern FfbLevelConfig g_ffbLevelConfig;
 extern FuelTyrePanelConfig g_fuelTyrePanelConfig;
 extern BrakeCueConfig g_brakeCueConfig;
 extern DrsCueConfig g_drsCueConfig;

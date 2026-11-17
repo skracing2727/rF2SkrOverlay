@@ -49,6 +49,7 @@ cl.exe /nologo /EHsc /std:c++17 /LD /O2 ^
   ..\src\FuelSave.cpp ^
   ..\src\TyreSave.cpp ^
   ..\src\EngineTemps.cpp ^
+  ..\src\FfbLevel.cpp ^
   ..\src\TyreWear.cpp ^
   ..\src\SetupInfo.cpp ^
   ..\src\DrsCue.cpp ^

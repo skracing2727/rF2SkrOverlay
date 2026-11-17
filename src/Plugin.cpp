@@ -40,6 +40,7 @@
 #include "Profiler.h"
 #include "TrackMap.h"
 #include "EngineTemps.h"
+#include "FfbLevel.h"
 #include "CarLayout.h"
 
 // Latched from scoring, read on the telemetry thread. -1 until the first
@@ -308,6 +309,7 @@ public:
     {
         PROF("FFB graph");
         g_ffbSpectrum.OnForce(forceValue);
+        FfbLevel::OnForce(forceValue);
         return false;
     }
 

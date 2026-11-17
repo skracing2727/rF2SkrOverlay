@@ -30,6 +30,7 @@ FuelTyrePanelConfig g_fuelTyrePanelConfig;
 FuelSaveConfig g_fuelSaveConfig;
 TyreSaveConfig g_tyreSaveConfig;
 EngineTempsConfig g_engineTempsConfig;
+FfbLevelConfig g_ffbLevelConfig;
 BrakeCueConfig g_brakeCueConfig;
 DrsCueConfig g_drsCueConfig;
 
@@ -1871,6 +1872,12 @@ void Config::Load()
     et.centerXFraction = ReadFloat("EngineTemps", "CenterXFraction", et.centerXFraction);
     et.centerYFraction = ReadFloat("EngineTemps", "CenterYFraction", et.centerYFraction);
     et.scale = ReadFloat("EngineTemps", "Scale", et.scale);
+
+    FfbLevelConfig& ffl = g_ffbLevelConfig;
+    ffl.enabled = ReadBool("FfbLevel", "Enabled", ffl.enabled);
+    ffl.centerXFraction = ReadFloat("FfbLevel", "CenterXFraction", ffl.centerXFraction);
+    ffl.centerYFraction = ReadFloat("FfbLevel", "CenterYFraction", ffl.centerYFraction);
+    ffl.scale = ReadFloat("FfbLevel", "Scale", ffl.scale);
 
     FuelTyrePanelConfig& ft = g_fuelTyrePanelConfig;
     ft.enabled = ReadBool("FuelTyrePanel", "Enabled", ft.enabled);
