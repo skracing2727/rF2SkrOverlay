@@ -50,6 +50,7 @@ private:
     double m_pendingStartET = 0.0;
     double m_belowExitStartET = -1.0;
     double m_tailStartET = 0.0;
+    double m_lastLogET = -1.0;   // session time of the last corner logged (see Finalize)
 
     // In the SDK's own left/centre/right order; mapped only when published.
     float m_peak[4][3] = {};

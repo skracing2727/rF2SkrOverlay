@@ -31,7 +31,7 @@ void CoverBox::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                             centerX, centerY, halfW, halfH,
                             &cfg.widthPx[i], kWKey[i], &cfg.heightPx[i], kHKey[i]);
 
-        renderer.AddFilledRoundedRect(centerX, centerY, halfW, halfH, cfg.cornerRadiusPx * px, 0.0f,
-                                      cfg.grey, cfg.grey, cfg.grey, cfg.a);
+        renderer.AddFilledRect(centerX, centerY, halfW, halfH, 0.0f,
+                               cfg.grey, cfg.grey, cfg.grey, cfg.a);   // square corners
     }
 }

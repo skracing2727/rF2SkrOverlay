@@ -115,14 +115,14 @@ namespace
     }
 }
 
-void ProximityHue::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND hwnd)
+void ProximityHue::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND hwnd, const CarSnapshot& snap)
 {
     const RadarConfig& cfg = g_radarConfig;
 
-    CarPos cars[128];
-    double playerHeading = 0.0;
-    bool hasPlayer = false;
-    const int count = g_carState.Read(cars, 128, playerHeading, hasPlayer);
+    const CarPos* cars = snap.cars;
+    const double playerHeading = snap.playerHeading;
+    const bool hasPlayer = snap.hasPlayer;
+    const int count = snap.count;
 
     const CarPos* player = nullptr;
     for (int i = 0; i < count; ++i)

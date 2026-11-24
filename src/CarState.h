@@ -27,12 +27,32 @@ struct CarPos
     double x, z;      // world position, ground plane (interpolated)
     double heading;   // world yaw, radians (interpolated)
     bool isPlayer;
-    // Copied straight from VehicleScoringInfoV01 (not interpolated -- a car
-    // does not change class mid-tick). Used to look up a real per-class
-    // footprint for the radar's car icons instead of one guessed box shared
-    // by every car on the grid; see Radar.cpp's LookupCarFootprint.
-    char vehicleClass[32];
-    char vehicleName[64];
+    // Which entry of the footprint table below this car's class/name matched
+    // (-1: none). Worked out on the scoring thread, and only when a car's
+    // class or name actually changes -- it used to be up to 28 case-
+    // insensitive substring scans per car per frame in the radar's draw.
+    int footprint;
+};
+
+// Typical real footprint for a handful of recognisable categories, matched
+// against the car's own VehicleScoringInfoV01 class and name (see CarState.cpp
+// for the table and where each figure comes from). The SDK exposes no actual
+// per-car dimension field, so this is not exact for any one specific car --
+// but it is a genuine improvement over one flat box shared by every car on a
+// mixed grid. Returns false for -1 (no category matched).
+struct CarFootprint { float halfWidthM, halfLengthM, cornerRadiusM; };
+bool GetCarFootprint(int footprint, CarFootprint& out);
+
+// One frame's interpolated read of every car (see CarStateStore::Read). The
+// radar and the side bars draw from the same one, so they cannot disagree by
+// the few microseconds between two separate reads either.
+struct CarSnapshot
+{
+    static const int kMaxCars = 128;
+    CarPos cars[kMaxCars];
+    int count = 0;
+    double playerHeading = 0.0;
+    bool hasPlayer = false;
 };
 
 class CarStateStore
@@ -44,6 +64,7 @@ public:
     void Update(const struct ScoringInfoV01& info);
     // Copies the latest snapshot out, interpolated to 'now'.
     int Read(CarPos* out, int maxCars, double& outPlayerHeading, bool& outHasPlayer);
+    void Read(CarSnapshot& out) { out.count = Read(out.cars, CarSnapshot::kMaxCars, out.playerHeading, out.hasPlayer); }
     void Clear();
 
 private:
@@ -58,6 +79,12 @@ private:
         double x, z;
         double heading;
         bool isPlayer;
+        // Index of the same car (by id) in the previous sample set, or -1 --
+        // found once per scoring tick in Update, instead of searched for by
+        // every Read.
+        int prevIndex = -1;
+        int footprint = -1;
+        // Kept only to notice a class/name change (and so redo 'footprint').
         char vehicleClass[32];
         char vehicleName[64];
     };
@@ -65,20 +92,21 @@ private:
     CRITICAL_SECTION m_lock;
     bool m_ready = false;
 
-    // "cur" is the most recently received real sample; "prev" is the one
-    // before that. Every Read() interpolates between them.
-    CarEntry m_curCars[kMaxCars] = {};
+    // Three sample sets: "cur" (the most recently received real sample) and
+    // "prev" (the one before it), which every Read() interpolates between,
+    // and a spare one Update fills without the lock. Taking the lock then only
+    // swaps the indices, so the render thread never waits on the scoring
+    // thread's per-car work. Only Update writes the buffers.
+    CarEntry m_cars[3][kMaxCars] = {};
+    int m_cur = 0, m_prev = 1, m_spare = 2;   // m_cur/m_prev change under m_lock; m_spare is Update's
+
     int m_curCount = 0;
     LARGE_INTEGER m_curTime = {};
-
-    CarEntry m_prevCars[kMaxCars] = {};
     int m_prevCount = 0;
     LARGE_INTEGER m_prevTime = {};
 
     bool m_hasPlayer = false;
     LARGE_INTEGER m_freq = {};
-
-    const CarEntry* FindPrev(long id) const;
 };
 
 extern CarStateStore g_carState;

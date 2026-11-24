@@ -83,12 +83,28 @@ public:
     // Vertices queued so far this frame, for per-panel accounting.
     size_t ShapeVertexCount() const { return m_vertices.size(); }
     size_t TextVertexCount() const { return m_textVertices.size(); }
+    // Everything queued after this call is drawn above everything queued
+    // before it, text included. Without it all shapes go first and all text
+    // after, so any panel's text shows through a box drawn later (the knob
+    // menus, 2026-11-23). Once per frame; reset by BeginFrame.
+    void BeginTopLayer() { m_topShape = m_vertices.size(); m_topText = m_textVertices.size(); }
     void SetTextBackgroundStyle(float r, float g, float b, float a, float paddingPx, float cornerRadiusPx);
 
 private:
-    struct Vertex { float x, y; float r, g, b, a; };
+    // Colour travels as four half floats (R16G16B16A16_FLOAT in the input
+    // layouts; the shaders still see a float4), not four floats: the per-frame
+    // upload and every throttled widget's cached copy are a third smaller.
+    // Not 8-bit: values above 1 must survive -- see PackColor.
+    struct Vertex { float x, y; UINT64 rgba; };
+    static UINT64 PackColor(float r, float g, float b, float a);
 
-    void PixelToNDC(float px, float py, float& ndcX, float& ndcY) const;
+    // Screen pixels to NDC, with 2/width and 2/height worked out once per
+    // frame in BeginFrame instead of two divisions per vertex.
+    void PixelToNDC(float px, float py, float& ndcX, float& ndcY) const
+    {
+        ndcX = px * m_ndcScaleX - 1.0f;
+        ndcY = 1.0f - py * m_ndcScaleY;
+    }
     void PushTriangle(const Vertex& a, const Vertex& b, const Vertex& c);
 
     ID3D11Device* m_device = nullptr;
@@ -105,17 +121,26 @@ private:
     std::vector<Vertex> m_vertices;
     int m_screenWidth = 1;
     int m_screenHeight = 1;
+    float m_ndcScaleX = 2.0f;   // 2 / m_screenWidth
+    float m_ndcScaleY = 2.0f;   // 2 / m_screenHeight
     // Generous: at a 10s / 144Hz pedal trace, worst case is ~53k vertices
-    // (4 lines x 1439 segments x 6 verts, plus slip strips). At 24 bytes each
-    // this buffer is still only ~2.4MB.
+    // (4 lines x 1439 segments x 6 verts, plus slip strips). At 16 bytes each
+    // this buffer is still only ~3.2MB.
     // Raised to 200k with the FFB spectrum panel: past the cap, the rest of
     // the frame's shapes (and a throttled widget's whole replay) are dropped,
     // which shows as panels flashing off. Overflow is now logged.
     static const UINT kMaxVertices = 200000;
     UINT m_droppedVertices = 0;
+    // Write positions in the two dynamic vertex buffers, used as rings: each
+    // frame appends after the last (MAP_WRITE_NO_OVERWRITE) and only a full
+    // buffer is renamed with MAP_WRITE_DISCARD. Discarding every frame made
+    // the driver block in Map() whenever the GPU was busy -- 1-2 ms a frame
+    // at Spa, shown as "Renderer upload" though almost nothing was copied.
+    UINT m_vbPos = 0;
+    UINT m_textVbPos = 0;
 
     // --- Text: separate pipeline, textured alpha-only glyph atlas ---
-    struct TextVertex { float x, y; float u, v; float r, g, b, a; };
+    struct TextVertex { float x, y; float u, v; UINT64 rgba; };
     struct Glyph { float u0, v0, u1, v1; float advancePx; };
 
     bool InitText();
@@ -125,7 +150,7 @@ private:
     bool m_fontReloadPending = false;
     char m_activeFace[64] = "";
     void ShutdownText();
-    void PushGlyphQuad(float x, float y, float w, float h, const Glyph& g, float r, float gg, float b, float a);
+    void PushGlyphQuad(float x, float y, float w, float h, const Glyph& g, UINT64 rgba);
 
     ID3D11VertexShader* m_textVs = nullptr;
     ID3D11PixelShader* m_textPs = nullptr;
@@ -148,7 +173,7 @@ private:
     // characters short of this -- comfortable today, but tight enough that a
     // widget added later could start silently dropping glyphs past the cap
     // (PushGlyphQuad just stops appending, no error). Sized with real
-    // headroom instead of exactly fitting current usage; 32 bytes/vertex
+    // headroom instead of exactly fitting current usage; 24 bytes/vertex
     // makes even this a rounding error in GPU memory.
     static const UINT kMaxTextVertices = 20000;
 
@@ -162,6 +187,36 @@ private:
     int SetFor(float pixelHeight) const;
 
 public:
+    // Geometry kept on the GPU between frames, for big shapes that rarely
+    // change (the track map's line: ~20k vertices at Spa, which re-uploaded
+    // every frame was nearly all of the overlay's CPU cost). Draw it as
+    // usual between BeginStatic() and EndStatic(): EndStatic moves what was
+    // drawn into the batch's own GPU buffer and draws it at this point in the
+    // frame. On later frames, while nothing changed, DrawStatic() draws the
+    // same batch again without re-sending anything. The batch must outlive
+    // the renderer's use of it (a static in the widget).
+    struct StaticBatch
+    {
+        ID3D11Buffer* buf = nullptr;
+        UINT count = 0;
+        UINT capacity = 0;
+        unsigned long long key = 0;   // the widget's hash of what it holds
+        bool valid = false;
+    };
+    size_t BeginStatic() const { return m_vertices.size(); }
+    void EndStatic(size_t mark, StaticBatch& batch);
+    void DrawStatic(StaticBatch& batch);
+
+private:
+    // A static batch drawn at a point in the shape stream (vertex index).
+    struct StaticInsert { size_t at; StaticBatch* batch; };
+    std::vector<StaticInsert> m_inserts;
+    std::vector<StaticBatch*> m_batches;   // to release on Shutdown
+    // BeginTopLayer's split points (vertex indices); SIZE_MAX = no top layer.
+    size_t m_topShape = static_cast<size_t>(-1);
+    size_t m_topText = static_cast<size_t>(-1);
+
+public:
     // Lets a widget throttled below full frame rate (see the tier notes on
     // each widget's own Draw()) skip regenerating its geometry on frames it
     // isn't due to update, by replaying what it drew last time instead. The
@@ -171,6 +226,7 @@ public:
     {
         std::vector<Vertex> shapeVerts;
         std::vector<TextVertex> textVerts;
+        std::vector<StaticInsert> inserts;   // static batches drawn in the captured range
         bool valid = false;
     };
     struct CaptureMark { size_t shapeCount; size_t textCount; };

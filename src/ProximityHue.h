@@ -27,10 +27,12 @@
 // costs ~0.2s of presentation delay, which is a far better trade than a
 // warning that false-fires.
 //
-// Everything runs in Draw() on the render thread, exactly like the radar --
-// CarState::Read() does its own locking, so nothing here needs a lock, a
-// snapshot buffer, or the scoring/telemetry callbacks at all.
+// Everything runs in Draw() on the render thread, exactly like the radar,
+// from the same per-frame CarState snapshot the radar draws from (Overlay.cpp
+// reads it once and hands it to both) -- so nothing here needs a lock or the
+// scoring/telemetry callbacks at all.
 class Renderer;
+struct CarSnapshot;
 
 class ProximityHue
 {
@@ -38,7 +40,7 @@ public:
     // 'hwnd' is the swap chain's output window -- needed only for the
     // layout-mode resize handle and opacity slider below, to hit-test the
     // mouse the same way Shortcuts' own list-click handling does.
-    void Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND hwnd);
+    void Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND hwnd, const CarSnapshot& cars);
 
 private:
     // Layout-mode-only width slider (vertical) and opacity slider

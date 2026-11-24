@@ -1,5 +1,6 @@
 #pragma once
 #include <Windows.h>
+#include <atomic>
 #include <vector>
 #include <string>
 
@@ -25,11 +26,12 @@ public:
     // session end so a stale in-progress trace, and the session-best
     // reference, don't leak into a new session.
     void Clear();
-    // Writes the best-lap trace if it's changed since the last flush --
-    // call only while NOT actively driving (see Plugin.cpp). OnScoring()
-    // itself never touches disk; setting a new best just marks it dirty, so
-    // the game's scoring thread can't be stalled by a slow disk or an
-    // antivirus scan intercepting the write.
+    // Writes the best-lap trace if it's changed since the last flush, and
+    // deletes the file of a personal best reset from the hotkey. Called from
+    // the save thread (Persist.cpp) at any moment: it swaps the save slot out
+    // under m_saveLock and does the file work after. OnScoring() itself never
+    // touches disk; setting a new best just fills the slot, so the game's
+    // scoring thread can't be stalled by a slow disk or an antivirus scan.
     void FlushIfDirty();
 
     struct DeltaState
@@ -87,7 +89,9 @@ public:
     // In-game resets, driven from the Ctrl+Shift hotkeys. ResetSessionBest
     // is in-memory only. ResetPersonalBest is DESTRUCTIVE -- it deletes the
     // saved per-car+track CSV as well as the in-memory trace, so the caller
-    // is expected to have confirmed with the user first.
+    // is expected to have confirmed with the user first. The readout clears
+    // at once, the trace on the next scoring tick, the file in the next save
+    // pass.
     void ResetSessionBest();
     void ResetPersonalBest();
     // "1:36.760" or "none set", for the confirmation prompt -- so the user is
@@ -115,8 +119,11 @@ public:
 private:
     struct Reference
     {
-        std::vector<std::pair<double, double>> trace; // sorted (distance, timeIntoLap)
+        std::vector<std::pair<double, double>> trace; // (distance, timeIntoLap), in order of distance
         double lapTimeSeconds = -1.0; // -1 = no reference lap yet
+        // trace's distances never step backwards (worked out whenever trace
+        // is set), so InterpolateAt can binary-search it.
+        bool sorted = true;
 
         double lastDeltaForTrend = 0.0;
         LARGE_INTEGER lastTrendTime = {};
@@ -150,16 +157,31 @@ private:
     // lap if needed. Scoring-thread-only; published to callers via
     // State::barWindowSeconds under m_lock, same as everything else here.
     double m_barWindowSeconds = 1.0;
-    // Set instead of saving directly whenever a new best lap is set; cleared
-    // by FlushIfDirty() once actually written (or by ResetPersonalBest(),
-    // so a manual reset can't be overwritten by a stale pending flush).
+    // Save slot, guarded by m_saveLock (taken only by the scoring thread,
+    // the save thread and Clear -- never by drawing). A new best copies its
+    // trace and key in here; FlushIfDirty() swaps them out and writes them.
+    // m_bestLapDirty is also cleared by a PB reset, so the reset can't be
+    // overwritten by a stale pending save.
+    SRWLOCK m_saveLock = SRWLOCK_INIT;
     bool m_bestLapDirty = false;
+    std::string m_saveKey;
+    double m_saveLapTime = -1.0;
+    std::vector<std::pair<double, double>> m_saveTrace;
+    bool m_deletePending = false;  // a PB reset's file delete, for the next save pass
+    std::string m_deleteKey;
+
+    // Set by ResetPersonalBest() (render thread), carried out by the scoring
+    // thread, which owns m_best -- see ApplyPersonalBestReset().
+    std::atomic<bool> m_resetPbRequested{ false };
+    // Same for the session best (ResetSessionBest): m_session is read
+    // unlocked by the scoring thread, so only that thread drops it.
+    std::atomic<bool> m_resetSessionRequested{ false };
+    void ApplyPersonalBestReset();
 
     State m_state;
     LARGE_INTEGER m_freq = {};
 
     void LoadBestLap(const char* vehicleName, const char* trackName);
-    void SaveBestLap() const;
 };
 
 extern LapDeltaStore g_lapDelta;

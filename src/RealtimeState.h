@@ -16,6 +16,15 @@ extern std::atomic<bool> g_inRealtime;
 // re-applied) normalised to 1x.
 extern std::atomic<int> g_fuelMult;
 
+// The player's headlights from telemetry: 1 on, 0 off, -1 not known yet.
+// For the "Headlights" rotary setting.
+extern std::atomic<int> g_headlightsOn;
+
+// The player's own car is being driven by the AI (scoring mControl == 1, e.g.
+// "Vehicle is now controlled by AI"). rF2 reports the speed limiter as on
+// then, even flat out, so the PIT warning ignores the limiter while this is set.
+extern std::atomic<bool> g_playerAiControl;
+
 // The player's vehicle CLASS ("MX-5 Cup", "F2", ...), captured once per
 // scoring tick and readable from the telemetry-driven widgets too.
 //

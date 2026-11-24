@@ -125,6 +125,10 @@ namespace Layout
     // is active.
     bool SuppressFade();
 
+    // Layout mode or the shortcut list open: every switched-on panel shows,
+    // at full size, with placeholder content where it has no data yet.
+    bool Preview();
+
     // Whether the OS cursor is currently VISIBLE, and where it is in
     // backbuffer pixels. This is the honest gate for any mouse interaction:
     // rFactor 2 only shows a cursor when it has actually released the mouse

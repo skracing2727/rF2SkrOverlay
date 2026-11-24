@@ -57,7 +57,7 @@
 
 <header>
   <h1>rF2SkrOverlayPublic</h1>
-  <p class="sub">In-car driving HUD for rFactor 2 &middot; version 26.11.17.3 &middot; by Paul Kiernan, Shamrock Kiernan Racing (SKR)</p>
+  <p class="sub">In-car driving HUD for rFactor 2 &middot; version 26.11.24.1 &middot; by Paul Kiernan, Shamrock Kiernan Racing (SKR)</p>
 </header>
 
 <nav>
@@ -66,12 +66,14 @@
   <a href="#controls">Controls</a>
   <a href="#radar">Radar</a>
   <a href="#gear">Gear &amp; speed</a>
+  <a href="#warnings">Warnings</a>
   <a href="#pedals">Pedal trace</a>
   <a href="#delta">Lap delta</a>
   <a href="#relative">Relative timing</a>
   <a href="#fueltyre">Fuel &amp; tyres</a>
   <a href="#stint">Stint targets</a>
   <a href="#engine">Engine &amp; FFB boxes</a>
+  <a href="#conditions">Track conditions</a>
   <a href="#temps">Tyre temps</a>
   <a href="#map">Track map</a>
   <a href="#ffb">FFB spectrum</a>
@@ -80,6 +82,7 @@
   <a href="#perf">Frame-time stats</a>
   <a href="#settings">Settings &amp; files</a>
   <a href="#licence">Licence</a>
+  <a href="#changes">Changes</a>
 </nav>
 
 <p>rF2SkrOverlayPublic is a plugin that draws a driving HUD straight into the rFactor 2 picture: radar, gear and speed,
@@ -116,6 +119,8 @@ variable-refresh range.</p>
       rF2SkrOverlayPublic on and restart the game.</li>
 </ol>
 <p>A settings file, <code>rF2SkrOverlayPublic.ini</code>, is created next to the DLL on first run.</p>
+<p>Nothing shows in the main menus: the plugin starts drawing once you load into a session (the garage), so it
+never touches the game's graphics while it is still starting up and setting the screen mode.</p>
 <p><strong>Requires</strong> 64-bit rFactor 2 running DirectX 11, and the Microsoft Visual C++ 2015&ndash;2022 x64
 runtime (most sim PCs already have it). It does not work in Le Mans Ultimate: LMU runs plugins in a separate
 process, so they cannot draw into the game picture.</p>
@@ -141,8 +146,9 @@ be deleted too.</p>
 <h2 id="controls">Controls</h2>
 <table>
   <tr><th style="width:34%">Key</th><th>What it does</th></tr>
-  <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>1</kbd></td><td>Opens the shortcut list: every panel, plus the gear-box, track map and cover box settings. Click a row to switch it.</td></tr>
-  <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>2</kbd></td><td>Layout mode. Drag any panel to move it, and drag its corner handle to resize it. Positions are saved automatically.</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>1</kbd></td><td>Opens the shortcut list: every panel, plus the gear-box, track map and cover box settings. Click a row to switch it. Drag the list's title to move it, and a corner square to resize it. The S / M / L boxes on its title line set the text size.</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>2</kbd></td><td>Layout mode. Drag any panel to move it, and drag any of its four corner handles to resize it: the opposite corner stays where it is. Panels show at their full size while you do this (the standings fill with placeholder rows), so you place them as they will look in a full race. Positions are saved automatically once you are out of the car.</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd></td><td>HUD always on: draws the HUD even when you are not driving, for example riding along while a team-mate drives your shared car. Press again to go back to normal.</td></tr>
   <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd></td><td>Turns the whole overlay off and on.</td></tr>
 </table>
 <div class="note"><strong>Mouse cursor:</strong> clicking rows in the shortcut list and dragging panels in layout mode both
@@ -157,15 +163,67 @@ used with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>).</p>
 <h3>The shortcut list</h3>
 <table>
   <tr><th style="width:34%">Row</th><th>What it does</th></tr>
-  <tr><td>One row per panel</td><td>Shows or hides that panel. The choice is remembered across restarts.</td></tr>
+  <tr><td>One row per panel</td><td>Shows or hides that panel. The choice is remembered across restarts. While the list is open, every panel that is switched on is shown at full size, with placeholder content where it has no data yet, so you can see what each row controls.</td></tr>
   <tr><td>Reset session best</td><td>Clears the session-best lap the delta bar compares against.</td></tr>
   <tr><td>Delete personal best</td><td>Wipes the saved all-time best for this car and track. Press twice to confirm.</td></tr>
   <tr><td>Relative timing: cars shown</td><td>Slider for how many cars the relative timing table lists.</td></tr>
   <tr><td>ABS / TC indicator</td><td>Which of these can light the small box next to the gear digit. See <a href="#gear">Gear &amp; speed</a>.</td></tr>
   <tr><td>Track map rows</td><td>Colour mode, mini-sector count, and for the current circuit its rotation, mirror and re-record. See <a href="#map">Track map</a>.</td></tr>
   <tr><td>Cover box rows</td><td>How many cover boxes, their shade and their opacity. See <a href="#cover">Cover boxes</a>.</td></tr>
+  <tr><td>Groups</td><td>Every panel and on/off option is listed once, grouped as Driving, Timing, Fuel/tyres/brakes,
+    Car &amp; FFB, Track &amp; weather and Screen. That includes the fuel use delta bar, tyre wear target, water/oil
+    temps, FFB strength, track conditions, the real weather forecast, the gap box and the standings options.</td></tr>
   <tr><td>Brake beep slider</td><td>Which braking points beep, by how much speed they lose. See <a href="#brakebeep">Braking-point beep</a>.</td></tr>
 </table>
+
+<h3 id="rotaries">Rotary menus (keyboard or wheel)</h3>
+<p>Three small menus let you change things while driving without the mouse. Each has an "up" and a "down" key, and
+you can also put them on rotary encoders or buttons on your wheel.</p>
+<table>
+  <tr><th style="width:34%">Keys</th><th>Menu</th></tr>
+  <tr><td><kbd>Home</kbd> / <kbd>End</kbd></td><td><strong>On/off list</strong>: walks the same panels and options as the
+    shortcut list. The wheel's toggle button switches the highlighted one.</td></tr>
+  <tr><td><kbd>Insert</kbd> / <kbd>Delete</kbd></td><td><strong>Left setting</strong>: picks which setting the left knob
+    changes.</td></tr>
+  <tr><td><kbd>Page Up</kbd> / <kbd>Page Down</kbd></td><td><strong>Right setting</strong>: the same for the right knob.</td></tr>
+</table>
+<p>While you use one, a 10-line list appears at the side of the screen: the left knob's on the left, the right
+knob's and the on/off list on the right. Each list keeps the same width whatever is highlighted, with its entries
+numbered down the left and the highlighted setting's value on the right. The highlight moves as you turn or press;
+when it steps onto the last line at the top or bottom, the list slides 5 lines so the highlight is back in the middle.
+The box at the bottom shows both knobs' settings, <strong>L</strong> on the left and <strong>R</strong> on the right,
+also at a fixed width (long values are shortened). A line above each list names the wheel button that acts on it
+(switch on/off, or change the value). The settings come in coloured groups, in this order:
+<span style="color:#ff7373">brakes and chassis</span> (ABS, brake bias, front and rear anti-roll bar),
+<span style="color:#ff9e33">engine and TC</span> (traction control, TC power cut, TC slip, engine mixture, shift
+point),
+<span style="color:#73f280">strategy</span> (fuel stint length, tyre max wear, tyre target time),
+<span style="color:#cc99ff">HUD</span> (pit lane limit, track map colour),
+<span style="color:#bfbfbf">cover boxes</span> (opacity, shade),
+<span style="color:#73b8ff">driving position</span> (field of view, seat fore/aft, seat height) and
+<span style="color:#ffe659">headlights</span>. A setting whose panel is switched off is greyed out with
+"(panel off)" and the knob steps over it. Each setting has a small icon beside it. Brake bias shows the car's real front share from telemetry; the others
+that press rF2 keys count the steps sent. The on/off list starts with an <strong>ESC</strong> entry: switching it presses Esc in rFactor 2, to close the chat box (which otherwise takes the keys as typed text) or go back to the garage. "Up" (or turning
+counter-clockwise) moves the highlight up.</p>
+<p><strong>Wheel buttons are not set up for you</strong>, because every wheel numbers its buttons differently. To use
+your wheel, find the button numbers in Windows (press <kbd>Win</kbd>+<kbd>R</kbd>, type <code>joy.cpl</code>, pick your
+wheel, <em>Properties</em>, and press or turn the control to see which number lights up), then put them in the
+<code>[Shortcuts]</code> section of the INI. 0 means not used:</p>
+<table>
+  <tr><th style="width:44%">INI key</th><th>What it does</th></tr>
+  <tr><td><code>CentreKnobPrevButton</code> / <code>CentreKnobNextButton</code></td><td>Up / down in the on/off list</td></tr>
+  <tr><td><code>ElementToggleButton</code></td><td>Switch the highlighted on/off item</td></tr>
+  <tr><td><code>LeftKnobPrevButton</code> / <code>LeftKnobNextButton</code></td><td>Up / down in the left setting list</td></tr>
+  <tr><td><code>LeftSettingUpButton</code> / <code>LeftSettingDownButton</code></td><td>Change the left setting's value</td></tr>
+  <tr><td><code>RightKnobPrevButton</code> / <code>RightKnobNextButton</code></td><td>Up / down in the right setting list</td></tr>
+  <tr><td><code>RightSettingUpButton</code> / <code>RightSettingDownButton</code></td><td>Change the right setting's value</td></tr>
+</table>
+<p>The <strong>Pit lane limit</strong> setting sets the pit-lane speed limit for the track you are at, one km/h
+per click (see <a href="#warnings">Warnings above the dashboard</a>).</p>
+<p>Some settings (engine mixture, traction control, ABS, anti-roll bars, field of view, seat, headlights) work by
+pressing rFactor 2's own controls for you. For those, bind a keyboard key to the control in rFactor 2 (for example
+<em>Increment Mixture</em>), then give the same key to the plugin in the INI as a DirectInput scan code
+(<code>MixtureUpKey</code>, <code>MixtureDownKey</code>, <code>TcUpKey</code> and so on; 0 = not used).</p>
 
 <!-- ============================================================ -->
 <h2 id="radar">Radar and side bars</h2>
@@ -209,9 +267,10 @@ used with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>).</p>
     <h3>Gear digit</h3>
     <ul>
       <li><strong>Red flash</strong> when the revs are near the shift point.</li>
-      <li><strong>Blue flash</strong> is the "shift now" cue. Its target RPM is learned from your own full-throttle
-      upshifts, separately for each gear, and it fires early by your own measured reaction time, so the shift lands
-      on target.</li>
+      <li><strong>Blue flash</strong> is the "shift now" cue. You choose the RPM to shift at with the
+      <strong>Shift point</strong> rotary setting (1% of max RPM a click, saved for each car). The cue fires early by
+      your measured reaction time, and for each gear it learns how much earlier still, from your full-throttle
+      upshifts made in response to it, so the actual shift lands on your target. It does not show in top gear.</li>
       <li><strong>Red background</strong> when you sit in neutral for more than 0.2 s. A quick pass through neutral
       on an upshift doesn't trigger it. There is also an optional first-gear warning.</li>
     </ul>
@@ -220,16 +279,21 @@ used with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>).</p>
     <span class="swatch" style="background:#26c6da"></span>cyan while a wheel spins under power.</p>
     <h3>The small box (left of the gear)</h3>
     <ul>
-      <li><strong>PIT</strong> while the pit limiter is on:
-        <span class="swatch" style="background:#26d940"></span>green at or under the pit-lane limit,
-        <span class="swatch" style="background:#f21f1a"></span>blinking red over it. The limit is learned the first
-        time you drive with the limiter on, and saved per car and track. It stays amber until then.</li>
+      <li><strong>PIT</strong> flashes while the pit limiter is on:
+        <span class="swatch" style="background:#26d940"></span>green at or under the pit-lane limit. Over it, the box
+        turns <span class="swatch" style="background:#f21f1a"></span>red, reads <strong>OVER SPEED</strong> and flashes
+        twice as fast. Gear and speed stay on screen as normal. The limit is the one you set for the track (the
+        <strong>Pit lane limit</strong> knob setting, see <a href="#warnings">Warnings above the dashboard</a>);
+        without one, it is learned the first time you drive with the limiter on, saved per car and track, and the box
+        stays amber until then. A learned limit is only where your limiter holds the car, so set the real one if the
+        car's limiter allows more than the pit lane does.</li>
       <li><strong>ABS</strong> flashes amber and <strong>TC</strong> flashes cyan while the car's ABS or traction
       control is acting. These are the same colours as the brake and throttle in the pedal trace. ABS is detected
       from the brake pressure at each wheel. Each can be switched off in the shortcut list.</li>
     </ul>
     <p><strong>Shift stats</strong>, a separate small panel, shows how you actually shift: average and earliest
-    shift RPM, per gear, and your reaction time to the cue.</p>
+    shift RPM, per gear, and your reaction time to the cue. It keeps its width as you shift, so it does not jump
+    about at every gear change.</p>
   </div>
   <figure>
     <svg viewBox="0 0 400 300" role="img" aria-label="Gear and speed diagram">
@@ -267,10 +331,6 @@ used with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>).</p>
     <h3>Tyre lockup box</h3>
     <p>A 2&times;2 box next to the speed readout, one square per wheel in the car's real layout. Each square lights
     up while that wheel locks under braking: the more it locks, the brighter it gets.</p>
-    <h3>Pit-limiter reminder</h3>
-    <p>When you are coming in for a stop and are already at or under the pit-lane speed, but the limiter is still
-    off, the plugin gives one long beep and shows a warning until you press it. It only does this near the pit
-    entry, whose exact position for each track is learned the first time you drive into that pit lane.</p>
   </div>
   <figure>
     <svg viewBox="0 0 400 150" role="img" aria-label="Tyre lockup box diagram">
@@ -284,6 +344,65 @@ used with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>).</p>
       <text x="262" y="72" fill="#cfd2d6" font-size="12" font-family="Segoe UI, sans-serif">front right a little</text>
     </svg>
     <figcaption>Tyre lockup box: brightness = how much that wheel is locking.</figcaption>
+  </figure>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="warnings">Warnings above the dashboard</h2>
+<div class="feature">
+  <div>
+    <p>Yellow lines just above the gear and speed boxes, shown only while there is something to warn about.</p>
+    <h3>Stopped cars ahead</h3>
+    <ul>
+      <li><strong>STOPPED 420 m</strong> for a car under 40 km/h: on a racing track, as good as stopped. In a corner
+        you take that slowly yourself (a hairpin), a car only counts under 80% of your own best-lap speed there, so
+        normal traffic in the hairpin is not reported.</li>
+      <li>Stopped cars within 150 m of each other are one incident: <strong>STOPPED 420 m (3 cars)</strong>, the
+        distance to the first of them.</li>
+      <li><strong>OFF TRACK</strong> is added when the car (or every car in the pile-up) is beyond the track edge
+        rather than on the racing surface. Without it, at least one is on the track.</li>
+      <li>The distance counts down as you close in, and the line flashes inside 200 m.</li>
+      <li>Only the nearest incident within 1000 m ahead is shown. A car must stay slow for a second before it counts, so
+        one that only runs wide is not reported. Cars in the pit lane, cars that have taken the flag, the first
+        10 s after the green flag and full-course yellows are left out.</li>
+    </ul>
+    <h3>Yellow flags</h3>
+    <p><strong>YELLOW S2</strong> names each sector with a local yellow flag. This needs the server to run local
+    yellows; with them off, only the slow-car warning works. During a full-course yellow the line reads
+    <strong>FULL COURSE YELLOW</strong>.</p>
+    <h3>Pit lane limit</h3>
+    <p>Once you request a pit stop, <strong>PIT LIMIT 60 km/h</strong> appears just above the speed box, until you are
+    in the pit lane or switch the limiter on. Set the limit for each track with the <strong>Pit lane limit</strong>
+    knob setting (see <a href="#rotaries">Rotary menus</a>): one click is 1 km/h, the first click starts from the
+    learned limit, and turning below 20 switches it back off. Without a set limit the line shows the learned one
+    with a "~" in front.</p>
+    <p>Distances, ranges and the colour are in the <code>[TrackAlerts]</code> section of the INI.</p>
+  </div>
+  <figure>
+    <svg viewBox="0 0 400 230" role="img" aria-label="Warnings above the dashboard diagram">
+      <rect width="400" height="230" fill="#3b4048"/>
+      <!-- slow car + sector yellow -->
+      <rect x="62" y="14" width="312" height="34" rx="8" fill="#1c1d20"/>
+      <text x="218" y="38" fill="#ffd91a" font-size="18" font-weight="700" text-anchor="middle" font-family="Segoe UI, sans-serif">YELLOW S2   STOPPED 420 m (2 cars)</text>
+      <!-- pit limit reminder over the speed box -->
+      <rect x="214" y="56" width="142" height="30" rx="8" fill="#1c1d20"/>
+      <text x="285" y="77" fill="#ffd91a" font-size="15" font-weight="700" text-anchor="middle" font-family="Segoe UI, sans-serif">PIT LIMIT 60 km/h</text>
+      <!-- dashboard -->
+      <rect x="120" y="94" width="80" height="56" rx="8" fill="#1c1d20"/>
+      <text x="160" y="138" fill="#e6e6e6" font-size="44" font-weight="700" text-anchor="middle" font-family="Segoe UI, sans-serif">4</text>
+      <rect x="210" y="94" width="150" height="56" rx="8" fill="#1c1d20"/>
+      <text x="285" y="134" fill="#e6e6e6" font-size="28" font-weight="600" text-anchor="middle" font-family="Segoe UI, sans-serif">188 km/h</text>
+      <text x="40" y="168" fill="#cfd2d6" font-size="12" font-family="Segoe UI, sans-serif">two stopped cars in the yellow sector ahead; pit stop requested</text>
+      <!-- over speed -->
+      <rect x="14" y="180" width="128" height="40" rx="8" fill="#f21f1a"/>
+      <text x="78" y="206" fill="#111" font-size="16" font-weight="700" text-anchor="middle" font-family="Segoe UI, sans-serif">OVER SPEED</text>
+      <rect x="150" y="180" width="56" height="40" rx="8" fill="#1c1d20"/>
+      <text x="178" y="211" fill="#e6e6e6" font-size="28" font-weight="700" text-anchor="middle" font-family="Segoe UI, sans-serif">2</text>
+      <rect x="212" y="180" width="110" height="40" rx="8" fill="#1c1d20"/>
+      <text x="267" y="207" fill="#e6e6e6" font-size="20" font-weight="600" text-anchor="middle" font-family="Segoe UI, sans-serif">67 km/h</text>
+      <text x="330" y="205" fill="#cfd2d6" font-size="12" font-family="Segoe UI, sans-serif">limit 60</text>
+    </svg>
+    <figcaption>Top: the warning lines. Bottom: limiter on but still above the set pit-lane limit.</figcaption>
   </figure>
 </div>
 
@@ -374,7 +493,14 @@ used with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>).</p>
       <tr><td>Last lap</td><td>Red if their last lap beat yours, green if yours was faster, <span style="color:#bf59ff">purple</span> if it is the fastest lap of the session.</td></tr>
       <tr><td>Tyre</td><td>Their tyre compound.</td></tr>
     </table>
-    <p>The footer shows the session's fastest lap and who set it, in purple. At the chequered flag the table
+    <p><strong>Gap box:</strong> a second, smaller table with just the two cars ahead of you in the race order,
+    you, and the two behind, picked from the whole field (retired cars left out). It starts just under the
+    standings, moves and resizes on its own in layout mode, and has its own row in the shortcut list.</p>
+    <p><strong>Riding along:</strong> when a team-mate is driving your shared car, rFactor 2 marks no car as yours.
+    The HUD then uses the car you last drove (saved as <code>[Session] LastVehicle</code>), so the standings, gear,
+    speed and fuel follow your car rather than a random one. Use <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> to
+    show the HUD while you are not driving.</p>
+    <p>The footer shows the session's fastest lap and who set it, in purple, followed by your own best lap this session (PB). At the chequered flag the table
     freezes as it stood, because the game's own gap figures stop making sense once the leader has finished.</p>
   </div>
   <figure>
@@ -409,13 +535,8 @@ used with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>).</p>
     <h3>Tyres</h3>
     <p>Wear in % per lap for each tyre, under one header. Below that is the time left until your most worn tyre
     reaches 20% life, naming which tyre it is. In races there is also a projection of tyre life at the finish.</p>
-    <p><strong>Wear plots</strong> (can be hidden on their own) show each tyre's wear per lap over the session as a
-    small box plot. The tyre wearing the most also gets a bigger plot, with a dot for the lap you are on: it moves
-    along as the lap goes on and is <span class="swatch" style="background:#33d94d"></span>green on your usual wear,
-    <span class="swatch" style="background:#ff991a"></span>orange a little over and
-    <span class="swatch" style="background:#f23333"></span>red well over.</p>
     <h3>Brake bias</h3>
-    <p>The current brake bias, and how far you have moved it since getting in the car.</p>
+    <p>The current brake bias as the front share (56.4% means 56.4:43.6, as in the garage), and how far you have moved it since getting in the car.</p>
   </div>
   <figure>
     <svg viewBox="0 0 400 230" role="img" aria-label="Fuel and tyre panel diagram">
@@ -443,16 +564,19 @@ used with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>).</p>
 
 <!-- ============================================================ -->
 <h2 id="stint">Stint targets: fuel saving and tyre wear</h2>
-<p>For long races run in fixed-length stints. Both are set in the INI, and both move and resize in layout mode.</p>
+<p>For long races run in fixed-length stints. Both are set in the INI, move and resize in layout mode, and can be
+switched off with their rows in the shortcut list.</p>
 <h3>Fuel-saving bar</h3>
 <p>Set the stint length you need the tank to last, and the bar tells you live through every lap whether you are
-using more or less fuel than that allows. The target litres per lap is worked out again at the start of each lap from
-the fuel in the tank, the stint time left and your last lap time.</p>
+using more or less fuel than that allows. The target litres per lap is worked out from the fuel in the tank, the
+stint time left and your last lap time: as soon as you leave the pit lane, and again at the start of each lap.</p>
 <ul>
   <li>The bar fills <span class="swatch" style="background:#3ccf4e"></span>green while you are under the target for
     the distance covered so far, and <span class="swatch" style="background:#e53935"></span>red while you are over it.</li>
-  <li>The line under it shows the target per lap, what last lap used, and how long a stint your recent laps are
-    heading for.</li>
+  <li>The table under it shows: <strong>Stint target</strong> (the stint length you set, and in laps),
+    <strong>Stint left</strong> (time and laps still to drive in it), <strong>Fuel lasts</strong> (how long the fuel
+    in the tank lasts at last lap's use, green if that covers the stint left, red if not) and <strong>Fuel per
+    lap</strong> (your average, and how far last lap was under or over the target).</li>
   <li>Off until you set a stint length: <code>[FuelSave] StintMinutes=50</code> (for example). <code>ReserveLitres</code>
     is how much should be left at the end (default 0.5), and <code>BarWindowLitres</code> how big a difference fills
     half the bar (default 0.10).</li>
@@ -479,8 +603,38 @@ above normal turns amber is <code>[EngineTemps] WaterAmberMargin</code> (default
 <p>The force rFactor 2 is sending to your wheel right now, as a percentage of full strength (held at its peak
 briefly so you can read it), the highest so far this lap, and last lap's highest along with how much of that lap
 was at 100% (clipping). If the clipping figure is high, turn the car's FFB strength down.</p>
-<p>Both boxes move and resize in layout mode. Turn one off with <code>Enabled=0</code> in its INI section
-(<code>[EngineTemps]</code> or <code>[FfbLevel]</code>).</p>
+<p>Both boxes move and resize in layout mode. Turn either off with its row in the shortcut list.</p>
+
+<!-- ============================================================ -->
+<h2 id="conditions">Track conditions and weather</h2>
+<p>A box for mixed-weather races. At the top it gives a tyre call:</p>
+<ul>
+  <li><span class="swatch" style="background:#59e666"></span><strong>SLICKS</strong>: the racing line is dry enough.</li>
+  <li><span class="swatch" style="background:#ffbf26"></span><strong>SLICKS - near crossover</strong>, or
+    <strong>wets soon</strong> if it is getting wetter: close to the point where wets become faster.</li>
+  <li><span class="swatch" style="background:#4d99ff"></span><strong>WETS</strong>: the racing line is wet enough
+    for wets.</li>
+</ul>
+<p>The switch-over point is set by <code>[Conditions] WetsAtWetness</code> (default 20% average wetness of the
+racing line). Below the call it shows how wet the racing line is (average, plus its driest and wettest parts), how
+hard it is raining, and track and air temperature, each with which way it is heading (wetter or drying, heavier or
+easing, and how much the track temperature has changed in the last 10 minutes).</p>
+<h3>Forecasts</h3>
+<ul>
+  <li><strong>GAME forecast</strong>: rFactor 2's own forecast for this session (rain chance, temperature and sky at
+    five points through the session), read from the game itself on your PC.</li>
+  <li><strong>REAL forecast</strong>: the real-world hourly forecast (rain chance, rain amount and temperature) for
+    the real circuit, from the free <a href="https://open-meteo.com/">Open-Meteo</a> service. To see the same data
+    the HUD reads (Spa shown; swap in your circuit's coordinates):
+    <a href="https://api.open-meteo.com/v1/forecast?latitude=50.633&amp;longitude=5.567&amp;hourly=precipitation_probability,precipitation,temperature_2m&amp;forecast_hours=12&amp;timezone=GMT&amp;timeformat=unixtime">api.open-meteo.com/v1/forecast?latitude=50.633&amp;longitude=5.567&amp;…</a>.
+    This is the only part of the plugin that uses the internet,
+    and all it sends is the circuit's map coordinates. Well-known circuits are built in. For any other track, add
+    <code>CoordsLat_&lt;track name&gt;=</code> and <code>CoordsLon_&lt;track name&gt;=</code> under
+    <code>[Conditions]</code>. It is <strong>off by default</strong>: switch it on with the <strong>Real weather forecast</strong> row in the shortcut list or <code>[Conditions] RealWeather=1</code>.</li>
+</ul>
+<p>The track map can also show which parts of the lap were wet when you last drove them: see
+<a href="#map">Track map</a>. The box moves and resizes in layout mode, and the <strong>Track conditions</strong> row
+in the shortcut list turns it off.</p>
 
 <!-- ============================================================ -->
 <h2 id="temps">Tyre temperatures</h2>
@@ -518,7 +672,8 @@ was at 100% (clipping). If the clipping figure is high, turn the car's FFB stren
     map is recorded from your own first clean lap at a new track and saved, so it is there straight away next time.
     If TinyPedal is installed and has already recorded the track, its map is used instead
     (<code>[TrackMap] TinyPedalMapDir</code>). The box fits the shape of the track, and a small
-    <strong>N</strong> arrow shows north.</p>
+    <strong>N</strong> arrow on a small disc just above the box's top-right corner shows north (outside the box, so
+    the track never runs through it).</p>
     <h3>Colouring by mini-sector</h3>
     <p>The lap is split into equal mini-sectors (80 by default, set with a slider in the shortcut list), and each one
     can be coloured against a reference:</p>
@@ -564,11 +719,19 @@ was at 100% (clipping). If the clipping figure is high, turn the car's FFB stren
 <h2 id="ffb">FFB spectrum</h2>
 <div class="feature">
   <div>
-    <p>Shows which frequencies the force feedback rFactor 2 sends to your wheel contains, live. The frequency axis
-    uses the same points as Moza Pit House's FFB equaliser (0, 5, 10, 15, 25, 30, 40, 50, 60, 80, 100 Hz), with
-    finer ticks between them, so you can read it straight across to your EQ.</p>
+    <p>Shows which frequencies the force feedback rFactor 2 sends to your wheel contains, live, from 1 Hz up to
+    200 Hz (half the game's 400 Hz FFB rate, the most that signal can carry). The frequency axis is a log scale,
+    labelled at the same points as Moza Pit House's FFB equaliser (5, 10, 15, 25, 30, 40, 50, 60, 80, 100 Hz, plus
+    150 and 200), so you can read it straight across to your EQ.</p>
+    <p>The line is drawn in log bands, 5 per decade by default (about 1, 1.6, 2.5, 4, 6.3, 10, 16, 25, 40, 63, 100,
+    160 and 200 Hz). Each point is the combined energy of everything in its band, so the high bands, which cover more
+    frequencies, sit a little higher than the low ones. <code>[FfbGraph] BandsPerDecade=10</code> gives finer
+    1/3-octave bands; <code>0</code> draws one point per 1 Hz instead. The live line covers about the last second
+    of driving and updates up to 60 times a second; <code>Realtime=0</code> averages it over
+    <code>WindowSeconds</code> instead.</p>
     <ul>
-      <li><strong>0&ndash;5 Hz:</strong> the steady weight of the steering through a corner.</li>
+      <li><strong>1&ndash;5 Hz:</strong> the steering weight building and easing through corners (the steady
+      load itself is shown by the FFB strength box).</li>
       <li><strong>5&ndash;25 Hz:</strong> kerbs, bumps and the car moving around.</li>
       <li><strong>25 Hz and up:</strong> road texture, vibration and grain.</li>
     </ul>
@@ -621,7 +784,7 @@ was at 100% (clipping). If the clipping figure is high, turn the car's FFB stren
 <div class="feature">
   <div>
     <p>Plain rounded boxes you can place anywhere, to hide part of the car's own dashboard or in-car display that
-    competes with the overlay. Up to four, each moved and resized (width and height separately) in layout mode.</p>
+    competes with the overlay. Up to four, each moved and resized (width and height separately, from any corner) in layout mode.</p>
     <p>All the boxes share one shade, from black to white, and one opacity, both set with sliders in the shortcut
     list. They are drawn underneath every other panel. Off by default: switch on <em>Cover boxes</em> in the
     shortcut list, then place them in layout mode.</p>
@@ -642,8 +805,6 @@ was at 100% (clipping). If the clipping figure is high, turn the car's FFB stren
 <h2 id="cues">Sounds and cues</h2>
 <table>
   <tr><th style="width:28%">Cue</th><th>What it does</th></tr>
-  <tr><td>Pit-limiter reminder</td><td>One long beep, plus a warning on screen, if you are at pit-lane speed near
-    the pit entry for a stop with the limiter still off.</td></tr>
   <tr><td>DRS</td><td>A double beep when DRS becomes legal to use, plus an "OPEN DRS" or "DRS ENGAGED" sign under
     the delta bar.</td></tr>
 </table>
@@ -673,14 +834,38 @@ you find you can brake later, do, and the next best lap moves the beeps with you
 <h2 id="perf">Frame-time stats and clock</h2>
 <p>A fixed-size box with FPS and frame time. More stats can be switched on in the <code>[FrameLatency]</code>
 section of the INI: CPU and GPU time per frame, FPS range with 1% low, game RAM, VRAM, and GPU power (AMD
-cards). This box also stays up in the menus as a sign the plugin is running. A small clock can be shown as
+cards). This box also stays up out of the car (garage, monitor, and the menus after your first session) as a sign the
+plugin is running. A small clock can be shown as
 well.</p>
+<p>The RAM stat (<code>ShowPcRam</code>) reads <em>RAM 18.2 used, rF2 9.1, 13.8 free GB</em>: the whole PC's memory
+in use, the part rFactor 2 uses, and what is free. The VRAM stat (<code>ShowVram</code>) reads <em>VRAM 9.8 used,
+rF2 8.1, 6.2 free GB</em>: the graphics card's memory in use by everything (the same figure RTSS and Afterburner
+show), the part rFactor 2 uses, and what is free on the card.</p>
+<p><strong>Replay recording</strong> (<code>ShowReplay=1</code>, off by default) adds how rFactor 2 is recording
+the replay: <em>Replay off</em>, <em>Replay RAM</em>, or <em>Replay disk 1.24 GB</em> with the size of the recording
+so far, followed by the replay fidelity setting, e.g. <strong>High fidelity</strong> (Low, Medium, High or Max). The size turns amber from 1.5 GB and red from 1.9 GB: a recording
+that reached 2 GB was seen to stop and never be saved. A replay kept in RAM cannot be measured on its own; it is part
+of rF2 RAM.</p>
+<p><strong>DLL cost (by module)</strong>, off by default, shows how much time the plugin itself takes each frame,
+split by panel, as a bar per module. Switch it on in the shortcut list if you want to see what the HUD costs, or
+to find out which panel to turn off on a slow PC. It moves and resizes in layout mode.</p>
 
 <!-- ============================================================ -->
 <h2 id="settings">Settings and files</h2>
-<p>Everything the shortcut list and layout mode change is saved automatically. Everything else (colours,
+<p>Everything the shortcut list and layout mode change is saved automatically, once you are out of the car
+(back in the garage or at the monitor). What the plugin learns while you drive (best lap, braking points, fuel and
+tyre use, pit limit, shift points, track maps) is saved as you cross the line. Nothing is written to disk at
+any other moment, so saving never costs you a frame. If the game crashes mid-stint, only that lap's learning and the
+layout or setting changes made since you got in are lost. Everything else (colours,
 thresholds, which stats show, hotkeys) is in <code>Bin64\Plugins\rF2SkrOverlayPublic.ini</code>. Edit it with the game
 closed; new values take effect on the next start.</p>
+<h3>Update check</h3>
+<p>Each time the game starts, the plugin asks GitHub once which release is the latest. If a newer one is out, a
+message says so (once, for 15 seconds) the first time you are in the garage, never while driving,
+with the address of the releases page. Nothing is downloaded or installed: you get the new version yourself. Nothing about
+you is sent either; GitHub sees the request like any website visit. If there is no internet connection, nothing
+shows. To switch it off, turn off <strong>Update check</strong> in the on/off list (shortcut list or centre rotary), or set
+<code>CheckForUpdates=0</code> under <code>[Updates]</code> in the INI.</p>
 <h3>Layouts per car</h3>
 <p>Which panels are shown, where they sit and how big they are is remembered separately for each car model. The first
 time you drive a new car it starts from your current layout; after that, getting into a car brings back the layout
@@ -692,9 +877,10 @@ you last used in it.</p>
   <tr><td><code>rF2SkrOverlayPublic_TrackMaps\</code></td><td>Recorded track maps, one per circuit.</td></tr>
   <tr><td><code>FuelStats\</code></td><td>Learned fuel consumption per car class and track.</td></tr>
   <tr><td><code>PitLimits\</code></td><td>Learned pit-lane speed limit per car and track.</td></tr>
-  <tr><td><code>PitEntryOffsets\</code></td><td>Learned pit-entry position per track, for the pit-limiter reminder.</td></tr>
+  <tr><td><code>PitLaneLimits\</code></td><td>The pit-lane speed limit you set per track (saved once you are out of the car).</td></tr>
   <tr><td><code>BestLaps\</code></td><td>Your all-time best lap per car and track, for the delta bar, and the braking-point beep's brake traces (<code>.brake</code> files).</td></tr>
-  <tr><td><code>ShiftPoints\</code></td><td>Learned shift points per car, for the shift cue.</td></tr>
+  <tr><td><code>ShiftTargets\</code></td><td>Your shift point and the cue's learned timing per gear, one file per car entry.</td></tr>
+  <tr><td><code>ShiftPoints\</code></td><td>Older per-class shift points; only read to start a car that has no ShiftTargets file yet.</td></tr>
 </table>
 <p>The log is <code>Bin64\rF2SkrOverlayPublic.log</code>. The previous run's log is kept as
 <code>rF2SkrOverlayPublic.prev.log</code>. Send these if you report a problem.</p>
@@ -712,6 +898,89 @@ read, try Normal or Bold.</p>
   <li><code>[RelativeTiming] LogRaceGaps=1</code> &mdash; race gaps every 10 s.</li>
   <li><code>[LapDelta] ShowValidityDebug=1</code> &mdash; a small on-screen line under the delta bar showing whether
     rFactor 2 is counting the current lap (useful if the delta bar never shows a reference).</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="changes">Changes in this version</h2>
+<h3>Changed</h3>
+<ul>
+  <li><strong>Rotary setting lists</strong> grouped by colour (brakes and chassis, engine and TC, strategy, HUD, cover
+    boxes, driving position, headlights), with new <strong>Traction control</strong> and <strong>Brake bias</strong>
+    settings, greyed-out rows for switched-off panels, and a line naming the wheel button above each list.</li>
+  <li>Rotary lists, knob box and messages are drawn above every other panel, text included.</li>
+  <li>Tyre wear target boxes are narrower, without the empty space inside.</li>
+  <li>Fuel-saving bar: a clearer table underneath, and the target is set as soon as you leave the pit lane.</li>
+  <li>Track map: the north arrow sits outside the box; the wet sections colour mode is removed (it did not show
+    the wet parts reliably).</li>
+  <li>Shift cue: you set the shift point (new rotary setting), the cue learns its timing per gear, saved per car
+    entry. No shift cue in top gear; the shift stats box no longer jumps at gear changes.</li>
+  <li>Icons beside each rotary setting.</li>
+</ul>
+<h3>New</h3>
+<ul>
+  <li><strong>Update check</strong>: at each game start the plugin asks GitHub whether a newer release is out and
+    says so in a message in the garage. Nothing is downloaded. Off with <strong>Update check</strong> in the on/off
+    list. See
+    <a href="#settings">Settings and files</a>.</li>
+  <li><strong>Rotary menus</strong>: on/off list and two setting lists, driven by <kbd>Home</kbd>/<kbd>End</kbd>,
+    <kbd>Insert</kbd>/<kbd>Delete</kbd> and <kbd>Page Up</kbd>/<kbd>Page Down</kbd>, or your wheel's buttons. See
+    <a href="#rotaries">Rotary menus</a>.</li>
+  <li><strong>Gap box</strong>: the two cars ahead and two behind you in the race, in their own small table. See
+    <a href="#relative">Relative timing</a>.</li>
+  <li><strong>Your session best (PB)</strong> in the standings footer, after the session's fastest lap.</li>
+  <li><strong>HUD always on</strong> (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>): shows the HUD while you are
+    not driving, such as riding along in a shared car.</li>
+  <li><strong>Track conditions and weather</strong> box: slicks/wets call, wetness and rain trends, the game's
+    forecast and an optional real-world forecast. See <a href="#conditions">Track conditions</a>.</li>
+  <li><strong>DLL cost</strong> panel (off by default): what each panel costs per frame.</li>
+  <li>Shortcut-list rows to switch the fuel save bar, tyre wear target, water/oil temps, FFB strength, track
+    conditions and real weather on or off.</li>
+  <li><strong>Replay recording</strong> in the frame-time stats box: off, RAM or disk with its size so far, and the
+    replay fidelity. See <a href="#perf">Frame-time stats</a>.</li>
+  <li><strong>Stopped car warning</strong> above the dashboard, with a distance countdown, a car count for a
+    pile-up and OFF TRACK (no sound). See <a href="#warnings">Warnings above the dashboard</a>.</li>
+  <li><strong>Yellow flag sector</strong> (YELLOW S2) and full-course yellow in the same line.</li>
+  <li><strong>Pit lane limit</strong> per track, set with a knob setting. The PIT box reads <strong>OVER SPEED</strong>
+    when you are above it with the limiter on, and <strong>PIT LIMIT 60 km/h</strong> shows above the speed box once
+    you request a stop.</li>
+</ul>
+<h3>Changed</h3>
+<ul>
+  <li><strong>Pit limiter</strong>: the big PIT bar is gone. PIT now flashes in the small ABS/TC box (green under
+    the limit, red over it), and gear and speed stay visible.</li>
+  <li><strong>FFB spectrum</strong>: now goes up to 200 Hz, on a log frequency axis labelled at the Moza EQ points,
+    drawn in log bands (<code>BandsPerDecade</code>). See <a href="#ffb">FFB spectrum</a>.</li>
+  <li><strong>Layout mode</strong>: every panel, cover boxes included, resizes from any of its four corners, and
+    the opposite corner stays put instead of the panel growing out of its centre. The standings and gap box show
+    at their full size while you place them.</li>
+  <li><strong>Brake bias</strong> is shown as the front share, the way the garage and car dashes give it.</li>
+  <li><strong>Shortcut list</strong>: every panel and option is now in one grouped list (Driving, Timing, Fuel/tyres/brakes, Car &amp; FFB, Track &amp; weather, Screen), and while it is open every switched-on panel is shown at full size.</li>
+  <li><strong>Pedal trace</strong> uses less CPU (flat stretches of a pedal line are drawn as one piece), and its lines no longer change shape as they scroll.</li>
+  <li><strong>Tyre wear plots removed.</strong></li>
+  <li><strong>Shortcut list</strong> is more compact (smaller text, tighter rows) on a darker background.</li>
+  <li><strong>Riding along in a shared car</strong>: the HUD follows your own car instead of mixing in other
+    cars' data (which made gear, speed and the PIT warning jump around).</li>
+  <li>Stint helpers: laps-based stint info, tyre life per corner and the stint clock counting only time on
+    track.</li>
+  <li>The track map is kept on the graphics card and only rebuilt when it changes, which cuts its CPU cost a
+    lot on long tracks.</li>
+  <li><strong>When files are saved</strong>: only when you cross the line (newly learned data) or are out of the car
+    (everything else), on a background thread. See <a href="#settings">Settings and files</a>.</li>
+  <li><strong>Pit stints</strong> are no longer saved across a game restart.</li>
+  <li><strong>Smoother frame times</strong>: no more hitches when leaving layout mode, at a beep, at a car or track
+    change, or when the track map's sector colours change. Each frame also costs less to draw.</li>
+  <li>The <strong>track conditions</strong> and <strong>engine temps</strong> boxes update five times a second.</li>
+  <li><strong>GPU usage</strong> in the stats line counts only rFactor 2's own GPU work.</li>
+  <li><strong>Pit-limiter reminder removed</strong> (the "ENGAGE PIT LIMITER" warning and its beep). The
+    <code>PitEntryOffsets</code> folder is no longer used and can be deleted.</li>
+</ul>
+<h3>Fixed</h3>
+<ul>
+  <li>Wheel buttons no longer stay dead when the wheel was not found at game start: the plugin looks again every
+    2 s.</li>
+  <li>Two possible crashes: one when the game recreates its window, one when a setting changes while saving.</li>
+  <li>The frame-time stats box could overrun its memory with every extra stat switched on.</li>
+  <li>Changing car no longer keeps the previous car's per-gear shift points.</li>
 </ul>
 
 <!-- ============================================================ -->

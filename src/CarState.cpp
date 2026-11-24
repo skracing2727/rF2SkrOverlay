@@ -2,6 +2,7 @@
 #include "InternalsPlugin.hpp"
 #include <cmath>
 #include <cstring>
+#include <cctype>
 
 CarStateStore g_carState;
 
@@ -16,6 +17,96 @@ namespace
         while (diff < -3.14159265358979) diff += 2.0 * 3.14159265358979;
         return a + diff * t;
     }
+
+    // Case-insensitive "does haystack contain needle" -- car class/name
+    // strings arrive in whatever case the mod/content author used.
+    bool ContainsCI(const char* haystack, const char* needle)
+    {
+        if (haystack[0] == '\0' || needle[0] == '\0')
+            return false;
+        const size_t hLen = strlen(haystack);
+        const size_t nLen = strlen(needle);
+        if (nLen > hLen)
+            return false;
+        for (size_t i = 0; i + nLen <= hLen; ++i)
+        {
+            size_t j = 0;
+            for (; j < nLen; ++j)
+            {
+                if (tolower(static_cast<unsigned char>(haystack[i + j])) != tolower(static_cast<unsigned char>(needle[j])))
+                    break;
+            }
+            if (j == nLen)
+                return true;
+        }
+        return false;
+    }
+
+    // Typical real footprint for a handful of recognisable categories,
+    // matched against the car's own VehicleScoringInfoV01 class and name.
+    // The SDK exposes no actual per-car dimension field, so this is not
+    // exact for any one specific car -- but it is a genuine improvement over
+    // one flat box shared by every car on a mixed grid (a BTCC-style touring
+    // car IS narrower and shorter than a GT3 car). Checked in order; the
+    // first match wins. A car matching none of these keeps the configured
+    // CarHalfWidthMeters/CarHalfLengthMeters/CarCornerRadiusMeters box,
+    // exactly as with RadarConfig::useRealCarSize turned off (that part is
+    // the radar's LookupCarFootprint in Overlay.cpp).
+    //
+    // Figures are half of a real published overall length/width for a
+    // representative car in each class (converted from mm), not invented:
+    //   GT3   -- Audi R8 LMS GT3 evo: 4600 x 1996mm
+    //   GTE   -- Porsche 911 RSR (2017): 4557 x 2045mm (axle-width figure)
+    //   LMP   -- Oreca 07 LMP2: 4745 x 1895mm (LMP1/LMP3 regs land within a
+    //            few cm of this too -- Toyota TS050 4650x1900, Ligier
+    //            JS P320 4605x1900 -- so one shared bucket stays accurate)
+    //   NASCAR (Cup) -- Next Gen car: 4912 x 1996mm
+    //   INDYCAR -- Dallara IR18, ~5080 x 2000mm (published figures for this
+    //            one are inconsistent between sources; used the wider,
+    //            more conservative reading)
+    // GT4/TCR/TOURING/BTCC/FORMULA/PROTOTYPE/TRUCK are class-typical
+    // approximations, not each individually sourced.
+    struct CarCategory { const char* keyword; float halfWidthM, halfLengthM, cornerRadiusM; };
+    const CarCategory kCarCategories[] =
+    {
+        { "GTE",       1.02f, 2.28f, 0.45f },  // ~2.05m x 4.56m
+        { "GT3",       1.00f, 2.30f, 0.45f },  // ~2.0m x 4.6m
+        { "GT4",       0.95f, 2.20f, 0.40f },  // ~1.9m x 4.4m
+        { "TCR",       0.90f, 2.15f, 0.40f },  // ~1.8m x 4.3m
+        { "TOURING",   0.90f, 2.15f, 0.40f },
+        { "BTCC",      0.90f, 2.15f, 0.40f },
+        { "TRUCK",     1.00f, 2.45f, 0.45f },  // NASCAR truck -- approximate, no verified source found
+        { "NASCAR",    1.00f, 2.45f, 0.45f },  // ~2.0m x 4.9m
+        { "DPI",       0.95f, 2.38f, 0.40f },  // ~1.9m x 4.75m
+        { "LMP",       0.95f, 2.37f, 0.40f },  // ~1.9m x 4.75m
+        { "PROTOTYPE", 0.95f, 2.37f, 0.40f },
+        { "INDYCAR",   1.00f, 2.54f, 0.35f },  // ~2.0m x 5.08m
+        { "IR18",      1.00f, 2.54f, 0.35f },
+        { "FORMULA",   0.90f, 2.50f, 0.30f },  // open-wheel: narrower, longer
+    };
+    const int kCarCategoryCount = static_cast<int>(sizeof(kCarCategories) / sizeof(kCarCategories[0]));
+
+    // The first category whose keyword is in the class or the name, or -1.
+    int MatchFootprint(const char* vehClass, const char* vehName)
+    {
+        for (int i = 0; i < kCarCategoryCount; ++i)
+        {
+            if (ContainsCI(vehClass, kCarCategories[i].keyword) || ContainsCI(vehName, kCarCategories[i].keyword))
+                return i;
+        }
+        return -1;
+    }
+}
+
+bool GetCarFootprint(int footprint, CarFootprint& out)
+{
+    if (footprint < 0 || footprint >= kCarCategoryCount)
+        return false;
+    const CarCategory& cat = kCarCategories[footprint];
+    out.halfWidthM = cat.halfWidthM;
+    out.halfLengthM = cat.halfLengthM;
+    out.cornerRadiusM = cat.cornerRadiusM;
+    return true;
 }
 
 void CarStateStore::Init()
@@ -27,31 +118,24 @@ void CarStateStore::Init()
     m_ready = true;
 }
 
-const CarStateStore::CarEntry* CarStateStore::FindPrev(long id) const
-{
-    for (int i = 0; i < m_prevCount; ++i)
-    {
-        if (m_prevCars[i].id == id)
-            return &m_prevCars[i];
-    }
-    return nullptr;
-}
-
 void CarStateStore::Update(const ScoringInfoV01& info)
 {
     if (!m_ready)
         return;
 
+    // The newest sample, about to become "prev". Its buffer is only ever
+    // written here (this thread), so it can be read without the lock; only
+    // the count needs it, since Clear() may zero it.
     EnterCriticalSection(&m_lock);
+    const int lastIdx = m_cur;
+    const int lastCount = m_curCount;
+    LeaveCriticalSection(&m_lock);
+    const CarEntry* last = m_cars[lastIdx];
 
-    // The previous sample set becomes whatever was "current" until now.
-    for (int i = 0; i < m_curCount; ++i)
-        m_prevCars[i] = m_curCars[i];
-    m_prevCount = m_curCount;
-    m_prevTime = m_curTime;
-
-    m_curCount = 0;
-    m_hasPlayer = false;
+    // Built in the spare buffer, which Read() never looks at.
+    CarEntry* out = m_cars[m_spare];
+    int count = 0;
+    bool hasPlayer = false;
 
     if (info.mVehicle != nullptr)
     {
@@ -59,7 +143,7 @@ void CarStateStore::Update(const ScoringInfoV01& info)
         for (int i = 0; i < n; ++i)
         {
             const VehicleScoringInfoV01& v = info.mVehicle[i];
-            CarEntry& e = m_curCars[m_curCount];
+            CarEntry& e = out[count];
 
             e.id = v.mID;
             e.x = v.mPos.x;
@@ -70,17 +154,49 @@ void CarStateStore::Update(const ScoringInfoV01& info)
 
             e.isPlayer = v.mIsPlayer != 0;
             if (e.isPlayer)
-                m_hasPlayer = true;
+                hasPlayer = true;
 
             strncpy_s(e.vehicleClass, v.mVehicleClass, _TRUNCATE);
             strncpy_s(e.vehicleName, v.mVehicleName, _TRUNCATE);
 
-            ++m_curCount;
+            // The same car in the previous sample, matched by id even if the
+            // game reordered mVehicle[] (first match, as the old per-Read
+            // search did).
+            e.prevIndex = -1;
+            for (int j = 0; j < lastCount; ++j)
+            {
+                if (last[j].id == e.id) { e.prevIndex = j; break; }
+            }
+
+            // Footprint: carried over while the class and name stay the same
+            // (nearly always), looked up again only when they change.
+            const CarEntry* before = (e.prevIndex >= 0) ? &last[e.prevIndex] : nullptr;
+            if (before && strcmp(before->vehicleClass, e.vehicleClass) == 0
+                       && strcmp(before->vehicleName, e.vehicleName) == 0)
+                e.footprint = before->footprint;
+            else
+                e.footprint = MatchFootprint(e.vehicleClass, e.vehicleName);
+
+            ++count;
         }
     }
 
-    QueryPerformanceCounter(&m_curTime);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
 
+    EnterCriticalSection(&m_lock);
+    // The previous sample set becomes whatever was "current" until now. If
+    // Clear() ran meanwhile, m_curCount/m_curTime are zero here, so the new
+    // prev is empty and Read() does not interpolate from it.
+    const int oldPrev = m_prev;
+    m_prev = m_cur;
+    m_prevCount = m_curCount;
+    m_prevTime = m_curTime;
+    m_cur = m_spare;
+    m_curCount = count;
+    m_curTime = now;
+    m_hasPlayer = hasPlayer;
+    m_spare = oldPrev;
     LeaveCriticalSection(&m_lock);
 }
 
@@ -137,10 +253,13 @@ int CarStateStore::Read(CarPos* out, int maxCars, double& outPlayerHeading, bool
     outPlayerHeading = 0.0;
     outHasPlayer = m_hasPlayer;
 
+    const CarEntry* curCars = m_cars[m_cur];
+    const CarEntry* prevCars = m_cars[m_prev];
     for (int i = 0; i < n; ++i)
     {
-        const CarEntry& cur = m_curCars[i];
-        const CarEntry* prev = (frac < 1.0) ? FindPrev(cur.id) : nullptr;
+        const CarEntry& cur = curCars[i];
+        const CarEntry* prev = (frac < 1.0 && cur.prevIndex >= 0 && cur.prevIndex < m_prevCount)
+            ? &prevCars[cur.prevIndex] : nullptr;
 
         if (prev)
         {
@@ -159,8 +278,7 @@ int CarStateStore::Read(CarPos* out, int maxCars, double& outPlayerHeading, bool
         }
         out[i].id = cur.id;
         out[i].isPlayer = cur.isPlayer;
-        strncpy_s(out[i].vehicleClass, cur.vehicleClass, _TRUNCATE);
-        strncpy_s(out[i].vehicleName, cur.vehicleName, _TRUNCATE);
+        out[i].footprint = cur.footprint;
 
         if (cur.isPlayer)
             outPlayerHeading = out[i].heading;

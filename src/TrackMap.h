@@ -9,7 +9,7 @@
 //     is installed (often dozens of circuits).
 // A circuit found in neither is RECORDED: the player's next clean, pit-free
 // lap is captured from scoring (~5Hz) and becomes the map at the line. The
-// file itself is only written out of the car (see FlushIfDirty), like every
+// file itself is written on the Persist thread (see FlushIfDirty), like every
 // other disk write in this plugin. Recordings use TinyPedal's own format, so
 // one loader reads both:
 //
@@ -38,8 +38,8 @@ namespace TrackMap
 {
     // Scoring thread (~5Hz). Notes the track name and every car's lap
     // distance, and runs the recorder when the track has no map. The file
-    // load itself is deferred to the render thread so no game callback ever
-    // blocks on disk.
+    // load itself runs on a worker thread Draw starts, so no game callback
+    // (and no frame) ever waits on the disk.
     void OnScoring(const ScoringInfoV01& info);
 
     void Draw(Renderer& renderer, int screenWidth, int screenHeight);
@@ -51,8 +51,13 @@ namespace TrackMap
     void DrawLayoutControls(Renderer& renderer, int screenWidth, int screenHeight, HWND hwnd);
 
     // Writes a freshly recorded map to disk, if there is one waiting. Called
-    // out of the car only, with the plugin's other FlushIfDirty() calls.
+    // from the Persist thread only (at the line and out of the car, with the
+    // plugin's other FlushIfDirty() calls); takes the recording under the
+    // module's lock and writes it after releasing it.
     void FlushIfDirty();
+    // Plugin shutdown: waits (up to 3 s) for a map-load worker still
+    // running, so the DLL is never unloaded under it.
+    void Shutdown();
 
     // EndSession. Drops the cars and asks the render thread to drop the map.
     void Clear();

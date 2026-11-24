@@ -25,6 +25,11 @@ cl.exe /nologo /EHsc /std:c++17 /LD /O2 ^
   ..\src\AmdGpuPower.cpp ^
   ..\src\GpuEngineUsage.cpp ^
   ..\src\RealtimeState.cpp ^
+  ..\src\Persist.cpp ^
+  ..\src\Sound.cpp ^
+  ..\src\TrackAlerts.cpp ^
+  ..\src\ReplayInfo.cpp ^
+  ..\src\UpdateCheck.cpp ^
   ..\src\Hook.cpp ^
   ..\src\Layout.cpp ^
   ..\src\Shortcuts.cpp ^
@@ -50,10 +55,12 @@ cl.exe /nologo /EHsc /std:c++17 /LD /O2 ^
   ..\src\TyreSave.cpp ^
   ..\src\EngineTemps.cpp ^
   ..\src\FfbLevel.cpp ^
+  ..\src\Conditions.cpp ^
+  ..\src\Weather.cpp ^
+  ..\src\PitStint.cpp ^
   ..\src\TyreWear.cpp ^
   ..\src\SetupInfo.cpp ^
   ..\src\DrsCue.cpp ^
-  ..\src\PitEntry.cpp ^
   ..\src\InputLagEstimate.cpp ^
   ..\src\ProximityHue.cpp ^
   ..\src\Renderer.cpp ^

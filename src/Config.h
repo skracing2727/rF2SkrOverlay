@@ -60,6 +60,14 @@ struct ClockConfig
 };
 extern ClockConfig g_clockConfig;
 
+// UpdateCheck.h: ask GitHub once per game start whether a newer release is
+// out, and say so in the menus.
+struct UpdateCheckConfig
+{
+    bool enabled = true;
+};
+extern UpdateCheckConfig g_updateCheckConfig;
+
 // What the DLL itself costs (Profiler.h): a bar of the last 10 s, split by
 // module. Draggable/resizable in layout mode like the rest.
 struct DllCostConfig
@@ -73,6 +81,9 @@ struct DllCostConfig
     // A module gets a name in the bar only if it is at least this share of
     // the total.
     float labelMinShare = 0.08f;
+    // Diagnostic: every 10 s of driving, log the render-thread frames that
+    // cost the DLL the most and which modules were in them (rF2SkrOverlay.log).
+    bool logSpikes = false;
 };
 extern DllCostConfig g_dllCostConfig;
 
@@ -128,7 +139,6 @@ struct ShortcutConfig
     int tyreTemps = 0;           // per-corner tyre temperature box (camber check)
     int ffbGraph = 0;            // FFB frequency spectrum panel
     int trackMap = 0;            // overhead track map
-    int tyreWearPlots = 0;       // per-tyre wear box plots in the Tyres box
     int dllCost = 0;             // what the DLL itself costs, by module
     int coverBoxes = 0;          // boxes hiding parts of the car's own display
 
@@ -136,6 +146,10 @@ struct ShortcutConfig
     // per-element toggles: those are about which panels you want, this is
     // about wanting the overlay at all.
     int masterToggle = 'H';
+    // Ctrl+Shift+A: draw the HUD even when not driving (watching a team-mate
+    // drive your shared car, the monitor, a replay). Kept until toggled off.
+    int alwaysOnToggle = 'A';
+    bool alwaysOn = false;
 
     int resetSessionBest = 0;    // Zero the session best -- in-memory, no confirm
     int resetPersonalBest = 0;   // WIPE the saved PB -- destructive, press twice
@@ -164,7 +178,6 @@ struct ShortcutConfig
     bool showTyreTemps = true;
     bool showFfbGraph = true;
     bool showTrackMap = true;
-    bool showTyreWearPlots = true;
     bool showDllCost = false;    // a diagnostic, so off unless asked for
     bool showCoverBoxes = false;  // off until wanted: an unplaced box sits mid-screen
     bool showOverlay = true;     // master switch, persisted like the rest
@@ -184,6 +197,62 @@ struct ShortcutConfig
     float messageCenterYFraction = 0.62f;
     float messageScale = 1.0f;
 
+    // The rotary setting box: the setting each side rotary changes and its
+    // value; while a rotary is being turned it lists the settings instead.
+    bool showKnobBox = true;
+    float knobBoxCenterXFraction = 0.5f;
+    float knobBoxCenterYFraction = 0.80f;
+    float knobBoxScale = 1.0f;
+    float knobNeighbourSeconds = 5.0f;
+    // Keys some rotary settings press (DirectInput scan codes, e.g. 0x1B for
+    // ]; 0 = none). Bind the same keys in rF2 to the matching controls:
+    // Increase / Decrease Vertical FOV, Increment / Decrement Mixture,
+    // Traction Control Up / Down, Traction Control 2 Up / Down (power cut),
+    // Traction Control Slip Angle Up / Down, Headlights, Inc / Dec Front and
+    // Rear ARB, Antilock Brake System Up / Down, Adjust Seat Fore / Aft and
+    // Up / Down. All unbound by default, since nobody's rF2 bindings match.
+    int fovUpKey = 0;
+    int fovDownKey = 0;
+    int mixtureUpKey = 0;
+    int mixtureDownKey = 0;
+    int tcUpKey = 0;
+    int tcDownKey = 0;
+    int tcCutUpKey = 0;
+    int tcCutDownKey = 0;
+    int tcSlipUpKey = 0;
+    int tcSlipDownKey = 0;
+    int headlightsKey = 0;
+    int frontArbUpKey = 0;
+    int frontArbDownKey = 0;
+    int rearArbUpKey = 0;
+    int rearArbDownKey = 0;
+    int absUpKey = 0;
+    int absDownKey = 0;
+    // "Brake bias": Bias Forward / Bias Rearward.
+    int biasForwardKey = 0;
+    int biasRearwardKey = 0;
+    int seatForeKey = 0;
+    int seatAftKey = 0;
+    int seatUpKey = 0;
+    int seatDownKey = 0;
+    // Wheel rotary buttons (DirectInput button numbers 1-128, 0 = none). The
+    // CENTRE rotary walks the on/off list and elementToggleButton switches
+    // the picked entry. The LEFT and RIGHT rotaries each pick a setting, and
+    // their Up/Down buttons change it. All 0 by default: every wheel numbers
+    // its buttons differently. The keyboard works without any of these
+    // (Home/End, Insert/Delete, Page Up/Page Down).
+    int elementToggleButton = 0;
+    int centreKnobPrevButton = 0;
+    int centreKnobNextButton = 0;
+    int rightKnobPrevButton = 0;
+    int rightKnobNextButton = 0;
+    int leftKnobPrevButton = 0;
+    int leftKnobNextButton = 0;
+    int leftSettingUpButton = 0;
+    int leftSettingDownButton = 0;
+    int rightSettingUpButton = 0;
+    int rightSettingDownButton = 0;
+
     // The shortcut list. -1 is a sentinel meaning "auto-anchor below the
     // fuel/tyre panel's real bottom edge", which is what it did before it
     // was draggable -- so a taller panel pushed it down instead of
@@ -193,6 +262,8 @@ struct ShortcutConfig
     float listPosXFraction = -1.0f;
     float listPosYFraction = -1.0f;
     float listScale = 1.0f;
+    // Text size preset, the S / M / L boxes at the top of the list: 0 small, 1 medium, 2 large.
+    int listTextSize = 0;
 };
 extern ShortcutConfig g_shortcutConfig;
 
@@ -533,6 +604,12 @@ struct FrameLatencyConfig
     // IDXGIAdapter3::QueryVideoMemoryInfo (DXGI 1.4+; silently omitted if
     // unavailable, e.g. very old GPU driver).
     bool showVram = false;
+    // This plugin's own RAM (DLL image + its heap), and the whole PC's RAM in use / installed.
+    bool showPluginRam = false;
+    bool showPcRam = false;
+    // The game's replay recording (ReplayInfo.h): off / to RAM / to disk with
+    // the recording file's size so far, and the replay fidelity setting.
+    bool showReplay = false;
     // FPS min / 1%-low / max over the last few seconds, alongside the live
     // smoothed FPS already shown above.
     bool showFpsRange = false;
@@ -812,9 +889,9 @@ struct GearDisplayConfig
 
 struct PitLimiterConfig
 {
-    // The colored PIT box (fill colour, limit/delta readout) is off by
-    // default -- simplified per request down to just the engage beep and the
-    // on-screen reminder below, both independent of this flag.
+    // The old separate PIT box beside the dashboard (fill colour,
+    // limit/delta readout) is off by default: the limiter now shows as "PIT"
+    // in the ABS/TC box (GearDisplay.cpp), which this flag does not affect.
     bool enabled = false;
     // Only drawn while the limiter is actually engaged -- an indicator that's
     // always on screen regardless of relevance would just be noise.
@@ -855,40 +932,50 @@ struct PitLimiterConfig
     // disappears into it when at/under the limit.
     float deltaTextHeightPx = 44.0f;
 
-    // One long beep once speed drops to/under the limit while the limiter
-    // isn't engaged yet, fired only once per "went from over to at/under"
-    // transition so it doesn't repeat every frame while you sit under it.
-    bool engageBeepEnabled = false;
-    int engageBeepFrequencyHz = 1400;
-    int engageBeepDurationMs = 600;
-
-    // Centred on-screen reminder shown while under the limit but the limiter
-    // still isn't engaged -- clears the moment it is (or you go back over).
-    // Only considered at all within this many metres of the pit entry line
-    // (PitEntryStore::distanceToLineM) -- a pit stop stays "requested"
-    // for the whole lap, so without this a slow corner anywhere on track,
-    // nowhere near the pits, would falsely trigger the reminder.
-    bool engageWarningEnabled = false;
-    float engageWarningMaxDistanceM = 400.0f;
-    float engageWarningTextHeightPx = 80.0f;   // enlarged per request
     // PIT LIMITER bar: centre position (fractions of screen; -1 = auto,
     // laid over the gear/speed row) and size multiplier. Draggable/resizable
     // in layout mode.
     float barXFraction = -1.0f;
     float barYFraction = -1.0f;
     float barScale = 1.0f;
-    float engageWarningXFraction = 0.5f;
-    float engageWarningYFraction = 0.4f;
-    float engageWarningR = 1.0f, engageWarningG = 0.9f, engageWarningB = 0.1f;
-    // One full on/off flash cycle, in seconds -- slower than the gear/PIT
-    // box flashes (which mark a fast-changing condition) since this is a
-    // static reminder meant to be readable, not urgent.
-    float engageWarningBlinkPeriodSeconds = 1.0f;
+};
 
-    // The SDK's mPitLapDist does not land exactly on the pit-lane entry line
-    // (see PitEntry.h) -- added to it, in metres, until a track has its own
-    // auto-calibrated offset. Positive moves the line later in the lap.
-    float entryOffsetMeters = 0.0f;
+// Warning lines above the gear/speed boxes (see TrackAlerts.h): a stopped
+// car (or several) ahead with a distance countdown, yellow-flag sectors,
+// and the pit-lane speed limit as a reminder once a pit stop is requested.
+// The pit-lane limit itself is set per track with a wheel knob ("Pit lane
+// limit") and saved in a PitLaneLimits folder next to this INI.
+struct TrackAlertConfig
+{
+    bool enabled = true;
+    // Only cars this far ahead of you along the lap are looked at.
+    float rangeMeters = 1000.0f;
+    // Under this a car counts as stopped -- a racing car this slow on track
+    // is as good as stopped.
+    float stoppedKmh = 40.0f;
+    // Slow-corner guard: where your own best lap was itself that slow (a
+    // hairpin taken at 45 km/h), a car only counts under this share of your
+    // speed there, so normal traffic in the hairpin is not reported. Ignored
+    // until there is a best lap for this car and track. 0 = off.
+    float slowCornerFraction = 0.8f;
+    // Stopped cars this close to each other along the track are one incident:
+    // one line, the distance to the first, and how many cars.
+    float groupMeters = 150.0f;
+    // How long a car has to stay slow before it is reported, and fast again
+    // before the warning clears -- so a car that just runs wide or a spin
+    // that is over in a moment does not flash up.
+    float dwellSeconds = 1.0f;
+    // Inside this distance the warning flashes.
+    float flashWithinMeters = 200.0f;
+    // Which sector has a yellow flag (needs local yellows on the server).
+    bool showSectorYellow = true;
+    // "PIT LIMIT 60 km/h" above the speed box once a pit stop is requested.
+    bool showPitLimitReminder = true;
+    // Text height (at 2160p, scaled with the dashboard) and the gap above
+    // the dashboard / between the two lines.
+    float textHeightPx = 56.0f;
+    float gapPx = 10.0f;
+    float r = 1.0f, g = 0.85f, b = 0.1f;    // yellow
 };
 
 struct LapDeltaConfig
@@ -1300,6 +1387,17 @@ struct RelativeTimingConfig
     // WantsTelemetryUpdates in Plugin.cpp) -- there is no cheaper way to
     // know what the rest of the field is running.
     bool showTyre = true;
+    // Laps since each car's last pit stop ("L12"), see PitStint.h.
+    bool showPitLaps = false;
+    // Car number ("#19", read from the entry name) between place and name.
+    bool showCarNumber = true;
+    // Gap box: a small second table of the two places ahead of you and the
+    // one behind, with the same columns as the standings. Its own position
+    // and size; -1 = auto, just under the standings (resolved on first draw).
+    bool showGapBox = true;
+    float gapPosXFraction = -1.0f;
+    float gapPosYFraction = -1.0f;
+    float gapScale = 1.0f;
 
 };
 
@@ -1361,17 +1459,6 @@ struct FuelTyrePanelConfig
     // FreezeAfterLineSeconds.
     float tyreFreezeAfterLineSeconds = 5.0f;
 
-    // Box plots of each tyre's wear per lap this session (see
-    // TyreWearStore::WearDistribution): a small one under each tyre's number
-    // in the grid, all four on one shared scale so they compare at a glance,
-    // and a bigger one for the worst tyre (highest median) on its own scale
-    // with the numbers written under it. The red point is the last counted
-    // lap. Shown/hidden in game from the shortcut list ("Tyre wear plots").
-    float wearPlotWidthPx = 240.0f;
-    float wearPlotHeightPx = 26.0f;
-    float wearBigPlotHeightPx = 44.0f;
-    float wearPlotR = 0.75f, wearPlotG = 0.75f, wearPlotB = 0.78f;
-    float wearLastLapR = 1.0f, wearLastLapG = 0.2f, wearLastLapB = 0.2f;
 
     // Fuel-versus-race verdict, applied to the "Fuel Time Left" and "Fuel
     // Laps Left" values in RACE sessions. Green means the tank comfortably
@@ -1579,6 +1666,10 @@ struct FfbGraphConfig
     // Log-scale y axis range, percent of full force.
     float minPercent = 0.5f;
     float maxPercent = 200.0f;
+    // Frequency bands per decade on the log axis (1-10 Hz, 10-100 Hz, ...):
+    // each point is the energy of all 1 Hz bins in its band. 0 = one point
+    // per 1 Hz bin.
+    int bandsPerDecade = 5;
     float bgR = 0.13f, bgG = 0.13f, bgB = 0.13f, bgA = 0.85f;
     float lineR = 0.95f, lineG = 0.42f, lineB = 0.15f; // Pit House orange
     // Dotted line: average over the last completed lap (or the lap so far).
@@ -1626,7 +1717,7 @@ struct TrackMapConfig
     // stretch still ahead shows the last lap, fainter. Wheel buttons step
     // through the modes: deltaPrevButton back, deltaNextButton on, wrapping
     // through off (0 = no button).
-    int   deltaColourMode = 0;
+    int   deltaColourMode = 0;   // 0 off, 1 PB, 2 SB, 3 session fastest
     int   deltaPrevButton = 30;
     int   deltaNextButton = 31;
     int   deltaSectorCount = 80;
@@ -1709,6 +1800,7 @@ extern LayoutConfig g_layoutConfig;
 extern FrameLatencyConfig g_frameLatencyConfig;
 extern GearDisplayConfig g_gearDisplayConfig;
 extern PitLimiterConfig g_pitLimiterConfig;
+extern TrackAlertConfig g_trackAlertConfig;
 extern LapDeltaConfig g_lapDeltaConfig;
 extern RelativeTimingConfig g_relativeTimingConfig;
 // Fuel-save delta bar for stint-length fuel targets -- see FuelSave.h.
@@ -1754,6 +1846,18 @@ struct FfbLevelConfig
     float scale = 1.0f;
 };
 extern FfbLevelConfig g_ffbLevelConfig;
+// Track conditions box -- see Conditions.h.
+struct ConditionsConfig
+{
+    bool enabled = true;
+    float wetsAtWetness = 0.20f;  // average racing-line wetness at which wets are called
+    float nearMargin = 0.05f;     // amber "near crossover" band below that
+    bool realWeather = false;     // also fetch the real-world forecast (Open-Meteo), see Weather.h
+    float centerXFraction = 0.85f;
+    float centerYFraction = 0.65f;
+    float scale = 1.0f;
+};
+extern ConditionsConfig g_conditionsConfig;
 extern FuelTyrePanelConfig g_fuelTyrePanelConfig;
 extern BrakeCueConfig g_brakeCueConfig;
 extern DrsCueConfig g_drsCueConfig;
@@ -1785,22 +1889,28 @@ namespace Config
 
     // Same deferred single-key write, for a word (the text font's name).
     bool WriteString(const char* section, const char* key, const char* value);
+    // Reads a word from the INI (empty if absent) -- or, if it was written
+    // but not flushed yet, the value still waiting in the queue.
+    void ReadStringLive(const char* section, const char* key, char* buf, size_t bufSize);
 
     // Actually performs every write queued by WriteBool/WriteFloat above
     // since the last call, in one batch, then clears the queue. This is the
-    // ONLY place either of those touches disk -- deferring every INI write
-    // until back at the garage/menu (see Plugin.cpp) was a real, measured
-    // source of Plugin CPU spikes while driving (WritePrivateProfileString
-    // is synchronous disk I/O, and a toggle or a layout-mode drag can happen
-    // mid-session). Returns false if any single write failed, so the caller
-    // can surface ONE warning for the whole batch rather than one per key.
+    // ONLY place either of those touches disk, and it runs only on the
+    // Persist thread, out of the car (the disk rule, Persist.cpp): a write
+    // from the render or a game thread was a real, measured source of Plugin
+    // CPU spikes while driving (WritePrivateProfileString is synchronous disk
+    // I/O, and a toggle or a layout-mode drag can happen mid-session). The
+    // queue itself is locked, so any thread may queue at any time. Returns
+    // false if any single write failed, so the caller can surface ONE
+    // warning for the whole batch rather than one per key.
     bool FlushPendingWrites();
 
-    // Reads one float straight from the live INI, for keys whose NAME is not
+    // Reads one float from the live INI, for keys whose NAME is not
     // known until runtime and so cannot be part of the normal Load(). The
     // track map's per-circuit rotation is the case this exists for: the key
     // is "Rotation_<TrackName>", and there is one per circuit ever driven.
-    // Hits disk, so call it on a map load, not per frame.
+    // A value queued but not flushed yet wins over the file. Hits disk, so
+    // call it on a map load, not per frame.
     float ReadFloatLive(const char* section, const char* key, float def);
 
     // Renders a virtual-key code the way the INI writes it and the on-screen

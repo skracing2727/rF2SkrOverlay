@@ -1,3 +1,4 @@
+#include "Conditions.h"
 #include "TrackMap.h"
 #include "InternalsPlugin.hpp"
 #include "Renderer.h"
@@ -52,9 +53,21 @@ namespace
     std::atomic<long long> g_lastScoringQpc{ 0 };
     LARGE_INTEGER g_qpcFreq = {};
 
-    // A finished recording. Handed to the render thread to show at once
-    // (g_newRecording) and, separately, queued for the disk write out of the
-    // car (g_saveQueue).
+    // A map ready to show: what BuildMapData makes from a file's or a
+    // recording's points. Built off the render thread (the map-load worker,
+    // the scoring thread); Draw only swaps it in (ApplyMap).
+    struct MapData
+    {
+        std::vector<Pt>    raw;       // as read from the file / recording
+        std::vector<float> lapDist;   // lap distance at each index, strictly increasing
+        float trackLength = 0.0f;
+        int   s1 = -1, s2 = -1;       // sector indices into both
+        bool  ok = false;
+    };
+
+    // A finished recording, queued for the disk write (g_saveQueue, see
+    // FlushIfDirty). The render thread gets it separately, already built
+    // into a map (g_newMap), to show at once.
     struct Recording
     {
         char track[64] = {};
@@ -62,8 +75,9 @@ namespace
         std::vector<Pt> dist;  // (lapDist, elevation)
         int s1 = -1, s2 = -1;
     };
-    Recording g_newRecording;
-    bool g_haveNewRecording = false;
+    char    g_newMapTrack[64] = {};
+    MapData g_newMap;
+    bool    g_haveNewRecording = false;
     Recording g_saveQueue;
     bool g_saveDirty = false;
 
@@ -455,7 +469,7 @@ namespace
 
     float g_minX = 0.0f, g_maxX = 0.0f, g_minZ = 0.0f, g_maxZ = 0.0f;
 
-    // This circuit's own angle and flip (see ApplyTrackSettings), and what
+    // This circuit's own angle and flip (see ReadTrackSettings), and what
     // the baked points were last built with.
     float g_trackRotationDeg = 0.0f;
     bool  g_trackMirror = false;
@@ -493,6 +507,7 @@ namespace
             return false;
 
         out.clear();
+        out.reserve((end - start) / 16 + 1); // "1234.5678,-123.4567 " is ~20 characters a point
         const char* p = text.c_str() + start;
         const char* stop = text.c_str() + end;
         while (p < stop)
@@ -583,6 +598,9 @@ namespace
     }
 
     // Same layout TinyPedal writes, so either tool can read the other's.
+    // Persist thread only (FlushIfDirty), with no lock held. Written to a
+    // temp file and moved over the old one, so a crash or a full disk mid-
+    // write never leaves a half-written map for the next load to choke on.
     void WriteRecording(const Recording& rec)
     {
         if (rec.map.empty() || rec.map.size() != rec.dist.size())
@@ -603,8 +621,10 @@ namespace
             minZ = (std::min)(minZ, p.z); maxZ = (std::max)(maxZ, p.z);
         }
 
+        char tmp[MAX_PATH + 8];
+        sprintf_s(tmp, "%s.tmp", path);
         FILE* f = nullptr;
-        if (fopen_s(&f, path, "w") != 0 || !f)
+        if (fopen_s(&f, tmp, "w") != 0 || !f)
         {
             Log::Write("TrackMap: could not write '%s' (read-only? UAC?)", path);
             return;
@@ -626,7 +646,14 @@ namespace
         for (size_t i = 0; i < rec.dist.size(); ++i)
             fprintf(f, "%s%.4f,%.4f", i ? " " : "", rec.dist[i].x, rec.dist[i].z);
         fprintf(f, "\"/>\n</svg>\n");
-        fclose(f);
+        const bool written = !ferror(f);
+        const bool closed = fclose(f) == 0;
+        if (!written || !closed || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+        {
+            DeleteFileA(tmp);
+            Log::Write("TrackMap: could not write '%s' (read-only? UAC? disk full?)", path);
+            return;
+        }
         Log::Write("TrackMap: saved '%s' (%d points)", path, static_cast<int>(rec.map.size()));
     }
 
@@ -668,22 +695,27 @@ namespace
 
     // Shared by the file loader and a fresh recording. 'distPts' may be null
     // or a different length, in which case arc length stands in for it.
-    bool BuildMap(const char* what, const std::vector<Pt>& mapPts, const std::vector<Pt>* distPts, int s1, int s2)
+    // Fills 'out' only, so it runs off the render thread: on the map-load
+    // worker for a file, on the scoring thread for a recording.
+    void BuildMapData(const char* what, std::vector<Pt>&& mapPts, const std::vector<Pt>* distPts, int s1, int s2,
+                      MapData& out)
     {
-        g_raw = mapPts;
-        g_lapDist.clear();
-        g_sector1Index = s1;
-        g_sector2Index = s2;
-        g_trackLength = 0.0f;
-        g_bakeValid = false;
-        if (g_raw.size() < 2)
-            return false;
+        out.raw = std::move(mapPts);
+        out.lapDist.clear();
+        out.s1 = s1;
+        out.s2 = s2;
+        out.trackLength = 0.0f;
+        out.ok = false;
+        std::vector<Pt>& raw = out.raw;
+        std::vector<float>& lapDist = out.lapDist;
+        if (raw.size() < 2)
+            return;
 
-        g_lapDist.resize(g_raw.size());
-        if (distPts && distPts->size() == g_raw.size())
+        lapDist.resize(raw.size());
+        if (distPts && distPts->size() == raw.size())
         {
             for (size_t i = 0; i < distPts->size(); ++i)
-                g_lapDist[i] = (*distPts)[i].x;
+                lapDist[i] = (*distPts)[i].x;
         }
         else
         {
@@ -691,74 +723,86 @@ namespace
             // distance and keeps a map without a usable dist array usable.
             Log::Write("TrackMap: '%s' has no matching dist array -- using arc length", what);
             float acc = 0.0f;
-            g_lapDist[0] = 0.0f;
-            for (size_t i = 1; i < g_raw.size(); ++i)
+            lapDist[0] = 0.0f;
+            for (size_t i = 1; i < raw.size(); ++i)
             {
-                const float dx = g_raw[i].x - g_raw[i - 1].x;
-                const float dz = g_raw[i].z - g_raw[i - 1].z;
+                const float dx = raw[i].x - raw[i - 1].x;
+                const float dz = raw[i].z - raw[i - 1].z;
                 acc += sqrtf(dx * dx + dz * dz);
-                g_lapDist[i] = acc;
+                lapDist[i] = acc;
             }
         }
 
-        NormalizeLapDist(g_raw, g_lapDist, g_sector1Index, g_sector2Index);
+        NormalizeLapDist(raw, lapDist, out.s1, out.s2);
 
         // Close the loop: the distance from the last point back to the first.
         // Measured from the FIRST point's distance, which is rarely exactly 0.
-        const float dxc = g_raw[0].x - g_raw.back().x;
-        const float dzc = g_raw[0].z - g_raw.back().z;
-        g_trackLength = (g_lapDist.back() - g_lapDist.front()) + sqrtf(dxc * dxc + dzc * dzc);
+        const float dxc = raw[0].x - raw.back().x;
+        const float dzc = raw[0].z - raw.back().z;
+        out.trackLength = (lapDist.back() - lapDist.front()) + sqrtf(dxc * dxc + dzc * dzc);
 
         Log::Write("TrackMap: '%s' -> %d points, sectors %d/%d, lapDist %.1f..%.1f, length %.1f",
-                   what, static_cast<int>(g_raw.size()),
-                   g_sector1Index, g_sector2Index,
-                   g_lapDist.front(), g_lapDist.back(), g_trackLength);
-        return true;
+                   what, static_cast<int>(raw.size()),
+                   out.s1, out.s2,
+                   lapDist.front(), lapDist.back(), out.trackLength);
+        out.ok = true;
     }
 
-    bool LoadMapFor(const char* trackName)
+    // Render thread: makes a built map the loaded one. Swapped, not copied
+    // -- 'm' is left holding the previous map, for the caller to free.
+    bool ApplyMap(MapData& m)
     {
-        g_raw.clear();
-        g_lapDist.clear();
+        g_raw.swap(m.raw);
+        g_lapDist.swap(m.lapDist);
+        g_trackLength = m.trackLength;
+        g_sector1Index = m.s1;
+        g_sector2Index = m.s2;
         g_bakeValid = false;
+        return m.ok;
+    }
+
+    // Finds and reads the circuit's SVG (own map folder first, then
+    // TinyPedal's). File I/O only -- run on the map-load worker thread.
+    bool ReadMapText(const char* trackName, std::string& text)
+    {
         if (!trackName || !trackName[0])
             return false;
-
         char ownDir[MAX_PATH];
         OwnMapDir(ownDir, sizeof(ownDir));
         char safeName[64];
         SafeFileName(trackName, safeName, sizeof(safeName));
-
         char candidates[2][MAX_PATH];
         sprintf_s(candidates[0], "%s%s.svg", ownDir, safeName);
         sprintf_s(candidates[1], "%s%s.svg", g_trackMapConfig.tinyPedalMapDir, trackName);
-
-        std::string text;
-        bool read = false;
-        for (int i = 0; i < 2 && !read; ++i)
-        {
+        for (int i = 0; i < 2; ++i)
             if (ReadWholeFile(candidates[i], text))
             {
-                read = true;
                 Log::Write("TrackMap: loaded '%s'", candidates[i]);
+                return true;
             }
-        }
-        if (!read)
-        {
-            Log::Write("TrackMap: no map file for track '%s'", trackName);
-            return false;
-        }
+        Log::Write("TrackMap: no map file for track '%s'", trackName);
+        return false;
+    }
+
+    // Parses the text ReadMapText got and builds the map from it (map-load
+    // worker). A few thousand numbers for a 45 KB map -- it used to run on
+    // the render thread when the worker handed back the text.
+    void ParseMap(const char* trackName, const std::string& text, bool read, MapData& out)
+    {
+        out = MapData{};
+        if (!trackName || !trackName[0] || !read)
+            return;
 
         std::vector<Pt> mapPts, distPts;
         if (!ExtractPoints(text, "map", mapPts))
         {
             Log::Write("TrackMap: '%s' has no usable polyline id=map", trackName);
-            return false;
+            return;
         }
         int s1 = -1, s2 = -1;
         ExtractSectorIndices(text, s1, s2);
         const bool haveDist = ExtractPoints(text, "dist", distPts);
-        return BuildMap(trackName, mapPts, haveDist ? &distPts : nullptr, s1, s2);
+        BuildMapData(trackName, std::move(mapPts), haveDist ? &distPts : nullptr, s1, s2, out);
     }
 
     // --- Recorder --------------------------------------------------------------
@@ -795,15 +839,22 @@ namespace
                     rec.dist = r.dist;
                     rec.s1 = r.s1;
                     rec.s2 = r.s2;
+                    Log::Write("TrackMap: recorded '%s' -- %d points, sectors %d/%d, lap %.3fs",
+                               rec.track, static_cast<int>(rec.map.size()), rec.s1, rec.s2, v.mLastLapTime);
+                    // Built into a map here (once per recording), so the
+                    // render thread only has to swap it in.
+                    MapData built;
+                    BuildMapData(rec.track, std::vector<Pt>(rec.map), &rec.dist, rec.s1, rec.s2, built);
+                    // Swapped in under the lock; whatever they replace is
+                    // freed after it is released.
                     EnterCriticalSection(&g_lock);
-                    g_newRecording = rec;
+                    strcpy_s(g_newMapTrack, sizeof(g_newMapTrack), rec.track);
+                    std::swap(g_newMap, built);
                     g_haveNewRecording = true;
-                    g_saveQueue = rec;
+                    std::swap(g_saveQueue, rec);
                     g_saveDirty = true;
                     LeaveCriticalSection(&g_lock);
                     g_wantRecording.store(false, std::memory_order_relaxed);
-                    Log::Write("TrackMap: recorded '%s' -- %d points, sectors %d/%d, lap %.3fs",
-                               rec.track, static_cast<int>(rec.map.size()), rec.s1, rec.s2, v.mLastLapTime);
                 }
                 else
                 {
@@ -958,6 +1009,108 @@ namespace
         BakedToScreen(bx + ox, bz + oz, sx, sy);
     }
 
+    // --- The track line on the GPU -----------------------------------------------
+
+    // The coloured line is cut into about this many pieces (whole runs of
+    // mini-sectors), each its own static batch -- a compromise between how
+    // much a colour change rebuilds and how many batches are drawn a frame.
+    const int kRibbonGroups = 12;
+    const int kMaxRibbonPieces = 16;
+
+    // A run of the line kept in a Renderer::StaticBatch, with a copy of
+    // exactly what it was built from: rebuilt only when that changes. A
+    // straight memcmp of a few KB -- it replaced an FNV hash run byte by byte
+    // over the whole line twenty times a second.
+    struct RibbonBatch
+    {
+        Renderer::StaticBatch batch;   // a static: the renderer keeps a pointer to it
+        std::vector<float> xy, rgb;
+        float style[6] = {};
+    };
+
+    bool SameFloats(const std::vector<float>& kept, const float* p, size_t n)
+    {
+        return kept.size() == n && (n == 0 || memcmp(kept.data(), p, n * sizeof(float)) == 0);
+    }
+
+    void DrawRibbon(Renderer& renderer, RibbonBatch& rb, const float* xy, int count, bool closed,
+                    float w, float r, float g, float b, float a, const float* rgb)
+    {
+        const float style[6] = { w, r, g, b, a, closed ? 1.0f : 0.0f };
+        const size_t nXy = count > 0 ? static_cast<size_t>(count) * 2 : 0;
+        const size_t nRgb = rgb ? nXy / 2 * 3 : 0;
+        if (rb.batch.valid && memcmp(style, rb.style, sizeof(style)) == 0
+            && SameFloats(rb.xy, xy, nXy) && SameFloats(rb.rgb, rgb, nRgb))
+        {
+            renderer.DrawStatic(rb.batch);
+            return;
+        }
+        const size_t mark = renderer.BeginStatic();
+        renderer.AddPolylineSmooth(xy, count, closed, w, r, g, b, a, rgb);
+        renderer.EndStatic(mark, rb.batch);
+        rb.xy.assign(xy, xy + nXy);
+        if (rgb) rb.rgb.assign(rgb, rgb + nRgb);
+        else rb.rgb.clear();
+        memcpy(rb.style, style, sizeof(style));
+    }
+
+    // Where the closed, coloured line (n points, 'xy' snapped -- see Draw) is
+    // cut into pieces: one cut where each group of mini-sectors starts, and
+    // one as near the start of the array as it can be, so the pieces draw in
+    // the order the single line's segments did (that order decides which
+    // side is on top where a circuit crosses itself). Returns the cuts, as
+    // segment indices (segment j runs from point j to j + 1), ascending.
+    //
+    // A cut goes half way along a segment whose two ends have the same
+    // colour and no sharp bend. The pieces are then open lines whose square
+    // ends meet half way along that segment, and they draw exactly what the
+    // single line did: every other point keeps the same neighbours and so
+    // the same mitred corner, the cut segment's two halves cover what it
+    // covered, in the one colour it had. A sharp bend is avoided because
+    // past ~133 degrees the renderer clamps its mitre, and the corner would
+    // then no longer line up with a square end.
+    int SplitRibbon(const float* xy, const float* rgb, const unsigned short* group, int n, int* cuts, int maxCuts)
+    {
+        if (n < 8)
+            return 0;
+        auto dir = [&](int from, int to, float& dx, float& dy)
+        {
+            dx = xy[to * 2] - xy[from * 2];
+            dy = xy[to * 2 + 1] - xy[from * 2 + 1];
+            const float len = sqrtf(dx * dx + dy * dy);
+            if (len > 0.0001f) { dx /= len; dy /= len; }
+            return len;
+        };
+        // No sharper than 120 degrees at point c.
+        auto gentle = [&](int c)
+        {
+            float ax = 0.0f, ay = 0.0f, bx = 0.0f, by = 0.0f;
+            if (dir((c - 1 + n) % n, c, ax, ay) < 0.0001f || dir(c, (c + 1) % n, bx, by) < 0.0001f)
+                return false;
+            return ax * bx + ay * by > -0.5f;
+        };
+        auto canCut = [&](int j)
+        {
+            const int j1 = (j + 1) % n;
+            float dx = 0.0f, dy = 0.0f;
+            return memcmp(rgb + j * 3, rgb + j1 * 3, 3 * sizeof(float)) == 0
+                && dir(j, j1, dx, dy) >= 1.0f && gentle(j) && gentle(j1);
+        };
+        int count = 0;
+        bool seeking = true;   // the first cut, from the start of the array
+        for (int j = 0; j < n && count < maxCuts; ++j)
+        {
+            if (j > 0 && group[j] != group[j - 1])
+                seeking = true;
+            if (seeking && canCut(j))
+            {
+                cuts[count++] = j;
+                seeking = false;
+            }
+        }
+        return count;
+    }
+
     // --- Per-track rotation and mirror -----------------------------------------
 
     // Sanitised into an INI key name: '=' or a newline in a key would corrupt
@@ -979,17 +1132,45 @@ namespace
     // The global RotationDegrees/Mirror are only the fallback for a circuit
     // never turned -- read from the config each time, never from the last
     // circuit's value, so a new track does not inherit the previous one's angle.
-    void ApplyTrackSettings(const char* track)
+    // (Reads the INI: map-load worker thread.)
+    void ReadTrackSettings(const char* track, float& rotDeg, bool& mirror)
     {
-        g_trackRotationDeg = g_trackMapConfig.rotationDegrees;
-        g_trackMirror = g_trackMapConfig.mirror;
+        rotDeg = g_trackMapConfig.rotationDegrees;
+        mirror = g_trackMapConfig.mirror;
         if (!track || !track[0])
             return;
         char key[96];
         TrackKey("Rotation_", track, key, sizeof(key));
-        g_trackRotationDeg = Config::ReadFloatLive("TrackMap", key, g_trackRotationDeg);
+        rotDeg = Config::ReadFloatLive("TrackMap", key, rotDeg);
         TrackKey("Mirror_", track, key, sizeof(key));
-        g_trackMirror = Config::ReadFloatLive("TrackMap", key, g_trackMirror ? 1.0f : 0.0f) > 0.5f;
+        mirror = Config::ReadFloatLive("TrackMap", key, mirror ? 1.0f : 0.0f) > 0.5f;
+    }
+
+    // A track change does everything slow on a worker thread: reads the SVG,
+    // parses it and builds the map (ParseMap), and reads the circuit's INI
+    // settings. Draw starts it and, once the thread has exited, only swaps
+    // the result in. It used to read and parse all of it on the render
+    // thread (a hitch at every track load), and later still parsed there.
+    // The worker touches nothing but g_mapJob, and Draw reads g_mapJob only
+    // after the thread has ended.
+    struct MapJob
+    {
+        HANDLE thread = nullptr;
+        char track[64] = {};
+        unsigned gen = 0;
+        MapData map;
+        float rotDeg = 0.0f;
+        bool mirror = false;
+    } g_mapJob;
+    unsigned g_mapGen = 0;   // bumped by DropLoadedMap: a load in flight is then stale
+
+    DWORD WINAPI MapJobProc(LPVOID)
+    {
+        std::string text;
+        const bool read = ReadMapText(g_mapJob.track, text);
+        ParseMap(g_mapJob.track, text, read, g_mapJob.map);
+        ReadTrackSettings(g_mapJob.track, g_mapJob.rotDeg, g_mapJob.mirror);
+        return 0;
     }
 
     void PersistTrackRotation()
@@ -1022,6 +1203,7 @@ namespace
 
     void DropLoadedMap()
     {
+        ++g_mapGen;
         g_haveMap = false;
         g_loadAttempted = false;
         g_loadedTrack[0] = 0;
@@ -1087,6 +1269,10 @@ void TrackMap::OnScoring(const ScoringInfoV01& info)
     }
 }
 
+// Persist thread, while scoring and the render thread keep running: the
+// queued recording is taken under g_lock (a swap -- the lock is held for a
+// few pointer moves, not a copy of the points) and written after it is
+// released, so neither callback ever waits on the disk.
 void TrackMap::FlushIfDirty()
 {
     if (!g_lockReady)
@@ -1096,8 +1282,7 @@ void TrackMap::FlushIfDirty()
     EnterCriticalSection(&g_lock);
     if (g_saveDirty)
     {
-        rec = g_saveQueue;
-        g_saveQueue = Recording{};
+        std::swap(rec, g_saveQueue);
         g_saveDirty = false;
         dirty = true;
     }
@@ -1127,7 +1312,8 @@ void TrackMap::Clear()
     g_pendingTrack[0] = 0;
     g_pendingChanged = false;
     g_haveNewRecording = false;
-    g_newRecording = Recording{};
+    g_newMapTrack[0] = 0;
+    g_newMap = MapData{};
     LeaveCriticalSection(&g_lock);
 }
 
@@ -1144,10 +1330,11 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     {
         char wanted[64] = {};
         bool changed = false;
-        Recording fresh;
+        char freshTrack[64] = {};
+        MapData fresh;
         bool haveFresh = false;
         EnterCriticalSection(&g_lock);
-        if (g_pendingChanged)
+        if (g_pendingChanged && !g_mapJob.thread)
         {
             strcpy_s(wanted, sizeof(wanted), g_pendingTrack);
             g_pendingChanged = false;
@@ -1155,27 +1342,63 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         }
         if (g_haveNewRecording)
         {
-            fresh = g_newRecording;
-            g_newRecording = Recording{};
+            strcpy_s(freshTrack, sizeof(freshTrack), g_newMapTrack);
+            std::swap(fresh, g_newMap);
             g_haveNewRecording = false;
             haveFresh = true;
         }
         LeaveCriticalSection(&g_lock);
 
+        bool jobFinished = false;
         if (changed)
         {
-            strcpy_s(g_loadedTrack, sizeof(g_loadedTrack), wanted);
-            g_haveMap = LoadMapFor(g_loadedTrack);
+            strcpy_s(g_mapJob.track, sizeof(g_mapJob.track), wanted);
+            g_mapJob.gen = g_mapGen;
+            g_mapJob.map = MapData{};
+            g_mapJob.thread = CreateThread(nullptr, 0, MapJobProc, nullptr, 0, nullptr);
+            if (!g_mapJob.thread)
+            {
+                // No worker: load here rather than never.
+                Log::Write("TrackMap: could not start the map loader (error %lu) -- loading on the render thread",
+                           GetLastError());
+                MapJobProc(nullptr);
+                jobFinished = true;
+            }
+            changed = false;
+        }
+        // Polled rather than waited on: the worker's exit can itself be held
+        // up behind the loader lock while the game loads a session, and a
+        // wait here would hold the frame up with it. Once the handle is
+        // signalled the thread has ended and everything it wrote is visible.
+        if (g_mapJob.thread && WaitForSingleObject(g_mapJob.thread, 0) == WAIT_OBJECT_0)
+        {
+            CloseHandle(g_mapJob.thread);
+            g_mapJob.thread = nullptr;
+            jobFinished = true;
+        }
+        if (jobFinished)
+        {
+            if (g_mapJob.gen == g_mapGen)
+            {
+                strcpy_s(g_loadedTrack, sizeof(g_loadedTrack), g_mapJob.track);
+                g_trackRotationDeg = g_mapJob.rotDeg;
+                g_trackMirror = g_mapJob.mirror;
+                g_haveMap = ApplyMap(g_mapJob.map);
+                changed = true;
+            }
+            g_mapJob.map = MapData{}; // the map swapped out, or a stale load's result
+        }
+        if (changed)
+        {
             g_loadAttempted = true;
-            ApplyTrackSettings(g_loadedTrack);
             const bool record = cfg.recordMissing && !g_haveMap && g_loadedTrack[0] != 0;
             g_wantRecording.store(record, std::memory_order_relaxed);
             if (record)
                 Log::Write("TrackMap: will record '%s' from the next clean lap", g_loadedTrack);
         }
         // A recording made for the circuit now loaded: show it at once.
-        if (haveFresh && strcmp(fresh.track, g_loadedTrack) == 0)
-            g_haveMap = BuildMap(fresh.track, fresh.map, &fresh.dist, fresh.s1, fresh.s2);
+        if (haveFresh && strcmp(freshTrack, g_loadedTrack) == 0)
+            g_haveMap = ApplyMap(fresh);
     }
 
     // Nothing until the first scoring tick of the session.
@@ -1306,10 +1529,21 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         if (dx * dx + dy * dy < kMinSpacingPx * kMinSpacingPx)
             --screenCount;
     }
+    // Snapped to 1/256 px, far below anything visible: the coloured line is
+    // drawn in pieces cut half way along a segment (see SplitRibbon), and on
+    // this grid the half-way point and both halves' directions come out
+    // exact, so the two pieces' ends are the same vertices -- no hairline
+    // gap or overlap where they meet. After the thinning, which still sees
+    // the unsnapped points.
+    for (int i = 0; i < screenCount * 2; ++i)
+        s_screen[i] = floorf(s_screen[i] * 256.0f + 0.5f) * (1.0f / 256.0f);
 
     // Per-point track colour by time gained/lost there (see DeltaStep), when
-    // a colour mode is on and that reference has a lap.
+    // a colour mode is on and that reference has a lap. s_group: which run
+    // of mini-sectors each point is in, for cutting the line
+    // into pieces.
     static std::vector<float> s_rgb;
+    static std::vector<unsigned short> s_group;
     bool coloured = false;
     if (cfg.deltaColourMode >= 1 && cfg.deltaColourMode <= kRefCount)
     {
@@ -1324,13 +1558,16 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         {
             const size_t bins = cur.size() - 1;
             const float trackLen = s_laps.binM * static_cast<float>(bins);
+            const size_t binsPerGroup = (bins + kRibbonGroups - 1) / kRibbonGroups;
             s_rgb.resize(static_cast<size_t>(screenCount) * 3);
+            s_group.resize(static_cast<size_t>(screenCount));
             for (int i = 0; i < screenCount; ++i)
             {
                 float d = fmodf(s_screenDist[i], trackLen);
                 if (d < 0.0f) d += trackLen;
                 size_t b = static_cast<size_t>(d / s_laps.binM);
                 if (b >= bins) b = bins - 1;
+                s_group[i] = static_cast<unsigned short>(b / binsPerGroup);
                 // This lap where driven, else last lap's, fainter.
                 float loss = NAN, sectorTime = NAN, strength = 1.0f;
                 if (!isnan(cur[b]) && !isnan(cur[b + 1]))
@@ -1356,15 +1593,15 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                 if (purple)
                 {
                     coloured = true;
-                    r += (cfg.purpleR - r) * strength;
-                    g += (cfg.purpleG - g) * strength;
-                    bl += (cfg.purpleB - bl) * strength;
+                    r = cfg.purpleR;
+                    g = cfg.purpleG;
+                    bl = cfg.purpleB;
                 }
                 else if (!isnan(loss))
                 {
                     coloured = true;
-                    float t = fabsf(loss) / cfg.deltaFullSeconds;
-                    t = (t > 1.0f ? 1.0f : t) * strength;
+                    // Solid colour, no shading by size: red = lost, green = gained.
+                    const float t = 1.0f;
                     const float tr = loss > 0.0f ? cfg.lossR : cfg.gainR;
                     const float tg = loss > 0.0f ? cfg.lossG : cfg.gainG;
                     const float tb = loss > 0.0f ? cfg.lossB : cfg.gainB;
@@ -1375,21 +1612,67 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         }
     }
 
-    for (int pass = 0; pass < 2; ++pass)
+    // The line is kept on the GPU (Renderer::StaticBatch) and only rebuilt
+    // when what it is made of changes: its points, widths or colours. At Spa
+    // it is ~20k vertices; sent every frame it was ~90% of the overlay's CPU.
+    //
+    // One joined ribbon rather than a quad per segment: separate quads left a
+    // notch on the outside of every bend and doubled-up halos at each joint.
+    //
+    // The dark outline underneath never changes colour, so it is a batch of
+    // its own, rebuilt only when the shape does. The coloured line is cut
+    // into a dozen pieces of a few mini-sectors each (SplitRibbon): a
+    // mini-sector turning green or red rebuilds the one or two pieces it is
+    // in, not the whole ribbon twice over -- that was ~20k vertices and half
+    // a megabyte to the GPU at every mini-sector boundary.
+    static RibbonBatch s_outline, s_line;
+    static RibbonBatch s_pieces[kMaxRibbonPieces];
+    if (cfg.outlineWidthPx > 0.0f)
+        DrawRibbon(renderer, s_outline, s_screen.data(), screenCount, true, outlineW,
+                   cfg.outlineR, cfg.outlineG, cfg.outlineB, cfg.outlineA, nullptr);
+    int cuts[kMaxRibbonPieces];
+    const int pieces = coloured
+        ? SplitRibbon(s_screen.data(), s_rgb.data(), s_group.data(), screenCount, cuts, kMaxRibbonPieces) : 0;
+    if (pieces < 2)
     {
-        if (pass == 0 && cfg.outlineWidthPx <= 0.0f)
-            continue;
-        const float w = (pass == 0) ? outlineW : lineW;
-        const float r = (pass == 0) ? cfg.outlineR : cfg.trackR;
-        const float g = (pass == 0) ? cfg.outlineG : cfg.trackG;
-        const float b = (pass == 0) ? cfg.outlineB : cfg.trackB;
-        const float a = (pass == 0) ? cfg.outlineA : cfg.trackA;
-
-        // One joined ribbon rather than a quad per segment: separate quads
-        // left a notch on the outside of every bend and doubled-up halos at
-        // each joint.
-        renderer.AddPolylineSmooth(s_screen.data(), screenCount, true, w, r, g, b, a,
-                                   (pass == 1 && coloured) ? s_rgb.data() : nullptr);
+        DrawRibbon(renderer, s_line, s_screen.data(), screenCount, true, lineW,
+                   cfg.trackR, cfg.trackG, cfg.trackB, cfg.trackA, coloured ? s_rgb.data() : nullptr);
+    }
+    else
+    {
+        // Piece p runs from half way along segment cuts[p] to half way along
+        // cuts[p + 1], the last one round past the end of the array.
+        static std::vector<float> s_pieceXy, s_pieceRgb;
+        auto addPoint = [&](int i)
+        {
+            s_pieceXy.push_back(s_screen[i * 2]);
+            s_pieceXy.push_back(s_screen[i * 2 + 1]);
+            s_pieceRgb.insert(s_pieceRgb.end(), s_rgb.begin() + i * 3, s_rgb.begin() + i * 3 + 3);
+        };
+        auto addHalfWay = [&](int j)
+        {
+            const int j1 = (j + 1) % screenCount;
+            s_pieceXy.push_back(s_screen[j * 2] + (s_screen[j1 * 2] - s_screen[j * 2]) * 0.5f);
+            s_pieceXy.push_back(s_screen[j * 2 + 1] + (s_screen[j1 * 2 + 1] - s_screen[j * 2 + 1]) * 0.5f);
+            // Both ends of a cut segment have this colour (SplitRibbon).
+            s_pieceRgb.insert(s_pieceRgb.end(), s_rgb.begin() + j * 3, s_rgb.begin() + j * 3 + 3);
+        };
+        for (int p = 0; p < pieces; ++p)
+        {
+            const int from = cuts[p];
+            const int to = cuts[(p + 1) % pieces];
+            s_pieceXy.clear();
+            s_pieceRgb.clear();
+            addHalfWay(from);
+            for (int i = (from + 1) % screenCount; ; i = (i + 1) % screenCount)
+            {
+                addPoint(i);
+                if (i == to) break;
+            }
+            addHalfWay(to);
+            DrawRibbon(renderer, s_pieces[p], s_pieceXy.data(), static_cast<int>(s_pieceXy.size() / 2), false,
+                       lineW, cfg.trackR, cfg.trackG, cfg.trackB, cfg.trackA, s_pieceRgb.data());
+        }
     }
 
     // Which reference the colours are against, top-left inside the box.
@@ -1399,10 +1682,14 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         renderer.SetTextBackground(false);
         const float px = cfg.labelHeightPx * uiScale * 0.85f;
         const char* what = cfg.deltaColourMode == 1 ? "vs my PB"
-                         : cfg.deltaColourMode == 2 ? "vs my SB" : "vs session fastest";
+                         : cfg.deltaColourMode == 2 ? "vs my SB"
+                         : "vs session fastest";
         char buf[48];
         sprintf_s(buf, coloured ? "%s" : "%s (no lap yet)", what);
-        renderer.AddText(centerX - halfW + px * 0.3f, centerY - halfH + px * 0.2f, buf, px,
+        // Above the map's box, never inside it, so the track line can not
+        // run through the text.
+        const float boxTop = centerY - halfH - (cfg.bgEnabled ? cfg.bgPaddingPx * uiScale : 0.0f);
+        renderer.AddText(centerX - halfW, boxTop - px * 1.25f, buf, px,
                          1.0f, 1.0f, 1.0f, 0.75f, Renderer::HAlign::Left);
         renderer.SetTextBackground(hadBg);
     }
@@ -1413,9 +1700,15 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     {
         const float rad = g_trackRotationDeg * 3.14159265f / 180.0f;
         const float ux = sinf(rad), uy = -cosf(rad);   // unit vector to north on screen
-        const float len = 26.0f * uiScale;
-        const float ax = centerX + halfW - len * 1.1f;
-        const float ay = centerY - halfH + len * 1.5f;
+        // Outside the map's box, above its top-right corner, on a small dark
+        // disc: inside the box the track ran through it whenever the
+        // circuit filled that corner (2026-11-23).
+        const float pad = cfg.bgEnabled ? cfg.bgPaddingPx * uiScale : 0.0f;
+        const float discR = 17.0f * uiScale;
+        const float ax = centerX + halfW + pad - discR;
+        const float ay = centerY - halfH - pad - discR - 4.0f * uiScale;
+        renderer.AddFilledCircle(ax, ay, discR, 0.05f, 0.05f, 0.05f, 0.8f);
+        const float len = discR * 1.4f;
         const float tipX = ax + ux * len * 0.5f, tipY = ay + uy * len * 0.5f;
         const float tailX = ax - ux * len * 0.5f, tailY = ay - uy * len * 0.5f;
         const float head = len * 0.4f;
@@ -1430,9 +1723,10 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                                thick, 1.0f, 1.0f, 1.0f, 0.85f);
         const bool hadBg = renderer.TextBackgroundEnabled();
         renderer.SetTextBackground(false);
+        // "N" just left of the disc, upright, so it never sits on the arrow.
         const float np = 22.0f * uiScale;
-        renderer.AddText(tipX + ux * np * 0.8f, tipY + uy * np * 0.8f - np * 0.5f, "N", np,
-                         1.0f, 1.0f, 1.0f, 0.9f, Renderer::HAlign::Center);
+        renderer.AddText(ax - discR - 5.0f * uiScale, ay - np * 0.5f, "N", np,
+                         1.0f, 1.0f, 1.0f, 0.9f, Renderer::HAlign::Right);
         renderer.SetTextBackground(hadBg);
     }
 
@@ -1531,17 +1825,28 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     if (carCount <= 0)
         return;
 
+    // Every car's place, colour and code from one DriverAbbrev snapshot (one
+    // lock). The sort below used to ask DriverAbbrev for a place -- a lock
+    // and a search of the field -- inside every comparison, ~1000 times a
+    // redraw with 60 cars, and the colour and code once more per car.
+    static DriverAbbrev::CarInfo s_info[kMaxCars];
+    const int infoCount = DriverAbbrev::Snapshot(s_info, kMaxCars);
+    int infoOf[kMaxCars];   // each car's entry in s_info, or -1 if scoring has not described it yet
+    int rank[kMaxCars];
+    for (int i = 0; i < carCount; ++i)
+    {
+        infoOf[i] = -1;
+        for (int j = 0; j < infoCount; ++j)
+            if (s_info[j].id == cars[i].id) { infoOf[i] = j; break; }
+        const int place = infoOf[i] >= 0 ? s_info[infoOf[i]].place : 0;
+        rank[i] = cars[i].isPlayer ? 100000 : (place ? place : 9999);
+    }
+
     // Leader first, so an overlapping label is kept by the car further up the
     // order -- except your own car, drawn last so it sits on top of the pack.
     int order[kMaxCars];
     for (int i = 0; i < carCount; ++i) order[i] = i;
-    auto rank = [&](int idx) -> int
-    {
-        if (cars[idx].isPlayer) return 100000;
-        const int p = DriverAbbrev::Place(cars[idx].id);
-        return p ? p : 9999;
-    };
-    std::stable_sort(order, order + carCount, [&](int a, int b) { return rank(a) < rank(b); });
+    std::stable_sort(order, order + carCount, [&](int a, int b) { return rank[a] < rank[b]; });
 
     const float dotR = cfg.carRadiusPx * uiScale;
     const float labelPx = cfg.labelHeightPx * uiScale;
@@ -1556,6 +1861,7 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     for (int k = 0; k < carCount; ++k)
     {
         const CarSample& c = cars[order[k]];
+        const DriverAbbrev::CarInfo* info = infoOf[order[k]] >= 0 ? &s_info[infoOf[order[k]]] : nullptr;
         float cxp = 0.0f, cyp = 0.0f;
         PlaceByLapDist(c.lapDist, c.pathLateral, cxp, cyp);
 
@@ -1566,9 +1872,9 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         {
             r = cfg.playerR; g = cfg.playerG; b = cfg.playerB;
         }
-        else
+        else if (info && info->hasColor)
         {
-            DriverAbbrev::Color(c.id, r, g, b);
+            r = info->r; g = info->g; b = info->b;
         }
 
         // A larger dot as well as its own colour: two independent cues.
@@ -1590,8 +1896,8 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         if (crowded)
             continue;
 
-        char code[8] = {};
-        if (!DriverAbbrev::Get(c.id, code, sizeof(code)) || !code[0])
+        const char* code = info ? info->code : "";
+        if (!code[0])
             continue;
 
         renderer.AddText(cxp, cyp + thisDotR + labelPx * 0.15f, code, labelPx,
@@ -1765,4 +2071,11 @@ void TrackMap::ToggleRerecord()
 bool TrackMap::Rerecording()
 {
     return HasMap() && g_wantRecording.load(std::memory_order_relaxed);
+}
+
+void TrackMap::Shutdown()
+{
+    // After the Present hook is removed, so Draw no longer touches the handle.
+    if (g_mapJob.thread)
+        WaitForSingleObject(g_mapJob.thread, 3000);
 }

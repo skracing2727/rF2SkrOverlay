@@ -3,7 +3,7 @@
 #include "Renderer.h"
 #include "Config.h"
 #include "Layout.h"
-#include "Log.h"
+#include "RenderThrottle.h"
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -38,8 +38,6 @@ void EngineTemps::OnTelemetry(const TelemInfoV01& info)
     s_oil = o;
     s_overheating = info.mOverheating;
     s_valid = w > 1.0f || o > 1.0f;
-    static bool logged = false;
-    if (!logged) { logged = true; Log::Write("EngineTemps: first telemetry water %.1f oil %.1f", w, o); }
 
     const double v = sqrt(info.mLocalVel.x * info.mLocalVel.x + info.mLocalVel.z * info.mLocalVel.z);
     const float dt = static_cast<float>(info.mDeltaTime);
@@ -63,12 +61,18 @@ bool EngineTemps::Draw(Renderer& renderer, int screenWidth, int screenHeight)
 {
     EngineTempsConfig& cfg = g_engineTempsConfig;
     if (!cfg.enabled) return false;
-    const bool placeholder = Layout::Active();
-    static int lastWhy = -1;
-    const int why = s_valid ? 1 : 0;
-    if (why != lastWhy) { lastWhy = why; Log::Write("EngineTemps: drawing %s", why ? "yes" : "no (no temperature data)"); }
+    const bool placeholder = Layout::Preview();
     // Drawn even with no data ("--"), so the box can always be found and a
     // car that reports no temperatures shows as such instead of vanishing.
+
+    // Low tier (~5Hz): whole-degree temperatures that move over seconds,
+    // so rebuild at most that often and replay the last build on the
+    // frames in between. Bypassed in layout mode so dragging/resizing
+    // stays smooth.
+    static RenderThrottle s_throttle(0.2);
+    if (!Layout::Active() && s_throttle.TryReplay(renderer))
+        return true;
+    RenderThrottle::Capture throttleCapture(s_throttle, renderer);
 
     const float s = static_cast<float>(screenHeight) / 2160.0f * (cfg.scale > 0.05f ? cfg.scale : 0.05f);
     const float textPx = 36.0f * s;

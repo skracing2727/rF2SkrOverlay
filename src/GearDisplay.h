@@ -1,5 +1,6 @@
 #pragma once
 #include <Windows.h>
+#include <atomic>
 #include <string>
 
 // Dashboard: current gear + speed on a dark panel (styled after the native
@@ -12,7 +13,7 @@
 //
 // The blue cue is NOT tied to the physical rev limiter: it fires at a
 // TARGET RPM that adaptively learns from your own upshifts (see
-// State::learnedShiftRpmFraction), LED BACK by your own measured reaction
+// State::shiftTargetFraction), LED BACK by your own measured reaction
 // time so that by the time you actually pull the paddle, the shift lands ON
 // the target instead of past it. Reaction time is learned from the gap
 // between the cue turning on and the upshift actually happening,
@@ -27,12 +28,22 @@ public:
     // called on session end, so a stale in-progress episode doesn't leak
     // into a new session.
     void Clear();
-    // Writes any learned value changed since the last flush -- call only
-    // while NOT actively driving (see Plugin.cpp). Update() itself never
-    // touches disk; a learning event just sets the matching dirty flag
-    // below, so the game's telemetry thread can't be stalled by a slow disk
-    // or an antivirus scan intercepting the write.
+    // Writes any learned value changed since the last flush. Called from the
+    // save thread (Persist.cpp) at any moment, while telemetry and drawing
+    // carry on: it only copies under m_lock and writes after releasing it.
+    // Update() itself never touches disk for a save; a learning event just
+    // sets the matching dirty flag below, so the game's telemetry thread
+    // can't be stalled by a slow disk or an antivirus scan.
     void FlushIfDirty();
+    // The pit-lane limit set for this track (wheel knob "Pit lane limit"):
+    // a setting, so it is written only out of the car (the disk rule,
+    // Persist.cpp) -- this is called from that pass only.
+    void FlushSettingsIfDirty();
+    // Render thread (the knob). kmh <= 0 clears it (back to the learned limit).
+    void SetPitLaneLimit(double kmh);
+    // The "Shift point" knob: moves this car's target by whole percent
+    // (70-100% of max RPM). Saved at the next line crossing. Any thread.
+    void AdjustShiftTarget(int steps);
 
     // Snapshot for drawing.
     struct State
@@ -52,35 +63,28 @@ public:
         // genuine limit change -- so it's ignored instead of corrupting the
         // learned value. 0 until a value has been learned or loaded.
         double learnedPitLimitKmh = 0.0;
-        // TARGET fraction of maxRpm -- the RPM the blue cue is trying to get
-        // you to actually shift AT (the cue itself fires earlier than this,
-        // by the reaction lead; see shiftReactionAvgSeconds below).
-        //
-        // Adaptively tuned toward wherever YOUR OWN upshifts actually land:
-        // shifting consistently later than the cue asked for nudges the
-        // target up, shifting earlier nudges it down, and shifting where it
-        // asked leaves it alone. Note this error is measured against the
-        // CURRENT TARGET, not against maxRpm -- measuring against maxRpm
-        // (as this originally did) makes "shift at the rev limiter" the only
-        // fixed point, so the target climbs to redline on every shift and
-        // stays there no matter how the driver actually drives.
-        //
-        // 0 until at least one upshift has been observed;
-        // GearDisplayConfig::revLimiterRpmFraction is the seed until then.
-        double learnedShiftRpmFraction = 0.0;
+        // The pit-lane limit you set for this TRACK, km/h, 0 = none (use
+        // the learned one). Needed because the learned value is where the
+        // car's limiter holds it, which is not the lane's limit when the
+        // limiter is set higher than the lane allows -- exactly when the
+        // OVER SPEED warning matters. Saved per track in PitLaneLimits.
+        double pitLaneLimitKmh = 0.0;
+        // The RPM you want to shift AT, as a fraction of maxRpm -- set by you
+        // (the "Shift point" knob setting, 1% a click), saved per car entry.
+        // The blue cue fires EARLIER than this, by the reaction lead plus the
+        // learned per-gear correction below, so that your actual shift lands
+        // on it. 0 = not loaded yet; GearDisplayConfig::revLimiterRpmFraction
+        // then. (Until 2026-11-24 this was itself "learned" from where you
+        // shifted, so it followed your habit instead of a target.)
+        double shiftTargetFraction = 0.0;
 
-        // The same learned trigger, but kept SEPARATELY PER GEAR -- indexed
-        // by the gear being shifted OUT of. One number for the whole car is
-        // wrong on almost any real gearbox: the lower gears are geared much
-        // shorter, so they spend far less time near the limiter and get
-        // shifted at a different point than 5th or 6th, and averaging the
-        // two together produces a cue that is late in the low gears and
-        // early in the high ones. Each gear learns from its own upshifts
-        // only. 0 for a gear that has not been observed yet, in which case
-        // the car-wide value above (and failing that the configured
-        // fraction) still applies.
+        // Learned per gear (indexed by the gear shifted OUT of): how much
+        // earlier than the reaction-time estimate the cue has to fire, as a
+        // fraction of maxRpm, for your shift to land on the target. Positive
+        // = fire earlier (you were landing late), negative = later. Learned
+        // only from full-throttle upshifts made in response to the cue.
         static const int kMaxGears = 10; // gears 1..9, index 0 unused
-        double learnedShiftRpmFractionByGear[kMaxGears] = {};
+        double cueCorrectionByGear[kMaxGears] = {};
         // Per-gear counterpart of shiftAvgPercent below, so the on-screen
         // readout can show how the gear you are actually in is being shifted
         // rather than only the car-wide average.
@@ -132,12 +136,6 @@ public:
         // it does.
         int slipState = 0;
 
-        // True while approaching a pit stop (PitEntryStore::State::armed),
-        // speed has dropped to/under the pit-lane limit, but the limiter
-        // still isn't engaged -- a reminder to actually press the button,
-        // cleared the moment it is (or speed goes back over).
-        bool showEngageLimiterWarning = false;
-
         bool valid = false;        // false until the first telemetry update arrives
     };
     State Read();
@@ -148,20 +146,36 @@ private:
     State m_state;
 
     std::string m_currentKey;      // sanitized "vehicle__track", identifies which save file applies
+    // Telemetry thread only: the raw names the keys were last worked out
+    // from, so Update() can tell "nothing changed" without building any
+    // strings. Clear() asks for a re-key through m_keysInvalidated instead
+    // of touching the keys itself.
+    char m_rawVehKey[64] = {};
+    char m_rawTrackName[64] = {};
+    char m_rawEntryName[64] = {};   // the car entry: shift targets are per entry
+    bool m_haveRawNames = false;
+    std::atomic<bool> m_keysInvalidated{ false };
     bool m_lastSpeedLimiterOn = false;
     double m_episodeMaxKmh = 0.0;        // running max speed for the CURRENT limiter-engaged episode
     double m_episodeStartSpeedKmh = 0.0; // speed at the instant this episode's limiter engaged
     // Set instead of saving directly whenever a learned value changes;
-    // cleared by FlushIfDirty() once actually written.
+    // cleared by FlushIfDirty() once copied out for writing. The key and
+    // values to write are copied alongside at that moment (under m_lock), so
+    // what gets saved is what was learned, for the car it was learned on.
     bool m_pitLimitDirty = false;
     bool m_shiftPointDirty = false;
+    char m_pitSaveKey[160] = {};
+    double m_pitSaveKmh = 0.0;
+    char m_shiftSaveKey[96] = {};
+    double m_shiftSaveTarget = 0.0;
+    double m_shiftSaveCorr[State::kMaxGears] = {};
 
-    // "Engage the limiter" reminder: edge-triggered long beep, synthesized
-    // once in Init() the same way DrsCue builds its double-beep.
-    bool m_lastBelowLimitAwaitingEngage = false;
-    unsigned char* m_engageWavBuffer = nullptr;
-    DWORD m_engageWavSize = 0;
-    void PlayEngageBeep();
+    // The set pit-lane limit's track key (sanitized track name) and its
+    // save slot, same pattern as the learned values above.
+    std::string m_laneKey;
+    bool m_laneLimitDirty = false;
+    char m_laneSaveKey[96] = {};
+    double m_laneSaveKmh = 0.0;
 
     // Shift-point learning: keyed by VEHICLE only (rev-limiter behaviour is
     // a car property, not a track one), separate from m_currentKey above.
@@ -251,11 +265,6 @@ private:
     int m_shiftHistoryCount = 0;
     int m_shiftHistoryNext = 0;
     void RecomputeShiftStats();
-
-    void LoadPitLimit(const char* vehicleName, const char* trackName);
-    void SavePitLimit() const;
-    void LoadShiftPoint(const char* vehicleName);
-    void SaveShiftPoint() const;
 };
 
 extern GearDisplayStore g_gearDisplay;

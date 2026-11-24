@@ -9,7 +9,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
-#include <deque>
 #include <vector>
 
 FfbSpectrumStore g_ffbSpectrum;
@@ -79,26 +78,35 @@ int FfbSpectrumStore::CopyLatest(float* values, double* times, int count, long l
     return static_cast<int>(avail);
 }
 
+long long FfbSpectrumStore::Total()
+{
+    if (!m_ready) return 0;
+    EnterCriticalSection(&m_lock);
+    const long long total = m_total;
+    LeaveCriticalSection(&m_lock);
+    return total;
+}
+
 namespace
 {
-    // The Moza EQ points, drawn evenly spaced as Pit House does; frequencies
-    // between two points are placed proportionally within that gap. Minor
-    // ticks split each gap in kTicksPerGap (1 Hz steps at the low end, 4 Hz
-    // at the top).
-    const int kPoints = 11;
-    const float kPointHz[kPoints] = { 0, 5, 10, 15, 25, 30, 40, 50, 60, 80, 100 };
-    const int kTicksPerGap = 5;
+    // Log frequency axis from kLowHz to kTopHz, labelled at the Moza Pit
+    // House EQ points (0 Hz can't sit on a log axis; the left edge is 1 Hz).
+    const int kPoints = 12;
+    const float kPointHz[kPoints] = { 5, 10, 15, 25, 30, 40, 50, 60, 80, 100, 150, 200 };
+    const float kLowHz = 1.0f;
     const double kTwoPi = 6.283185307179586;
 
-    // One point per DFT bin up to 100 Hz: with a 1 s window that is every
-    // 1 Hz, 101 points.
-    const int kMaxBins = 128;
-    const float kTopHz = 100.0f;
+    // One point per DFT bin up to 200 Hz (half the 400 Hz FFB rate): with a 1 s window, every
+    // 1 Hz, 201 points. The Moza points end at 100 Hz; 150 and 200 extend the axis.
+    const int kMaxBins = 256;
+    const float kTopHz = 200.0f;
 
-    // 1 s Hann-windowed segments, a new one every frame at 60 fps. Live =
-    // the newest segment; averaged = running sums over windowSeconds; lap
-    // average = every segment of the last completed lap.
-    const double kHopSeconds = 1.0 / 60.0;
+    // 1 s Hann-windowed segments, a new one every 1/30 s. Live = the newest
+    // segment; averaged = running sums over windowSeconds; lap average =
+    // every segment of the last completed lap. (Every 1/60 s before
+    // 2026-11-23: twice the work, for a 1 s window that hardly moves in a
+    // thirtieth of a second either way.)
+    const double kHopSeconds = 1.0 / 30.0;
     // A lap shorter than this (an aborted out-lap, a restart) doesn't
     // replace the previous lap's average.
     const double kMinLapSeconds = 20.0;
@@ -110,15 +118,23 @@ namespace
         int freshClipped;
     };
 
+    // The averaging window's segments, a fixed ring rather than a deque (which
+    // allocated every ~1 KB segment on its own). Room for WindowSeconds' 30 s
+    // maximum at the hop rate.
+    const int kMaxSegs = 1024;
+    Segment g_segs[kMaxSegs];
+
     struct Analysis
     {
         int segLen = 0;                    // samples per segment (~1 s)
         int binCount = 0;                  // bins 0..binCount-1 are shown
         double segRateHz = 0.0;            // sample rate the bins were laid out for
-        std::vector<float> window, cosT, sinT;
-        std::deque<Segment> history;       // newest last
+        std::vector<float> window;         // Hann window, segLen long
+        std::vector<float> coef;           // Goertzel 2cos(2 pi k / segLen) per bin
+        std::vector<double> coefD;         // the same, unrounded, for the final magnitude
+        int segHead = 0, segCount = 0;     // g_segs: next slot to write, segments held (newest at segHead - 1)
         size_t maxSegs = 1;
-        double sumAmp2[kMaxBins] = {};     // running sums over 'history'
+        double sumAmp2[kMaxBins] = {};     // running sums over the segments held
         long long sumSamples = 0, sumClipped = 0;
         long long lastSegEndTotal = 0;
         double sampleRateHz = 0.0;
@@ -154,9 +170,11 @@ namespace
         g_an.lapSegments = 0;
     }
 
+    const Segment& NewestSegment() { return g_segs[(g_an.segHead - 1 + kMaxSegs) % kMaxSegs]; }
+
     void ClearHistory()
     {
-        g_an.history.clear();
+        g_an.segHead = g_an.segCount = 0;
         for (int k = 0; k < kMaxBins; ++k) g_an.sumAmp2[k] = 0.0;
         g_an.sumSamples = g_an.sumClipped = 0;
         ClearLap();
@@ -169,17 +187,18 @@ namespace
         g_an.segLen = n;
         g_an.segRateHz = rate;
         g_an.window.resize(n);
-        g_an.cosT.resize(n);
-        g_an.sinT.resize(n);
         for (int i = 0; i < n; ++i)
-        {
             g_an.window[i] = static_cast<float>(0.5 - 0.5 * cos(kTwoPi * i / n));
-            g_an.cosT[i] = static_cast<float>(cos(kTwoPi * i / n));
-            g_an.sinT[i] = static_cast<float>(sin(kTwoPi * i / n));
-        }
         int bins = 0;
         while (bins < kMaxBins && bins <= n / 2 && BinHz(bins) <= kTopHz + 1e-6) ++bins;
         g_an.binCount = bins;
+        g_an.coef.resize(bins);
+        g_an.coefD.resize(bins);
+        for (int k = 0; k < bins; ++k)
+        {
+            g_an.coefD[k] = 2.0 * cos(kTwoPi * k / n);
+            g_an.coef[k] = static_cast<float>(g_an.coefD[k]);
+        }
         ClearHistory();
     }
 
@@ -191,26 +210,51 @@ namespace
     //    and the one-sided spectrum: A = 4|X|/N -- a full-scale sine reads
     //    1.0 (100%). A sine still shows about half of that in the bins
     //    either side (the window's own width, +/-1 Hz).
+    //
+    // The same bins as a plain DFT, by Goertzel's recurrence: the segment is
+    // windowed once, then every bin's two-term state is stepped through it
+    // together, one sample at a time -- independent bins side by side, which
+    // the compiler turns into SIMD. ~17 us a segment at 400 Hz against
+    // ~120 us for the DFT it replaced (which re-windowed the whole segment
+    // for each of the ~200 bins, in double). In float the state drifts by at
+    // most ~0.005% of full force (measured, 1024-sample segments; ~0.001% at
+    // 400) -- far under the plot's default 0.5% floor (MinPercent).
     void AnalyseSegment(const float* x, int n, Segment& out)
     {
         double mean = 0.0;
         for (int i = 0; i < n; ++i) mean += x[i];
         mean /= n;
         out.amp2[0] = static_cast<float>(mean * mean);
-        for (int k = 1; k < g_an.binCount; ++k)
+
+        static float s_xw[1024];             // segLen is at most 1024 (see Update)
+        static float s_s1[kMaxBins], s_s2[kMaxBins], s_c[kMaxBins];
+        if (n > 1024) n = 1024;
+        for (int i = 0; i < n; ++i)
+            s_xw[i] = static_cast<float>((x[i] - mean) * g_an.window[i]);
+        const int bins = g_an.binCount;
+        for (int k = 0; k < bins; ++k)
         {
-            double re = 0.0, im = 0.0;
-            int idx = 0;
-            for (int i = 0; i < n; ++i)
+            s_s1[k] = 0.0f;
+            s_s2[k] = 0.0f;
+            s_c[k] = g_an.coef[k];
+        }
+        for (int i = 0; i < n; ++i)
+        {
+            const float v = s_xw[i];
+            for (int k = 1; k < bins; ++k)
             {
-                const double v = (x[i] - mean) * g_an.window[i];
-                re += v * g_an.cosT[idx];
-                im -= v * g_an.sinT[idx];
-                idx += k;
-                if (idx >= n) idx -= n;
+                const float s = v + s_c[k] * s_s1[k] - s_s2[k];
+                s_s2[k] = s_s1[k];
+                s_s1[k] = s;
             }
-            const double a = 4.0 * sqrt(re * re + im * im) / n;
-            out.amp2[k] = static_cast<float>(a * a);
+        }
+        // |X|^2 = s1^2 + s2^2 - 2cos(w) s1 s2, and A^2 = 16 |X|^2 / N^2.
+        const double scale = 16.0 / (static_cast<double>(n) * n);
+        for (int k = 1; k < bins; ++k)
+        {
+            const double s1 = s_s1[k], s2 = s_s2[k];
+            const double p = s1 * s1 + s2 * s2 - g_an.coefD[k] * s1 * s2;
+            out.amp2[k] = static_cast<float>(p > 0.0 ? p * scale : 0.0);
         }
     }
 
@@ -232,11 +276,21 @@ namespace
     // Pulls in any newly completed segment, the clip figure and the lap average.
     void Update(const FfbGraphConfig& cfg)
     {
+        // Nothing to do until a hop's worth of new samples is in: skip the
+        // copy below (made under the FFB thread's lock) on those frames.
+        if (g_an.segLen > 0 && g_an.sampleRateHz >= 20.0)
+        {
+            const long long have = g_ffbSpectrum.Total();
+            const long long hop = (std::max)(1LL, static_cast<long long>(g_an.sampleRateHz * kHopSeconds + 0.5));
+            if (have >= g_an.lastSegEndTotal && have - g_an.lastSegEndTotal < hop)
+                return;
+        }
+
         static float s_values[FfbSpectrumStore::kRing];
         static double s_times[FfbSpectrumStore::kRing];
         long long total = 0;
-        // Only what one segment plus the rate estimate needs -- this runs
-        // every frame, and the copy is made under the FFB thread's lock.
+        // Only what one segment plus the rate estimate needs -- the copy is
+        // made under the FFB thread's lock.
         const int want = (std::min)(FfbSpectrumStore::kRing, (std::max)(1024, g_an.segLen + 64));
         const int got = g_ffbSpectrum.CopyLatest(s_values, s_times, want, total);
         if (got < 64)
@@ -276,24 +330,29 @@ namespace
             if (fabsf(s_values[i]) >= cfg.clipLevel) ++freshClipped;
         g_an.lastSegEndTotal = total;
 
-        Segment seg;
-        AnalyseSegment(s_values + got - g_an.segLen, g_an.segLen, seg);
-        seg.freshSamples = fresh;
-        seg.freshClipped = freshClipped;
-        g_an.history.push_back(seg);
-        for (int k = 0; k < g_an.binCount; ++k) g_an.sumAmp2[k] += seg.amp2[k];
-        g_an.sumSamples += seg.freshSamples;
-        g_an.sumClipped += seg.freshClipped;
+        // Oldest segments out first, so the new one has its slot: the window
+        // holds at most maxSegs once it is in.
         const double segSeconds = g_an.segLen / g_an.sampleRateHz;
         g_an.maxSegs = static_cast<size_t>((std::max)(1.0, (cfg.windowSeconds - segSeconds) / kHopSeconds + 1.0));
-        while (g_an.history.size() > g_an.maxSegs)
+        if (g_an.maxSegs > static_cast<size_t>(kMaxSegs)) g_an.maxSegs = kMaxSegs;
+        while (g_an.segCount > 0 && static_cast<size_t>(g_an.segCount) >= g_an.maxSegs)
         {
-            const Segment& old = g_an.history.front();
+            const Segment& old = g_segs[(g_an.segHead - g_an.segCount + kMaxSegs) % kMaxSegs];
             for (int k = 0; k < g_an.binCount; ++k) g_an.sumAmp2[k] -= old.amp2[k];
             g_an.sumSamples -= old.freshSamples;
             g_an.sumClipped -= old.freshClipped;
-            g_an.history.pop_front();
+            --g_an.segCount;
         }
+
+        Segment& seg = g_segs[g_an.segHead];
+        AnalyseSegment(s_values + got - g_an.segLen, g_an.segLen, seg);
+        seg.freshSamples = fresh;
+        seg.freshClipped = freshClipped;
+        g_an.segHead = (g_an.segHead + 1) % kMaxSegs;
+        ++g_an.segCount;
+        for (int k = 0; k < g_an.binCount; ++k) g_an.sumAmp2[k] += seg.amp2[k];
+        g_an.sumSamples += seg.freshSamples;
+        g_an.sumClipped += seg.freshClipped;
 
         // Clip %, over the averaging window -- counted per segment, since
         // the raw samples copied above only cover the latest second or two.
@@ -335,7 +394,9 @@ bool FfbGraph::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     if (!cfg.enabled)
         return false;
 
-    // 60 fps, matching the analysis hop.
+    // 60 fps. The analysis hops at 30 Hz (kHopSeconds), so every other
+    // redraw shows the same spectrum; it is the clip curve's fade that
+    // wants the 60.
     static RenderThrottle s_throttle(1.0 / 60.0);
     if (!Layout::Active() && s_throttle.TryReplay(renderer))
         return true;
@@ -371,7 +432,7 @@ bool FfbGraph::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     // Title row: what this is, the signal's own rate, and the clip figure.
     const float titleY = top + pad;
     const double now = NowSeconds();
-    const bool live = !g_an.history.empty() && (now - g_an.lastSampleTime) < 1.0;
+    const bool live = g_an.segCount > 0 && (now - g_an.lastSampleTime) < 1.0;
     const bool showLap = cfg.showLapAverage && (g_an.haveLastLap || g_an.lapSegments > 0);
 
     char title[160];
@@ -394,17 +455,12 @@ bool FfbGraph::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     const float plotT = titleY + textPx * 1.8f;
     const float plotB = top + boxH - pad - textPx * 1.6f;
     const float plotH = plotB - plotT;
-    const float gapW = (plotR - plotL) / (kPoints - 1);
-
-    // Frequency -> x on the Moza axis: evenly spaced points, linear inside
-    // each gap.
+    // Frequency -> x on the log axis.
+    const float logLo = log10f(kLowHz), logSpan = log10f(kTopHz) - log10f(kLowHz);
     auto xForHz = [&](double f) {
-        if (f <= 0.0) return plotL;
+        if (f <= kLowHz) return plotL;
         if (f >= kTopHz) return plotR;
-        int i = 0;
-        while (i < kPoints - 2 && f > kPointHz[i + 1]) ++i;
-        const double t = (f - kPointHz[i]) / (kPointHz[i + 1] - kPointHz[i]);
-        return plotL + gapW * static_cast<float>(i + t);
+        return plotL + (plotR - plotL) * (log10f(static_cast<float>(f)) - logLo) / logSpan;
     };
 
     // Log scale: road texture and vibration are often only a few percent of
@@ -428,21 +484,34 @@ bool FfbGraph::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         renderer.AddText(plotL - pad * 0.6f, y - textPx * 0.5f, lbl, textPx, 0.55f, 0.55f, 0.55f, 1.0f,
                          Renderer::HAlign::Right);
     }
-    for (int i = 0; i < kPoints; ++i)
+    // Moza EQ points: a grid line each; a label where it doesn't run into
+    // the previous one (25/30 Hz and the like sit close on a log axis).
     {
-        const float x = plotL + gapW * i;
-        renderer.AddLine(x, plotT, x, plotB, gridThick, 0.06f, 0.06f, 0.06f, 0.9f);
+        float lastLabelR = -1.0e9f;
         char lbl[16];
-        sprintf_s(lbl, "%.0fHz", kPointHz[i]);
-        renderer.AddText(x, plotB + textPx * 0.5f, lbl, textPx, 0.55f, 0.55f, 0.55f, 1.0f, Renderer::HAlign::Center);
+        sprintf_s(lbl, "%.0fHz", kLowHz);
+        renderer.AddText(plotL, plotB + textPx * 0.5f, lbl, textPx, 0.55f, 0.55f, 0.55f, 1.0f, Renderer::HAlign::Center);
+        lastLabelR = plotL + renderer.MeasureText(lbl, textPx) * 0.5f;
+        for (int i = 0; i < kPoints; ++i)
+        {
+            const float x = xForHz(kPointHz[i]);
+            renderer.AddLine(x, plotT, x, plotB, gridThick, 0.06f, 0.06f, 0.06f, 0.9f);
+            sprintf_s(lbl, "%.0fHz", kPointHz[i]);
+            const float w = renderer.MeasureText(lbl, textPx);
+            if (x - w * 0.5f < lastLabelR + textPx * 0.3f) continue;
+            renderer.AddText(x, plotB + textPx * 0.5f, lbl, textPx, 0.55f, 0.55f, 0.55f, 1.0f, Renderer::HAlign::Center);
+            lastLabelR = x + w * 0.5f;
+        }
     }
-    // Minor ticks between the Moza points.
+    // Minor ticks: 1-9 in each decade.
     {
         const float tickLen = textPx * 0.35f;
-        for (int i = 0; i < kPoints - 1; ++i)
-            for (int j = 1; j < kTicksPerGap; ++j)
+        for (float dec = 1.0f; dec < kTopHz; dec *= 10.0f)
+            for (int j = 1; j <= 9; ++j)
             {
-                const float x = plotL + gapW * (i + static_cast<float>(j) / kTicksPerGap);
+                const float f = dec * j;
+                if (f < kLowHz || f > kTopHz) continue;
+                const float x = xForHz(f);
                 renderer.AddLine(x, plotB - tickLen, x, plotB, gridThick, 0.45f, 0.45f, 0.45f, 0.8f);
             }
         renderer.AddLine(plotL, plotB, plotR, plotB, gridThick, 0.45f, 0.45f, 0.45f, 0.8f);
@@ -456,12 +525,48 @@ bool FfbGraph::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     }
 
     const float lineThick = 4.0f * uiScale;
-    // A solid line through one point per bin, at that bin's own frequency.
-    auto drawLine = [&](const float* pct, float r, float g, float b, float a, float thick) {
-        float px = xForHz(BinHz(0)), py = yFor(pct[0]);
-        for (int k = 1; k < g_an.binCount; ++k)
+
+    // Per-bin % -> the points drawn: log bands (energy of every 1 Hz bin in
+    // the band, at the band's centre), or one point per bin from 1 Hz.
+    // DC (bin 0) is left out: it is the steady steering load, not vibration.
+    struct Pts { int n = 0; float hz[kMaxBins]; float pct[kMaxBins]; };
+    auto toPoints = [&](const float* pct, Pts& out) {
+        out.n = 0;
+        const int per = cfg.bandsPerDecade;
+        if (per <= 0)
         {
-            const float x = xForHz(BinHz(k)), y = yFor(pct[k]);
+            for (int k = 1; k < g_an.binCount; ++k)
+            {
+                if (BinHz(k) < kLowHz) continue;
+                out.hz[out.n] = static_cast<float>(BinHz(k)); out.pct[out.n] = pct[k]; ++out.n;
+            }
+            return;
+        }
+        int k = 1;
+        for (int band = 0; out.n < kMaxBins; ++band)
+        {
+            const double lo = kLowHz * pow(10.0, (band - 0.5) / per);
+            const double hi = kLowHz * pow(10.0, (band + 0.5) / per);
+            if (lo > kTopHz) break;
+            double e = 0.0; int used = 0;
+            while (k < g_an.binCount && BinHz(k) < lo) ++k;
+            int kk = k;
+            for (; kk < g_an.binCount && BinHz(kk) < hi; ++kk) { e += pct[kk] * pct[kk]; ++used; }
+            k = kk;
+            if (!used) continue;   // a band narrower than 1 Hz with no bin in it
+            out.hz[out.n] = static_cast<float>((std::min)(static_cast<double>(kTopHz), kLowHz * pow(10.0, static_cast<double>(band) / per)));
+            out.pct[out.n] = static_cast<float>(sqrt(e));
+            ++out.n;
+        }
+    };
+    // A solid line through one point per bin, at that bin's own frequency.
+    auto drawLine = [&](const float* binPct, float r, float g, float b, float a, float thick) {
+        static Pts pts; toPoints(binPct, pts);
+        if (pts.n < 2) return;
+        float px = xForHz(pts.hz[0]), py = yFor(pts.pct[0]);
+        for (int k = 1; k < pts.n; ++k)
+        {
+            const float x = xForHz(pts.hz[k]), y = yFor(pts.pct[k]);
             renderer.AddLineSmooth(px, py, x, y, thick, r, g, b, a);
             px = x; py = y;
         }
@@ -474,14 +579,16 @@ bool FfbGraph::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     // leave it a hair short of the boundary forever (a step smaller than one
     // ulp of the distance) -- an infinite loop on the render thread that hung
     // rF2 as soon as the lap-average line first drew (26.10.25.7).
-    auto drawDotted = [&](const float* pct, float r, float g, float b, float a, float thick) {
+    auto drawDotted = [&](const float* binPct, float r, float g, float b, float a, float thick) {
+        static Pts pts; toPoints(binPct, pts);
+        if (pts.n < 2) return;
         const float dash = (std::max)(1.0f, 7.0f * uiScale);
         const float cycle = dash + (std::max)(1.0f, 7.0f * uiScale);
-        float px = xForHz(BinHz(0)), py = yFor(pct[0]);
+        float px = xForHz(pts.hz[0]), py = yFor(pts.pct[0]);
         float phase = 0.0f; // distance already into the current cycle at this segment's start
-        for (int k = 1; k < g_an.binCount; ++k)
+        for (int k = 1; k < pts.n; ++k)
         {
-            const float x = xForHz(BinHz(k)), y = yFor(pct[k]);
+            const float x = xForHz(pts.hz[k]), y = yFor(pts.pct[k]);
             const float dx = x - px, dy = y - py;
             const float len = sqrtf(dx * dx + dy * dy);
             if (len > 0.0f && len < 100000.0f) // also skips NaN
@@ -504,8 +611,8 @@ bool FfbGraph::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     for (int k = 0; k < g_an.binCount; ++k)
     {
         const double amp2 = cfg.realtime
-            ? g_an.history.back().amp2[k]
-            : (std::max)(0.0, g_an.sumAmp2[k] / g_an.history.size());
+            ? NewestSegment().amp2[k]
+            : (std::max)(0.0, g_an.sumAmp2[k] / g_an.segCount);
         livePct[k] = 100.0f * sqrtf(static_cast<float>(amp2));
     }
 

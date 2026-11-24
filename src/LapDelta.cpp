@@ -8,9 +8,12 @@
 #include "Shortcuts.h"
 #include "RealtimeState.h"
 #include "RenderThrottle.h"
+#include "Persist.h"
+#include "StoreFile.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 
 LapDeltaStore g_lapDelta;
 
@@ -50,6 +53,54 @@ namespace
         if (out.empty()) out = "unknown";
         return out;
     }
+
+    // Whether a trace is in non-decreasing lap distance, so InterpolateAt can
+    // binary-search it. Practically always true (a point is only added once
+    // the car is further round than the last tick), but a car reversing back
+    // down the track and then driving on can leave a step backwards in it.
+    bool SortedByDistance(const std::vector<std::pair<double, double>>& trace)
+    {
+        for (size_t i = 1; i < trace.size(); ++i)
+            if (trace[i].first < trace[i - 1].first)
+                return false;
+        return true;
+    }
+
+    void BestLapPath(const std::string& key, char* path, size_t pathSize)
+    {
+        char dir[MAX_PATH];
+        GetBestLapDir(dir, sizeof(dir));
+        sprintf_s(path, pathSize, "%s\\%s.csv", dir, key.c_str());
+    }
+
+    // Save thread only (see LapDeltaStore::FlushIfDirty).
+    void WriteBestLapFile(const std::string& key, double lapTimeSeconds,
+                          const std::vector<std::pair<double, double>>& trace)
+    {
+        char dir[MAX_PATH];
+        GetBestLapDir(dir, sizeof(dir));
+        CreateDirectoryA(dir, nullptr); // no-op (ERROR_ALREADY_EXISTS) if it's already there
+
+        char path[MAX_PATH];
+        BestLapPath(key, path, sizeof(path));
+
+        char tmp[StoreFile::kTmpPathSize];
+        FILE* f = StoreFile::Begin(path, tmp, sizeof(tmp), "w");
+        if (!f)
+        {
+            Log::Write("LapDelta: failed to save best lap to %s", path);
+            return;
+        }
+        fprintf(f, "%.6f\n", lapTimeSeconds);
+        for (const auto& sample : trace)
+            fprintf(f, "%.3f,%.4f\n", sample.first, sample.second);
+        if (!StoreFile::Commit(f, tmp, path))
+        {
+            Log::Write("LapDelta: failed to save best lap to %s", path);
+            return;
+        }
+        Log::Write("LapDelta: saved new best lap %.3fs to %s", lapTimeSeconds, path);
+    }
 }
 
 void LapDeltaStore::SaveDir(char* out, size_t outSize)
@@ -65,8 +116,31 @@ bool LapDeltaStore::Reference::InterpolateAt(double lapDist, double& outTime) co
     if (lapDist <= trace.front().first) { outTime = trace.front().second; return true; }
     if (lapDist >= trace.back().first) { outTime = trace.back().second; return true; }
 
-    // Linear scan -- a lap's worth of 5Hz samples is at most a few hundred
-    // points, cheap enough to not need a binary search.
+    // Binary search: RelativeTiming asks this for every car on every scoring
+    // tick, against a trace of several hundred points. It finds the same
+    // pair the linear scan below does -- the first point at or beyond
+    // lapDist -- because the trace is in order of distance (checked once,
+    // when it was set; see SortedByDistance).
+    if (sorted)
+    {
+        const auto it = std::lower_bound(trace.begin(), trace.end(), lapDist,
+            [](const std::pair<double, double>& p, double d) { return p.first < d; });
+        const size_t i = static_cast<size_t>(it - trace.begin());
+        if (i == 0 || i >= trace.size())
+        {
+            outTime = trace.back().second;   // only a NaN distance gets here
+            return true;
+        }
+        const double d0 = trace[i - 1].first, t0 = trace[i - 1].second;
+        const double d1 = trace[i].first, t1 = trace[i].second;
+        const double span = d1 - d0;
+        const double frac = (span > 0.0001) ? (lapDist - d0) / span : 0.0;
+        outTime = t0 + (t1 - t0) * frac;
+        return true;
+    }
+
+    // Out-of-order trace (rare, see SortedByDistance): the original linear
+    // scan, so the result is exactly what it always was.
     for (size_t i = 1; i < trace.size(); ++i)
     {
         if (lapDist <= trace[i].first)
@@ -116,13 +190,16 @@ void LapDeltaStore::Init()
 void LapDeltaStore::Clear()
 {
     if (!m_ready) return;
+    // A PB reset the scoring thread never got round to: done now, while
+    // m_currentKey still names the file it was meant for.
+    if (m_resetPbRequested.exchange(false))
+        ApplyPersonalBestReset();
+    // Callers flush (Persist::FlushAllNow) before Clear() -- see Plugin.cpp.
+    // A save still waiting regardless (that flush timed out) is kept rather
+    // than dropped: the save slot carries its own key and trace, so it can no
+    // longer end up written under a cleared key, which is why it used to be
+    // dropped here.
     EnterCriticalSection(&m_lock);
-    // Callers are expected to FlushIfDirty() before Clear() (see
-    // Plugin.cpp) -- SaveBestLap() needs m_currentKey, which is about to be
-    // wiped below. Dropped here too, defensively, so a dirty flag left set
-    // by some future call path can't later write using an already-cleared
-    // key.
-    m_bestLapDirty = false;
     m_currentTrace.clear();
     m_currentKey.clear();
     m_lastTotalLaps = -1;
@@ -135,77 +212,92 @@ void LapDeltaStore::Clear()
 void LapDeltaStore::FlushIfDirty()
 {
     if (!m_ready) return;
-    EnterCriticalSection(&m_lock);
+    // Save thread, any time. The save slot is swapped out under m_saveLock
+    // (nothing is copied while holding it), the file work done after. The
+    // delete goes first: a PB reset followed by a new best before this ran
+    // must end with the new best on disk.
+    std::string deleteKey, saveKey;
+    std::vector<std::pair<double, double>> trace;
+    double lapTime = -1.0;
+    bool doDelete = false, doSave = false;
+    AcquireSRWLockExclusive(&m_saveLock);
+    if (m_deletePending)
+    {
+        deleteKey.swap(m_deleteKey);
+        m_deletePending = false;
+        doDelete = true;
+    }
     if (m_bestLapDirty)
     {
-        SaveBestLap();
+        saveKey.swap(m_saveKey);
+        trace.swap(m_saveTrace);
+        lapTime = m_saveLapTime;
         m_bestLapDirty = false;
+        doSave = true;
     }
-    LeaveCriticalSection(&m_lock);
+    ReleaseSRWLockExclusive(&m_saveLock);
+
+    if (doDelete)
+    {
+        // Deleted, not just left: otherwise the next session simply loads the
+        // "deleted" lap straight back off disk.
+        char path[MAX_PATH];
+        BestLapPath(deleteKey, path, sizeof(path));
+        const bool removed = DeleteFileA(path) != 0;
+        Log::Write("LapDelta: personal best file %s %s", path, removed ? "deleted" : "-- not present");
+    }
+    if (doSave)
+        WriteBestLapFile(saveKey, lapTime, trace);
 }
 
 void LapDeltaStore::LoadBestLap(const char* vehicleName, const char* trackName)
 {
-    m_best.trace.clear();
-    m_best.lapTimeSeconds = -1.0;
+    // Scoring thread, on a car/track change. m_best is this thread's own, so
+    // the file is simply read into it; no lock is involved.
+    std::vector<std::pair<double, double>> trace;
+    double lapTime = -1.0;
 
-    char dir[MAX_PATH];
-    GetBestLapDir(dir, sizeof(dir));
     char path[MAX_PATH];
-    sprintf_s(path, "%s\\%s.csv", dir, m_currentKey.c_str());
+    BestLapPath(m_currentKey, path, sizeof(path));
 
     FILE* f = nullptr;
     if (fopen_s(&f, path, "r") != 0 || !f)
     {
+        m_best.trace.clear();
+        m_best.lapTimeSeconds = -1.0;
+        m_best.sorted = true;
         Log::Write("LapDelta: no saved best lap yet for %s / %s", vehicleName, trackName);
         return;
     }
 
     char line[128];
     if (fgets(line, sizeof(line), f))
-        m_best.lapTimeSeconds = atof(line);
+        lapTime = atof(line);
 
     while (fgets(line, sizeof(line), f))
     {
         double dist = 0.0, t = 0.0;
         if (sscanf_s(line, "%lf,%lf", &dist, &t) == 2)
-            m_best.trace.emplace_back(dist, t);
+            trace.emplace_back(dist, t);
     }
     fclose(f);
+
+    m_best.sorted = SortedByDistance(trace);
+    m_best.trace.swap(trace);
+    m_best.lapTimeSeconds = lapTime;
 
     Log::Write("LapDelta: loaded best lap %.3fs (%zu points) for %s / %s",
                m_best.lapTimeSeconds, m_best.trace.size(), vehicleName, trackName);
 }
 
-void LapDeltaStore::SaveBestLap() const
-{
-    char dir[MAX_PATH];
-    GetBestLapDir(dir, sizeof(dir));
-    CreateDirectoryA(dir, nullptr); // no-op (ERROR_ALREADY_EXISTS) if it's already there
-
-    char path[MAX_PATH];
-    sprintf_s(path, "%s\\%s.csv", dir, m_currentKey.c_str());
-
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "w") != 0 || !f)
-    {
-        Log::Write("LapDelta: failed to save best lap to %s", path);
-        return;
-    }
-
-    fprintf(f, "%.6f\n", m_best.lapTimeSeconds);
-    for (const auto& sample : m_best.trace)
-        fprintf(f, "%.3f,%.4f\n", sample.first, sample.second);
-    fclose(f);
-
-    Log::Write("LapDelta: saved new best lap %.3fs to %s", m_best.lapTimeSeconds, path);
-}
-
 void LapDeltaStore::ResetSessionBest()
 {
     if (!m_ready) return;
+    // Render thread (hotkey). The readout clears here; the trace itself is
+    // dropped by the scoring thread at its next tick, which reads m_session
+    // without a lock (same as ResetPersonalBest).
+    m_resetSessionRequested.store(true);
     EnterCriticalSection(&m_lock);
-    m_session = Reference{};
     m_state.session = DeltaState{};
     m_state.haveLineFreeze = false;
     LeaveCriticalSection(&m_lock);
@@ -216,26 +308,42 @@ void LapDeltaStore::ResetPersonalBest()
 {
     if (!m_ready) return;
 
-    // Delete the file as well as the in-memory trace -- otherwise the next
-    // session simply loads the "deleted" lap straight back off disk.
-    char dir[MAX_PATH];
-    GetBestLapDir(dir, sizeof(dir));
-    char path[MAX_PATH];
-    sprintf_s(path, "%s\\%s.csv", dir, m_currentKey.c_str());
-    const bool removed = DeleteFileA(path) != 0;
+    // Called from the hotkeys on the render thread. What shows on screen is
+    // cleared right here; the trace itself is dropped by the scoring thread
+    // at its next tick (ApplyPersonalBestReset) -- it reads m_best without a
+    // lock, for every car, every tick, so freeing it from this thread could
+    // pull the vector out from under it. The file is deleted by the next
+    // save pass, not here: no disk work on the render thread.
+    m_resetPbRequested.store(true);
+    EnterCriticalSection(&m_lock);
+    m_state.best = DeltaState{};
+    m_state.haveLineFreeze = false;
+    LeaveCriticalSection(&m_lock);
+}
+
+void LapDeltaStore::ApplyPersonalBestReset()
+{
+    // Scoring thread (or Clear, between sessions).
+    AcquireSRWLockExclusive(&m_saveLock);
+    // A best lap set moments ago but not yet saved would otherwise survive
+    // this reset -- the save recreating the just-deleted file from it.
+    m_bestLapDirty = false;
+    m_saveTrace.clear();
+    if (!m_currentKey.empty())
+    {
+        m_deleteKey = m_currentKey;
+        m_deletePending = true;
+    }
+    ReleaseSRWLockExclusive(&m_saveLock);
 
     EnterCriticalSection(&m_lock);
-    // A best lap set moments ago but not yet flushed (see FlushIfDirty())
-    // would otherwise survive this reset -- the next flush recreating the
-    // just-deleted file from the stale in-memory trace.
-    m_bestLapDirty = false;
     m_best = Reference{};
     m_state.best = DeltaState{};
     m_state.haveLineFreeze = false;
     LeaveCriticalSection(&m_lock);
 
-    Log::Write("LapDelta: personal best cleared by hotkey (%s %s)",
-               path, removed ? "deleted" : "-- file not present");
+    Log::Write("LapDelta: personal best cleared by hotkey (%s)", m_currentKey.c_str());
+    Persist::RequestLearned();
 }
 
 void LapDeltaStore::DescribePersonalBest(char* out, size_t outSize) const
@@ -264,6 +372,18 @@ void LapDeltaStore::OnScoring(const ScoringInfoV01& info)
 {
     if (!m_ready)
         return;
+
+    // A PB reset from the hotkey, done first so it applies to the car/track
+    // it was asked for even if this tick changes them.
+    if (m_resetPbRequested.exchange(false))
+        ApplyPersonalBestReset();
+    if (m_resetSessionRequested.exchange(false))
+    {
+        EnterCriticalSection(&m_lock);
+        m_session = Reference{};
+        m_state.session = DeltaState{};
+        LeaveCriticalSection(&m_lock);
+    }
 
     if (info.mVehicle == nullptr)
         return;
@@ -407,16 +527,30 @@ void LapDeltaStore::OnScoring(const ScoringInfoV01& info)
             if (m_currentTrace.front().first > 0.0 && m_currentTrace.front().second > 0.0)
                 m_currentTrace.insert(m_currentTrace.begin(), std::make_pair(0.0, 0.0));
 
+            const bool traceSorted = SortedByDistance(m_currentTrace);
             if (m_best.lapTimeSeconds < 0.0 || lastLap < m_best.lapTimeSeconds)
             {
                 m_best.trace = m_currentTrace;
                 m_best.lapTimeSeconds = lastLap;
-                m_bestLapDirty = true; // written later by FlushIfDirty(), off this (scoring) thread's critical path
+                m_best.sorted = traceSorted;
+                // Written by FlushIfDirty() on the save thread. Its own copy
+                // of the trace and key, made before taking m_saveLock, so the
+                // save thread only ever swaps it out.
+                std::vector<std::pair<double, double>> saveTrace = m_best.trace;
+                std::string saveKey = m_currentKey;
+                AcquireSRWLockExclusive(&m_saveLock);
+                m_saveTrace.swap(saveTrace);
+                m_saveKey.swap(saveKey);
+                m_saveLapTime = lastLap;
+                m_bestLapDirty = true;
+                ReleaseSRWLockExclusive(&m_saveLock);
+                Persist::RequestLearned();
             }
             if (m_session.lapTimeSeconds < 0.0 || lastLap < m_session.lapTimeSeconds)
             {
                 m_session.trace = m_currentTrace;
                 m_session.lapTimeSeconds = lastLap;
+                m_session.sorted = traceSorted;
             }
         }
         m_currentTrace.clear();
@@ -444,7 +578,9 @@ void LapDeltaStore::OnScoring(const ScoringInfoV01& info)
     m_state.countLapFlag = static_cast<int>(player->mCountLapFlag);
     m_state.lapValidityLatch = m_lapValidityLatch;
     m_state.pitState = static_cast<int>(player->mPitState);
-    if (haveBest)
+    // (A PB reset requested during this tick keeps its cleared readout
+    // until the next tick applies it.)
+    if (haveBest && !m_resetPbRequested.load())
         m_best.UpdateTrend(timeIntoLap - bestRefTime, now, m_freq, windowSeconds, m_state.best);
     else
         m_state.best.valid = false;
@@ -1046,7 +1182,7 @@ bool LapDelta::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         // never be dragged or resized in layout mode either. Force it
         // visible (with its default "OPEN DRS" text) while arranging the
         // HUD, same as every other conditionally-shown panel.
-        if (drs.showIndicator || Layout::Active())
+        if (drs.showIndicator || Layout::Preview())
         {
             const char* text = drs.drsOpen ? "DRS ENGAGED" : "OPEN DRS";
             const float textW = renderer.MeasureText(text, drsIndicatorTextHeightPx);

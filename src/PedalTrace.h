@@ -27,8 +27,15 @@ public:
         float ffb;              // -1..1, force feedback: + = pushing the wheel right
     };
 
-    // Copies history oldest-first. Returns how many samples were written.
-    int Read(Sample* out, int maxSamples);
+    // Brings the caller's own copy of the history up to date, copying under
+    // the telemetry lock only the samples committed since its last call --
+    // one or two a frame, not the whole 10 s. 'ring' holds kHistory samples,
+    // each at (absolute sample number % kHistory); 'total' is the caller's
+    // count of samples copied so far (0 the first time) and comes back as
+    // the number ever committed, so the newest sample is number total - 1.
+    // Returns how many of the newest samples the ring now holds -- the
+    // valid ones are numbers total - n .. total - 1.
+    int ReadNew(Sample* ring, long long& total);
 
     // RAW slip ratios, for consumers that need to judge slip against their
     // own thresholds rather than the trace's display scaling. Sample::lockup
@@ -77,6 +84,7 @@ private:
     Sample m_samples[kHistory] = {};
     int m_head = 0;        // next write slot
     int m_count = 0;
+    long long m_total = 0; // samples ever committed (for stable thinning buckets)
 
     LARGE_INTEGER m_lastSample = {};
     LARGE_INTEGER m_freq = {};

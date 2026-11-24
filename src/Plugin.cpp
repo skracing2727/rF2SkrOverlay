@@ -11,6 +11,7 @@
 #include "InternalsPlugin.hpp"
 #include "Hook.h"
 #include <atomic>
+#include <vector>
 #include <cmath>
 #include "Log.h"
 #include "CarState.h"
@@ -25,8 +26,10 @@
 #include "SetupInfo.h"
 #include "DrsCue.h"
 #include "BrakeCue.h"
-#include "PitEntry.h"
+#include "TrackAlerts.h"
 #include "RealtimeState.h"
+#include "PerfStats.h"
+#include "UpdateCheck.h"
 #include "InputLagEstimate.h"
 #include "MiniSector.h"
 #include "ProximityHue.h"
@@ -41,11 +44,103 @@
 #include "TrackMap.h"
 #include "EngineTemps.h"
 #include "FfbLevel.h"
+#include "Conditions.h"
+#include "Weather.h"
+#include "PitStint.h"
+#include "FuelSave.h"
+#include "TyreSave.h"
+#include "Persist.h"
+#include "Sound.h"
+#include <atomic>
+
+// Set from the options list ("Reset timing tower"); acted on in the
+// scoring callback so the store is only ever touched from that thread.
+std::atomic<bool> g_resetTimingRequested{ false };
 #include "CarLayout.h"
 
 // Latched from scoring, read on the telemetry thread. -1 until the first
 // scoring tick names a player.
 static std::atomic<long> g_playerId{ -1 };
+
+// "My car" when rF2 marks no car as the player's: riding along while a
+// team-mate drives the shared car. It is the car last driven (its entry name,
+// saved as [Session] LastVehicle so it survives a restart). Without this,
+// with no player car known, every car's telemetry reached the driving HUD
+// and the gear, speed and pit limiter showed whichever car came last.
+static char s_myVehicle[64] = {};
+static bool s_myVehicleLoaded = false;
+static std::vector<VehicleScoringInfoV01> s_viewVehicles;
+
+// The scoring info as the HUD should see it: the original while driving;
+// while riding along, a copy with "my car" flagged as the player.
+static const ScoringInfoV01& PlayerView(const ScoringInfoV01& info, ScoringInfoV01& copy)
+{
+    if (!s_myVehicleLoaded)
+    {
+        Config::ReadStringLive("Session", "LastVehicle", s_myVehicle, sizeof(s_myVehicle));
+        s_myVehicleLoaded = true;
+    }
+    if (!info.mVehicle) { g_playerId.store(-1); return info; }
+    for (int i = 0; i < info.mNumVehicles; ++i)
+    {
+        const VehicleScoringInfoV01& v = info.mVehicle[i];
+        if (!v.mIsPlayer) continue;
+        g_playerId.store(v.mID, std::memory_order_relaxed);
+        g_playerAiControl.store(v.mControl == 1, std::memory_order_relaxed);
+        if (strncmp(s_myVehicle, v.mVehicleName, sizeof(s_myVehicle) - 1) != 0)
+        {
+            strncpy_s(s_myVehicle, v.mVehicleName, _TRUNCATE);
+            Config::WriteString("Session", "LastVehicle", s_myVehicle);
+        }
+        return info;
+    }
+    if (s_myVehicle[0])
+    {
+        for (int i = 0; i < info.mNumVehicles; ++i)
+        {
+            if (strncmp(s_myVehicle, info.mVehicle[i].mVehicleName, sizeof(s_myVehicle) - 1) != 0) continue;
+            s_viewVehicles.assign(info.mVehicle, info.mVehicle + info.mNumVehicles);
+            s_viewVehicles[i].mIsPlayer = true;
+            copy = info;
+            copy.mVehicle = s_viewVehicles.data();
+            g_playerId.store(info.mVehicle[i].mID, std::memory_order_relaxed);
+            g_playerAiControl.store(false, std::memory_order_relaxed);   // a team-mate drives: their limiter is real
+            return copy;
+        }
+    }
+    g_playerId.store(-1, std::memory_order_relaxed);   // no car to call mine: telemetry ignored
+    return info;
+}
+
+// The save pass, run only on the Persist thread (see the disk rule in
+// Persist.cpp). Each FlushIfDirty is a cheap dirty check when nothing changed,
+// and copies its data under its own lock before writing, so the game and the
+// HUD keep running while this works.
+static void PersistPass(bool all)
+{
+    // Learned driving data: at the line, and out of the car.
+    g_gearDisplay.FlushIfDirty();
+    g_fuelStore.FlushIfDirty();
+    g_lapDelta.FlushIfDirty();
+    g_brakeCue.FlushIfDirty();
+    TrackMap::FlushIfDirty();
+    FuelSave::FlushIfDirty();
+    TyreSave::FlushIfDirty();
+    if (!all)
+        return;
+
+    // Out of the car only: settings, per-car layouts, and the log -- last, so
+    // anything this pass itself logged goes out with it.
+    CarLayout::FlushIfDirty();
+    g_gearDisplay.FlushSettingsIfDirty();
+    if (!Config::FlushPendingWrites())
+        Log::Write("Plugin: one or more queued INI writes failed (read-only? UAC?)");
+    Log::FlushBuffered();
+}
+
+// The player's completed laps at the last scoring tick, to see the line
+// being crossed (-1 = no player car).
+static long s_playerLaps = -1;
 
 class SkrPlugin : public InternalsPluginV07
 {
@@ -59,6 +154,10 @@ public:
         Log::Write("SkrPlugin::Startup (game version %ld)", version);
         VehicleKey::Init();
         Config::Load();
+        // Here rather than on the first scoring tick: an INI read is disk
+        // access, and the scoring thread is a game callback.
+        Config::ReadStringLive("Session", "LastVehicle", s_myVehicle, sizeof(s_myVehicle));
+        s_myVehicleLoaded = true;
         g_carState.Init();
         g_pedalTrace.Init();
         FrameLatency::Init();
@@ -70,31 +169,49 @@ public:
         g_setupInfo.Init();
         g_drsCue.Init();
         g_brakeCue.Init();
-        g_pitEntry.Init();
+        g_trackAlerts.Init();
         g_miniSector.Init();
         g_tyreTemps.Init();
         AmdGpuPower::Init(); // no-op, quietly, on non-AMD hardware
         GpuEngineUsage::Init();
+        PerfStats::StartPoller();
         g_ffbSpectrum.Init();
+        // After every store's Init: the first pass (for the lines logged
+        // above) must not find a store whose lock does not exist yet.
+        Persist::Start(PersistPass);
+        // Its own thread; after Config::Load (it reads [Updates]).
+        UpdateCheck::Start();
 
-        if (Hook::Install())
-            Log::Write("SkrPlugin::Startup: D3D11 hook installed");
-        else
-            Log::Write("SkrPlugin::Startup: hook not installed yet (will retry on first session)");
+        // No D3D hook here: installing it makes a probe device and swapchain,
+        // and at startup the game may still be switching into full screen --
+        // with NVIDIA Surround (all monitors as one display) a user's game
+        // hung on a black screen there. Hooked at the first StartSession
+        // instead, when the game is up; nothing is drawn in the main menus
+        // before that.
+        Log::Write("SkrPlugin::Startup: D3D11 hook waits for the first session");
     }
 
     void Shutdown() override
     {
+        Weather::Shutdown();
         Log::Write("SkrPlugin::Shutdown");
         // Last chance -- EndSession's own flush covers a normal session end,
         // but not the game closing (or the plugin being re-ticked off)
-        // without one, e.g. mid-session.
-        Config::FlushPendingWrites();
-        Log::FlushBuffered();
+        // without one, e.g. mid-session. Done first, before anything below
+        // can go wrong.
+        Persist::FlushAllNow();
         Hook::Uninstall();
+        // File-load workers still running must finish before the DLL can go.
+        CarLayout::Shutdown();
+        TrackMap::Shutdown();
         Shortcuts::Shutdown();
+        PerfStats::StopPoller();
+        UpdateCheck::Shutdown();
         AmdGpuPower::Shutdown();
         GpuEngineUsage::Shutdown();
+        Sound::Shutdown();
+        // Last of all: its final pass writes whatever was logged above.
+        Persist::Stop();
     }
 
     void StartSession() override
@@ -104,9 +221,12 @@ public:
         // Again here, not only at EndSession: scoring that arrives between the
         // two can leave the timing table frozen on the old session.
         g_relativeTiming.Clear();
-        // D3D is definitely up by now; make sure the hook is in place.
+        // The D3D hook goes in here (not at Startup, see there): the game is
+        // fully up by now. A no-op once installed.
         if (Hook::Install())
-            Log::Write("SkrPlugin::StartSession: hook confirmed installed");
+            Log::Write("SkrPlugin::StartSession: D3D11 hook installed");
+        else
+            Log::Write("SkrPlugin::StartSession: D3D11 hook could not be installed");
     }
 
     void EndSession() override
@@ -115,17 +235,9 @@ public:
         g_inRealtime = false;
         // Last chance to write anything still dirty -- BEFORE the Clear()
         // calls below, which wipe the very vehicle/track keys these saves
-        // need. Covers a session ending without an intervening scoring tick
-        // where g_inRealtime was already false (see UpdateScoring).
-        g_gearDisplay.FlushIfDirty();
-        g_fuelStore.FlushIfDirty();
-        g_lapDelta.FlushIfDirty();
-        g_brakeCue.FlushIfDirty();
-        TrackMap::FlushIfDirty();
-        CarLayout::FlushIfDirty();
-        if (!Config::FlushPendingWrites())
-            Log::Write("Plugin: one or more queued INI writes failed (read-only? UAC?)");
-        Log::FlushBuffered();
+        // need. Waits for a full pass on the Persist thread, the only place
+        // that writes (see Persist.cpp).
+        Persist::FlushAllNow();
         g_carState.Clear();
         g_pedalTrace.Clear();
         g_gearDisplay.Clear();
@@ -135,9 +247,11 @@ public:
         g_fuelStore.Clear();
         g_tyreWear.Clear();
         EngineTemps::Reset();
+        Conditions::Reset();
+        Weather::Reset();
         g_setupInfo.Clear();
         g_drsCue.Clear();
-        g_pitEntry.Clear();
+        g_trackAlerts.Clear();
         g_miniSector.Clear();
         g_tyreTemps.Clear();
         g_ffbSpectrum.Clear();
@@ -166,6 +280,7 @@ public:
         // start drawing.
         Log::Write("SkrPlugin::EnterRealtime");
         g_setupInfo.ResetBaseline();
+        Sound::Prepare();   // the game's audio is up by now (see Sound.h)
         g_inRealtime = true;
     }
 
@@ -179,6 +294,8 @@ public:
         // Not a full Clear(): dropping to the monitor is still the same
         // session, and the reference stays this session's best lap.
         g_brakeCue.OnExitRealtime();
+        // Out of the car: everything may be written now (Persist.cpp).
+        Persist::RequestAll();
     }
 
     // Scoring: positions of all cars, ~5Hz (radar).
@@ -198,55 +315,53 @@ public:
         // requiring a plugin reload to recover.
         g_inRealtime = info.mInRealtime;
 
+        // My car, also while riding along (see PlayerView). Learning stores
+        // (best laps, braking points, mini-sectors) keep the original, so a
+        // team-mate's laps never become yours.
+        ScoringInfoV01 viewCopy;
+        const ScoringInfoV01& view = PlayerView(info, viewCopy);
+
         // Each call timed for the DLL-cost panel (Profiler.h).
-        { PROF("Radar"); g_carState.Update(info); }
+        { PROF("Radar"); g_carState.Update(view); }
         { PROF("Brake cue"); g_brakeCue.OnScoring(info); }
         { PROF("Lap delta"); g_lapDelta.OnScoring(info); }
-        { PROF("Relative"); g_relativeTiming.OnScoring(info); }
-        { PROF("Fuel"); g_fuelStore.OnScoring(info); }
-        { PROF("Pit entry"); g_pitEntry.OnScoring(info); }
+        { PROF("Conditions"); Conditions::OnScoring(view); }
+        { PROF("Weather"); Weather::OnScoring(info); }
+        { PROF("Pit stints"); PitStint::OnScoring(info); }
+        if (g_resetTimingRequested.exchange(false))
+        {
+            g_relativeTiming.Clear();
+            Log::Write("RelativeTiming: reset from the options list");
+        }
+        { PROF("Relative"); g_relativeTiming.OnScoring(view); }
+        { PROF("Fuel"); g_fuelStore.OnScoring(view); }
+        { PROF("Track alerts"); g_trackAlerts.OnScoring(view); } // after LapDelta: reads its PB trace
         { PROF("Mini-sectors"); g_miniSector.OnScoring(info); }
-        { PROF("Relative"); DriverAbbrev::OnScoring(info); }
-        { PROF("Track map"); TrackMap::OnScoring(info); }
-        { PROF("Car layout"); CarLayout::OnScoring(info); }
-        { PROF("Tyre wear"); g_tyreWear.OnScoring(info); }
+        { PROF("Relative"); DriverAbbrev::OnScoring(view); }
+        { PROF("Track map"); TrackMap::OnScoring(view); }
+        { PROF("Car layout"); CarLayout::OnScoring(view); }
+        { PROF("Tyre wear"); g_tyreWear.OnScoring(view); }
 
-        // The player's slot ID, for the telemetry filter below. Scoring is
-        // the only callback that reports mIsPlayer, so it has to be latched
-        // here. Written on the scoring thread and read on the telemetry
-        // thread; a long is atomic on x86-64 and a one-tick-stale ID is
-        // harmless, which is much cheaper than a lock on a callback that
-        // fires thousands of times a second.
-        if (info.mVehicle)
-        {
-            for (int i = 0; i < info.mNumVehicles; ++i)
-            {
-                if (info.mVehicle[i].mIsPlayer)
-                {
-                    g_playerId.store(info.mVehicle[i].mID, std::memory_order_relaxed);
-                    break;
-                }
-            }
-        }
+        // The two moments anything is written (the disk rule, Persist.cpp).
+        // Both only wake the Persist thread; no disk access on this thread.
+        //
+        // The player crossing the line: their completed-lap count going up
+        // while driving. Learned driving data (a new best lap, braking
+        // points, fuel rate...) is saved then, a lap at a time, rather than
+        // only once out of the car.
+        long playerLaps = -1;
+        if (view.mVehicle)
+            for (long i = 0; i < view.mNumVehicles; ++i)
+                if (view.mVehicle[i].mIsPlayer) { playerLaps = view.mVehicle[i].mTotalLaps; break; }
+        if (g_inRealtime && s_playerLaps >= 0 && playerLaps > s_playerLaps)
+            Persist::RequestLearned();
+        s_playerLaps = playerLaps;
 
-        // Persist any learned value(s) picked up while driving now that
-        // we're not -- back at the monitor, in the garage, between stints.
-        // These stores never touch disk from the telemetry/scoring thread
-        // themselves any more (see each FlushIfDirty()); this is a no-op
-        // dirty-flag check the rest of the time, ~5Hz, so it costs nothing
-        // extra while actually on track.
+        // Out of the car (monitor, garage, between stints): everything,
+        // including the INI, the per-car layouts and the log. Asked every
+        // tick here; the Persist thread runs at most about one pass a second.
         if (!g_inRealtime)
-        {
-            g_gearDisplay.FlushIfDirty();
-            g_fuelStore.FlushIfDirty();
-            g_lapDelta.FlushIfDirty();
-            g_brakeCue.FlushIfDirty();
-            TrackMap::FlushIfDirty();
-            CarLayout::FlushIfDirty();
-            if (!Config::FlushPendingWrites())
-                Log::Write("Plugin: one or more queued INI writes failed (read-only? UAC?)");
-            Log::FlushBuffered();
-        }
+            Persist::RequestAll();
     }
 
     // Telemetry scope: 1 = player car only, 2 = every vehicle.
@@ -261,12 +376,11 @@ public:
     // genuinely can be changed at runtime.
     long WantsTelemetryUpdates() override
     {
-        // Player-only is what the driving HUD needs and is far cheaper. The
-        // scope widens only when the timing table's tyre column asks for it,
-        // because compound lives in TelemInfoV01 and scoring carries no tyre
-        // data at all -- there is no cheaper way to know what the rest of
-        // the field is running.
-        return g_relativeTimingConfig.showTyre ? 2 : 1;
+        // The tyre column only shows in the standings table and the gap box:
+        // with both of those switched off, every other car's telemetry would
+        // be fetched and stored for nothing.
+        const RelativeTimingConfig& rt = g_relativeTimingConfig;
+        return ((rt.enabled || rt.showGapBox) && rt.showTyre) ? 2 : 1;
     }
 
     void UpdateTelemetry(const TelemInfoV01& info) override
@@ -282,9 +396,10 @@ public:
         // fuel store record against it -- so feeding it twenty cars
         // interleaved would corrupt learned state, and do so silently.
         const long playerId = g_playerId.load(std::memory_order_relaxed);
-        if (playerId >= 0 && info.mID != playerId)
+        if (playerId < 0 || info.mID != playerId)
             return;
 
+        g_headlightsOn.store(info.mHeadlights ? 1 : 0, std::memory_order_relaxed);
         { PROF("Pedal trace"); g_pedalTrace.Update(info); }
         { PROF("Brake cue"); g_brakeCue.OnTelemetry(info); }
         {
@@ -295,6 +410,7 @@ public:
         { PROF("Gear + speed"); g_gearDisplay.Update(info); }
         { PROF("Fuel"); g_fuelStore.OnTelemetry(info); }
         { PROF("Tyre wear"); g_tyreWear.OnTelemetry(info); }
+        { PROF("Conditions"); Conditions::OnTelemetry(info); }
         { PROF("Engine temps"); EngineTemps::OnTelemetry(info); }
         { PROF("Brake bias"); g_setupInfo.OnTelemetry(info); }
         { PROF("DRS"); g_drsCue.OnTelemetry(info); }

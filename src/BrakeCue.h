@@ -53,7 +53,8 @@ public:
     void OnExitRealtime();
 
     // Writes the saved brake profiles if a new one joined the best five.
-    // Called from the same flush points as LapDelta::FlushIfDirty.
+    // Called from the save thread (Persist.cpp) at any moment: copies the
+    // list under m_saveLock, writes after releasing it.
     void FlushIfDirty();
 
     // Beep-to-pedal reaction times, for the on-screen readout.
@@ -124,14 +125,18 @@ private:
     // track, kept across sessions (BestLaps\<car>__<track>.brake). The
     // reference profile (m_refBrake) is their per-bin median, so it is
     // there from the first lap of a session and one odd lap cannot skew it.
-    // Scoring thread only, apart from m_refBrake.
+    // Scoring thread only, apart from m_refBrake -- and the save thread's
+    // copy in FlushIfDirty, which is why every change to these three takes
+    // m_saveLock (nothing else does, so neither telemetry nor drawing ever
+    // waits on it). The scoring thread's own reads need no lock.
     static const int kKeptLaps = 5;
     struct SavedLap { double lapTime; std::vector<float> brake; };
+    SRWLOCK m_saveLock = SRWLOCK_INIT;
     std::vector<SavedLap> m_savedLaps;  // fastest first
     std::string m_savedKey;             // car+track the list belongs to; empty = not loaded
     bool m_savedDirty = false;
     void LoadSavedLaps(const std::string& key, size_t bins);
-    void SaveSavedLaps() const;
+    static void WriteSavedLaps(const std::string& key, const std::vector<SavedLap>& laps);
     void AddSavedLap(double lapTime, const std::vector<float>& brake);
     void RebuildReferenceFromSaved();   // takes m_lock itself
     // A finished lap whose time had not reached scoring yet.

@@ -44,6 +44,7 @@ void TyreTempStore::Clear()
     m_phase = Phase::Idle;
     m_lastET = -1.0;
     m_cornerCounter = 0;
+    m_lastLogET = -1.0;
     ResetAccum();
     if (!m_ready) return;
     EnterCriticalSection(&m_lock);
@@ -111,18 +112,26 @@ void TyreTempStore::Finalize(double drivenSeconds)
 
     // Raw SDK-order values (index 0/1/2 = the SDK's left/centre/right) plus
     // mean camber, so the inside/outside mapping can be checked against a
-    // real corner rather than trusted.
-    const double n = static_cast<double>(m_samples);
-    Log::Write("TyreTemps: corner %d, %s wheels loaded, %.1fs, %d samples | camber deg FL %.1f FR %.1f RL %.1f RR %.1f | "
-               "raw surface peak [0/1/2] FL %.0f/%.0f/%.0f FR %.0f/%.0f/%.0f RL %.0f/%.0f/%.0f RR %.0f/%.0f/%.0f | "
-               "raw inner [0/1/2] FL %.0f/%.0f/%.0f FR %.0f/%.0f/%.0f RL %.0f/%.0f/%.0f RR %.0f/%.0f/%.0f",
-               s.cornerCount, s.loadedLeft ? "left" : "right", drivenSeconds, m_samples,
-               m_camberSum[0] / n * kRadToDeg, m_camberSum[1] / n * kRadToDeg,
-               m_camberSum[2] / n * kRadToDeg, m_camberSum[3] / n * kRadToDeg,
-               m_peak[0][0], m_peak[0][1], m_peak[0][2], m_peak[1][0], m_peak[1][1], m_peak[1][2],
-               m_peak[2][0], m_peak[2][1], m_peak[2][2], m_peak[3][0], m_peak[3][1], m_peak[3][2],
-               m_lastInner[0][0], m_lastInner[0][1], m_lastInner[0][2], m_lastInner[1][0], m_lastInner[1][1], m_lastInner[1][2],
-               m_lastInner[2][0], m_lastInner[2][1], m_lastInner[2][2], m_lastInner[3][0], m_lastInner[3][1], m_lastInner[3][2]);
+    // real corner rather than trusted. This is the telemetry thread and the
+    // log has no INI switch, so it is one corner every 30 s of session time
+    // at most rather than every corner -- still plenty to check the mapping
+    // against. (The line is ~280 characters with real temperatures, well
+    // inside Log::Write's 512, which clips rather than fails anyway.)
+    if (m_lastLogET < 0.0 || m_lastET < m_lastLogET || m_lastET - m_lastLogET >= 30.0)
+    {
+        m_lastLogET = m_lastET;
+        const double n = static_cast<double>(m_samples);
+        Log::Write("TyreTemps: corner %d, %s wheels loaded, %.1fs, %d samples | camber deg FL %.1f FR %.1f RL %.1f RR %.1f | "
+                   "raw surface peak [0/1/2] FL %.0f/%.0f/%.0f FR %.0f/%.0f/%.0f RL %.0f/%.0f/%.0f RR %.0f/%.0f/%.0f | "
+                   "raw inner [0/1/2] FL %.0f/%.0f/%.0f FR %.0f/%.0f/%.0f RL %.0f/%.0f/%.0f RR %.0f/%.0f/%.0f",
+                   s.cornerCount, s.loadedLeft ? "left" : "right", drivenSeconds, m_samples,
+                   m_camberSum[0] / n * kRadToDeg, m_camberSum[1] / n * kRadToDeg,
+                   m_camberSum[2] / n * kRadToDeg, m_camberSum[3] / n * kRadToDeg,
+                   m_peak[0][0], m_peak[0][1], m_peak[0][2], m_peak[1][0], m_peak[1][1], m_peak[1][2],
+                   m_peak[2][0], m_peak[2][1], m_peak[2][2], m_peak[3][0], m_peak[3][1], m_peak[3][2],
+                   m_lastInner[0][0], m_lastInner[0][1], m_lastInner[0][2], m_lastInner[1][0], m_lastInner[1][1], m_lastInner[1][2],
+                   m_lastInner[2][0], m_lastInner[2][1], m_lastInner[2][2], m_lastInner[3][0], m_lastInner[3][1], m_lastInner[3][2]);
+    }
 
     EnterCriticalSection(&m_lock);
     m_state = s;

@@ -80,5 +80,21 @@ namespace DriverAbbrev
     // Returns false when the ID is unknown.
     bool NameParts(long id, char* first, size_t firstSize, char* last, size_t lastSize);
 
+    // The whole field's places, colours and codes in one go, for a caller
+    // that wants every car at once (the track map, each redraw): one lock
+    // for all of them, rather than a lock and a search of the field per car
+    // per lookup. Each entry holds what Place(), Color() and Get() would
+    // have returned for that car at the same moment.
+    struct CarInfo
+    {
+        long  id;
+        int   place;      // as Place(): 0 = unknown
+        bool  hasColor;   // as Color()'s return; r/g/b only meaningful when true
+        float r, g, b;
+        char  code[4];    // as Get(): may be empty
+    };
+    // Copies up to 'maxCars' entries into 'out' (any order); returns how many.
+    int Snapshot(CarInfo* out, int maxCars);
+
     void Clear();
 }

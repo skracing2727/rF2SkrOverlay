@@ -3,6 +3,8 @@
 #include "LapDelta.h"
 #include "Log.h"
 #include "RealtimeState.h"
+#include "Persist.h"
+#include "StoreFile.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -46,6 +48,56 @@ namespace
         if (out.empty()) out = "unknown";
         return out;
     }
+
+    // What a car+track's saved file holds, read on the telemetry thread on
+    // a car/track change BEFORE OnTelemetry takes m_lock (Draw reads the
+    // store through that lock several times a frame).
+    struct LoadedStats
+    {
+        double seedNorm = 0.0;        // 0 = no usable saved rate
+        double lastLapTime = 0.0;     // 0 = none
+    };
+
+    LoadedStats ReadFuelStats(const std::string& key, const char* vehicleName, const char* trackName)
+    {
+        LoadedStats out;
+        char dir[MAX_PATH];
+        GetFuelStatsDir(dir, sizeof(dir));
+        char path[MAX_PATH];
+        sprintf_s(path, "%s\\%s.txt", dir, key.c_str());
+
+        FILE* f = nullptr;
+        if (fopen_s(&f, path, "r") != 0 || !f)
+        {
+            Log::Write("FuelStore: no saved fuel stats yet for %s / %s", vehicleName, trackName);
+            return out;
+        }
+        char line[64];
+        double savedRate = 0.0;
+        if (fgets(line, sizeof(line), f))
+            savedRate = atof(line);
+        // Second line: last lap time (see WriteFuelStats).
+        if (fgets(line, sizeof(line), f))
+        {
+            const double lapTime = atof(line);
+            if (lapTime > 5.0 && lapTime < 100000.0)
+                out.lastLapTime = lapTime;
+        }
+        // Third line marks the rate as normalised to a 1x fuel multiplier.
+        // Files without it were saved before the multiplier was tracked, so the
+        // rate in them may have been learned under any multiplier (one session
+        // at 6x burn poisoned a whole car+track) -- it is ignored rather than
+        // trusted. The lap time above is still used.
+        bool normalised = false;
+        if (fgets(line, sizeof(line), f))
+            normalised = (strncmp(line, "norm", 4) == 0);
+        if (normalised && savedRate > 0.01)
+            out.seedNorm = savedRate;
+        fclose(f);
+        Log::Write("FuelStore: loaded %.3f L/lap @1x (%s), %.3fs/lap for %s / %s",
+                   out.seedNorm, normalised ? "normalised" : "legacy file, rate ignored", out.lastLapTime, vehicleName, trackName);
+        return out;
+    }
 }
 
 void FuelStore::Init()
@@ -59,14 +111,16 @@ void FuelStore::Clear()
 {
     if (!m_ready) return;
     EnterCriticalSection(&m_lock);
-    // Callers are expected to FlushIfDirty() before Clear() (see
-    // Plugin.cpp) -- SaveFuelStats() needs m_key, which is about to be
-    // wiped below. Dropped here too, defensively, so a dirty flag left set
-    // by some future call path can't later write using an already-cleared
-    // key.
-    m_dirty = false;
+    // Callers flush (Persist::FlushAllNow) before Clear() -- see Plugin.cpp.
+    // A rate still waiting regardless (that flush timed out) is stashed with
+    // its key before the state it is worked out from is wiped below, rather
+    // than dropped as it used to be (when the save read the live key).
+    if (m_dirty)
+    {
+        m_stash = SnapshotForSaveLocked();
+        m_dirty = false;
+    }
     m_state = State{};
-    m_key.clear();
     m_lastLapNumber = -1;
     m_haveLapStartFuel = false;
     m_hasLearnedValue = false;
@@ -90,18 +144,81 @@ void FuelStore::Clear()
     m_haveConsumedSample = false;
     m_haveScoringVerdict = false;
     LeaveCriticalSection(&m_lock);
+    // The key is forgotten too, so the next session reloads the file even
+    // for the same car and track. Only OnTelemetry touches m_key (so it can
+    // compare it without the lock), so it is told to rather than the key
+    // being cleared from here.
+    m_keysInvalidated.store(true);
 }
 
 void FuelStore::FlushIfDirty()
 {
     if (!m_ready) return;
+    // Save thread, any time. Work out what to write under the lock, write
+    // after letting go: OnTelemetry and Draw's Read() take m_lock.
+    SaveSnapshot stashed, current;
     EnterCriticalSection(&m_lock);
+    if (m_stash.valid)
+    {
+        stashed = m_stash;
+        m_stash = SaveSnapshot{};
+    }
     if (m_dirty)
     {
-        SaveFuelStats();
+        current = SnapshotForSaveLocked();
         m_dirty = false;
     }
     LeaveCriticalSection(&m_lock);
+    WriteFuelStats(stashed);
+    WriteFuelStats(current);
+}
+
+FuelStore::SaveSnapshot FuelStore::SnapshotForSaveLocked() const
+{
+    // Caller holds m_lock.
+    SaveSnapshot s;
+    s.valid = !m_key.empty();
+    s.key = m_key;
+    // The rate is written normalised to 1x fuel: this session's learned
+    // rate divided by its multiplier. If nothing real was learned this
+    // session (still only the seeded value) or the multiplier is unknown,
+    // the previously saved normalised value is kept as it was.
+    const int mult = g_fuelMult.load();
+    s.norm = m_seedNorm;
+    if (m_hasLearnedValue && !m_historySeeded && mult > 0)
+        s.norm = m_learnedFuelPerLap / mult;
+    // Whatever the most recent real lap time seen this session was -- just
+    // enough for next session's "Fuel Time Left" to have something to seed
+    // from at the green flag. Not an average, and not meant to be a
+    // reference lap; the very next completed lap this session overwrites it
+    // in memory (see OnTelemetry), only the persisted file lags by one lap.
+    s.lapTime = m_lastLapTimeSeconds;
+    return s;
+}
+
+void FuelStore::WriteFuelStats(const SaveSnapshot& s)
+{
+    if (!s.valid)
+        return;
+    char dir[MAX_PATH];
+    GetFuelStatsDir(dir, sizeof(dir));
+    CreateDirectoryA(dir, nullptr); // no-op (ERROR_ALREADY_EXISTS) if it's already there
+
+    char path[MAX_PATH];
+    sprintf_s(path, "%s\\%s.txt", dir, s.key.c_str());
+
+    char tmp[StoreFile::kTmpPathSize];
+    FILE* f = StoreFile::Begin(path, tmp, sizeof(tmp), "w");
+    if (!f)
+    {
+        Log::Write("FuelStore: failed to save fuel stats to %s", path);
+        return;
+    }
+    fprintf(f, "%.4f\n", s.norm);
+    fprintf(f, "%.3f\n", s.lapTime);
+    fprintf(f, "norm\n");
+    if (!StoreFile::Commit(f, tmp, path))
+        Log::Write("FuelStore: failed to save fuel stats to %s", path);
 }
 
 double FuelStore::MedianOfHistory() const
@@ -139,7 +256,11 @@ void FuelStore::ApplyLearnedLap(double consumed)
     if (m_fuelHistoryCount < kFuelHistorySize) ++m_fuelHistoryCount;
     RecomputeFuelPerLap();
     m_hasLearnedValue = true;
-    m_dirty = true; // written later by FlushIfDirty(), off this thread's critical path
+    // Written by FlushIfDirty() on the save thread. Learned at the line (or
+    // a tick after it, when the two halves of the handoff meet), so the save
+    // pass the line itself asked for may already have run -- ask again.
+    m_dirty = true;
+    Persist::RequestLearned();
 }
 
 void FuelStore::RecomputeFuelPerLap()
@@ -166,107 +287,62 @@ void FuelStore::TrySeedFromSaved()
     Log::Write("FuelStore: seeded %.3f L/lap (%.3f @1x x %dx fuel)", seeded, m_seedNorm, mult);
 }
 
-void FuelStore::LoadFuelStats(const char* vehicleName, const char* trackName)
-{
-    m_learnedFuelPerLap = 0.0;
-    m_hasLearnedValue = false;
-    m_fuelHistoryCount = 0;
-    m_fuelHistoryNext = 0;
-    m_historySeeded = false;
-    m_seedNorm = 0.0;
-    m_lastLapTimeSeconds = 0.0;
-
-    char dir[MAX_PATH];
-    GetFuelStatsDir(dir, sizeof(dir));
-    char path[MAX_PATH];
-    sprintf_s(path, "%s\\%s.txt", dir, m_key.c_str());
-
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "r") != 0 || !f)
-    {
-        Log::Write("FuelStore: no saved fuel stats yet for %s / %s", vehicleName, trackName);
-        return;
-    }
-    char line[64];
-    double savedRate = 0.0;
-    if (fgets(line, sizeof(line), f))
-        savedRate = atof(line);
-    // Second line: last lap time (see SaveFuelStats).
-    if (fgets(line, sizeof(line), f))
-    {
-        const double lapTime = atof(line);
-        if (lapTime > 5.0 && lapTime < 100000.0)
-            m_lastLapTimeSeconds = lapTime;
-    }
-    // Third line marks the rate as normalised to a 1x fuel multiplier.
-    // Files without it were saved before the multiplier was tracked, so the
-    // rate in them may have been learned under any multiplier (one session
-    // at 6x burn poisoned a whole car+track) -- it is ignored rather than
-    // trusted. The lap time above is still used.
-    bool normalised = false;
-    if (fgets(line, sizeof(line), f))
-        normalised = (strncmp(line, "norm", 4) == 0);
-    if (normalised && savedRate > 0.01)
-        m_seedNorm = savedRate;
-    fclose(f);
-    Log::Write("FuelStore: loaded %.3f L/lap @1x (%s), %.3fs/lap for %s / %s",
-               m_seedNorm, normalised ? "normalised" : "legacy file, rate ignored", m_lastLapTimeSeconds, vehicleName, trackName);
-}
-
-void FuelStore::SaveFuelStats() const
-{
-    char dir[MAX_PATH];
-    GetFuelStatsDir(dir, sizeof(dir));
-    CreateDirectoryA(dir, nullptr); // no-op (ERROR_ALREADY_EXISTS) if it's already there
-
-    char path[MAX_PATH];
-    sprintf_s(path, "%s\\%s.txt", dir, m_key.c_str());
-
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "w") != 0 || !f)
-    {
-        Log::Write("FuelStore: failed to save fuel stats to %s", path);
-        return;
-    }
-    // The rate is written normalised to 1x fuel: this session's learned
-    // rate divided by its multiplier. If nothing real was learned this
-    // session (still only the seeded value) or the multiplier is unknown,
-    // the previously saved normalised value is kept as it was.
-    const int mult = g_fuelMult.load();
-    double normToSave = m_seedNorm;
-    if (m_hasLearnedValue && !m_historySeeded && mult > 0)
-        normToSave = m_learnedFuelPerLap / mult;
-    fprintf(f, "%.4f\n", normToSave);
-    // Whatever the most recent real lap time seen this session was -- just
-    // enough for next session's "Fuel Time Left" to have something to seed
-    // from at the green flag. Not an average, and not meant to be a
-    // reference lap; the very next completed lap this session overwrites it
-    // in memory (see OnTelemetry), only the persisted file lags by one lap.
-    fprintf(f, "%.3f\n", m_lastLapTimeSeconds);
-    fprintf(f, "norm\n");
-    fclose(f);
-}
-
 void FuelStore::OnTelemetry(const TelemInfoV01& info)
 {
     if (!m_ready) return;
 
+    // Car/track change. The raw names are compared with last tick's copies
+    // first, so an ordinary tick builds no strings; the key is only
+    // sanitized, and the saved file read, on an actual change -- and the
+    // read happens here, BEFORE m_lock, which Draw takes through Read()
+    // several times a frame. m_key is only ever written by this thread
+    // (under the lock, for FlushIfDirty), so it can be compared here safely.
     // Vehicle CLASS, shared from the scoring thread -- see RealtimeState.h.
     char vehKey[64];
     VehicleKey::Get(vehKey, sizeof(vehKey));
-    const std::string key = Sanitize(vehKey, sizeof(vehKey)) + "__" + Sanitize(info.mTrackName, sizeof(info.mTrackName));
+    const bool rekeyAfterClear = m_keysInvalidated.exchange(false);
+    bool keyChanged = false;
+    std::string newKey;
+    LoadedStats loaded;
+    char profilePath[MAX_PATH] = "";
+    if (rekeyAfterClear || !m_haveRawNames
+        || strncmp(vehKey, m_rawVehKey, sizeof(m_rawVehKey)) != 0
+        || strncmp(info.mTrackName, m_rawTrackName, sizeof(m_rawTrackName)) != 0)
+    {
+        memcpy(m_rawVehKey, vehKey, sizeof(m_rawVehKey));
+        memcpy(m_rawTrackName, info.mTrackName, sizeof(m_rawTrackName));
+        m_haveRawNames = true;
+        newKey = Sanitize(vehKey, sizeof(vehKey)) + "__" + Sanitize(info.mTrackName, sizeof(info.mTrackName));
+        keyChanged = rekeyAfterClear || newKey != m_key;
+        if (keyChanged)
+        {
+            loaded = ReadFuelStats(newKey, vehKey, info.mTrackName);
+            char dir[MAX_PATH];
+            GetFuelStatsDir(dir, sizeof(dir));
+            sprintf_s(profilePath, "%s\\%s_profile.txt", dir, newKey.c_str());
+        }
+    }
 
     EnterCriticalSection(&m_lock);
 
-    if (key != m_key)
+    if (keyChanged)
     {
-        m_key = key;
-        LoadFuelStats(vehKey, info.mTrackName);
+        // A rate learned for the car/track being left and not saved yet
+        // still goes to its own file.
+        if (m_dirty)
         {
-            char dir[MAX_PATH];
-            GetFuelStatsDir(dir, sizeof(dir));
-            sprintf_s(m_state.profilePath, "%s\\%s_profile.txt", dir, m_key.c_str());
+            m_stash = SnapshotForSaveLocked();
+            m_dirty = false;
         }
+        m_key = newKey;
+        m_learnedFuelPerLap = 0.0;
+        m_hasLearnedValue = false;
+        m_fuelHistoryCount = 0;
+        m_fuelHistoryNext = 0;
+        m_historySeeded = false;
+        m_seedNorm = loaded.seedNorm;
+        m_lastLapTimeSeconds = loaded.lastLapTime;
+        strcpy_s(m_state.profilePath, profilePath);
         m_lastLapNumber = info.mLapNumber;
         m_haveLapStartFuel = true;
         m_fuelAtLapStart = info.mFuel;

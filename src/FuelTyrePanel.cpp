@@ -33,80 +33,6 @@ namespace
         sprintf_s(out, outSize, "%.0f min", minutes);
     }
 
-    // One box plot (see TyreWearStore::WearDistribution), horizontal, between
-    // leftX and rightX on the value scale lo..hi: whiskers as a thin line
-    // with end caps, the middle half as a translucent box with an outline,
-    // the median as a bright bar, outliers as small dots, and the last
-    // counted lap as the red point on top of everything.
-    void DrawWearBoxPlot(Renderer& renderer, const TyreWearStore::WearDistribution& d,
-                         float leftX, float rightX, float centerY, float height,
-                         float lo, float hi, const FuelTyrePanelConfig& cfg)
-    {
-        if (d.count <= 0 || hi <= lo)
-            return;
-        const float span = rightX - leftX;
-        auto X = [&](float v) { return leftX + (v - lo) / (hi - lo) * span; };
-        const float thin = (std::max)(1.0f, height * 0.08f);
-        const float halfH = height * 0.5f;
-        const float pr = cfg.wearPlotR, pg = cfg.wearPlotG, pb = cfg.wearPlotB;
-
-        const float wl = X(d.whiskerLo), wh = X(d.whiskerHi);
-        renderer.AddFilledRect((wl + wh) * 0.5f, centerY, (std::max)((wh - wl) * 0.5f, thin * 0.5f), thin * 0.5f, 0.0f, pr, pg, pb, 0.9f);
-        renderer.AddFilledRect(wl, centerY, thin * 0.5f, halfH * 0.6f, 0.0f, pr, pg, pb, 0.9f);
-        renderer.AddFilledRect(wh, centerY, thin * 0.5f, halfH * 0.6f, 0.0f, pr, pg, pb, 0.9f);
-
-        const float bl = X(d.q1), br = X(d.q3);
-        const float boxHalfW = (std::max)((br - bl) * 0.5f, thin);
-        const float boxCx = (bl + br) * 0.5f;
-        renderer.AddFilledRect(boxCx, centerY, boxHalfW, halfH, 0.0f, pr, pg, pb, 0.35f);
-        renderer.AddFilledRect(boxCx, centerY - halfH + thin * 0.5f, boxHalfW, thin * 0.5f, 0.0f, pr, pg, pb, 0.9f);
-        renderer.AddFilledRect(boxCx, centerY + halfH - thin * 0.5f, boxHalfW, thin * 0.5f, 0.0f, pr, pg, pb, 0.9f);
-        renderer.AddFilledRect(boxCx - boxHalfW + thin * 0.5f, centerY, thin * 0.5f, halfH, 0.0f, pr, pg, pb, 0.9f);
-        renderer.AddFilledRect(boxCx + boxHalfW - thin * 0.5f, centerY, thin * 0.5f, halfH, 0.0f, pr, pg, pb, 0.9f);
-
-        renderer.AddFilledRect(X(d.median), centerY, thin, halfH, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f);
-
-        for (int i = 0; i < d.outlierCount; ++i)
-            renderer.AddFilledCircle(X(d.outliers[i]), centerY, height * 0.12f, pr, pg, pb, 0.8f, 12);
-
-        if (d.lastLap >= 0.0f)
-        {
-            const float lx = X(d.lastLap);
-            renderer.AddFilledCircle(lx, centerY, height * 0.24f + thin, 0.0f, 0.0f, 0.0f, 0.9f, 16);
-            renderer.AddFilledCircle(lx, centerY, height * 0.24f, cfg.wearLastLapR, cfg.wearLastLapG, cfg.wearLastLapB, 1.0f, 16);
-        }
-    }
-
-    // Value range covering everything a plot will draw (whiskers, outliers,
-    // last lap), padded a little so nothing sits on the very edge, and never
-    // narrower than 0.05 %/lap so a near-identical run of laps is not blown
-    // up into a misleadingly wide box.
-    void WearPlotRange(const TyreWearStore::WearDistribution* d, int n, float& lo, float& hi)
-    {
-        bool any = false;
-        for (int i = 0; i < n; ++i)
-        {
-            if (d[i].count <= 0) continue;
-            float a = d[i].whiskerLo, b = d[i].whiskerHi;
-            for (int k = 0; k < d[i].outlierCount; ++k) { a = (std::min)(a, d[i].outliers[k]); b = (std::max)(b, d[i].outliers[k]); }
-            if (d[i].lastLap >= 0.0f) { a = (std::min)(a, d[i].lastLap); b = (std::max)(b, d[i].lastLap); }
-            lo = any ? (std::min)(lo, a) : a;
-            hi = any ? (std::max)(hi, b) : b;
-            any = true;
-        }
-        if (!any) { lo = 0.0f; hi = 1.0f; return; }
-        const float minSpan = 0.05f;
-        if (hi - lo < minSpan)
-        {
-            const float mid = (lo + hi) * 0.5f;
-            lo = mid - minSpan * 0.5f;
-            hi = mid + minSpan * 0.5f;
-        }
-        const float pad = (hi - lo) * 0.06f;
-        lo -= pad;
-        hi += pad;
-    }
-
     // One "label ......... value" row, value right-aligned -- used for both
     // groups so the whole panel reads as one consistent little table rather
     // than free-form sentences.
@@ -407,19 +333,6 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     // worst of the four) for the "Tyre @ Race End" row's own highlight.
     int wheelEndOfRaceTier[4] = {};
     int tyreEndOfRaceTier = 0;
-    // Wear box plots: only once at least one lap has been counted, and the
-    // worst tyre is the one with the highest median wear per lap.
-    int worstWearWheel = -1;
-    if (showTyres && Shortcuts::Visible(Shortcuts::TyreWearPlots))
-    {
-        for (int w = 0; w < 4; ++w)
-        {
-            const TyreWearStore::WearDistribution& d = tyres.distribution[w];
-            if (d.count > 0 && (worstWearWheel < 0 || d.median > tyres.distribution[worstWearWheel].median))
-                worstWearWheel = w;
-        }
-    }
-    const bool showWearPlots = worstWearWheel >= 0;
     if (showTyres)
     {
         for (int w = 0; w < 4; ++w)
@@ -539,11 +452,14 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         // The live value, plus how far it has been moved from the value the
         // car left the garage on. A bare percentage doesn't say whether it
         // has been touched this session; the delta does.
-        const double biasDelta = setup.rearBrakeBiasPercent - setup.garageRearBrakeBiasPercent;
+        // Shown as the FRONT share, the way rFactor 2's garage and most cars'
+        // dashes give it (e.g. 56.0 = 56:44); the SDK reports the rear share.
+        const double front = 100.0 - setup.rearBrakeBiasPercent;
+        const double biasDelta = setup.garageRearBrakeBiasPercent - setup.rearBrakeBiasPercent; // front moved by
         if (setup.garageRearBrakeBiasPercent >= 0.0 && (biasDelta > 0.05 || biasDelta < -0.05))
-            sprintf_s(brake.value, "%.1f%% Rear (%+.1f)", setup.rearBrakeBiasPercent, biasDelta);
+            sprintf_s(brake.value, "%.1f%% Front (%+.1f)", front, biasDelta);
         else
-            sprintf_s(brake.value, "%.1f%% Rear", setup.rearBrakeBiasPercent);
+            sprintf_s(brake.value, "%.1f%% Front", front);
         brake.alert = false;
     }
 
@@ -579,9 +495,6 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         // numbers change.
         (void)cellW;
         colLeftW = colRightW = renderer.MeasureText("99.9", tyresTextPx);
-        // Each column wide enough for its small box plot underneath.
-        if (showWearPlots)
-            colLeftW = colRightW = (std::max)(colLeftW, cfg.wearPlotWidthPx * tyresUiScale);
         const float gridW = colLeftW + tyresColumnGapPx * 2.0f + colRightW;
 
         auto rowW = [&](const Row& r)
@@ -596,14 +509,6 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         // header + 2 grid rows + life row (+ race-end row, race only)
         const int tyreLineCount = showRaceEndProjection ? 5 : 4;
         tyreGroupH = static_cast<float>(tyreLineCount) * tyresLineStep - cfg.lineGapPx * tyresUiScale;
-        if (showWearPlots)
-        {
-            // Two small-plot rows under the grid rows, then the worst-tyre
-            // block: title line, big plot, value line.
-            const float gap = cfg.lineGapPx * tyresUiScale;
-            tyreGroupH += 2.0f * (cfg.wearPlotHeightPx * tyresUiScale + gap);
-            tyreGroupH += tyresLineStep + cfg.wearBigPlotHeightPx * tyresUiScale + gap + tyresLineStep;
-        }
     }
 
     // ---- Setup group geometry: label column + value column, same as Fuel,
@@ -743,24 +648,6 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         const float rightColCX = groupCenterX + boxColumnGapPx + colRightW * 0.5f;
         float ly = topY;
 
-        // All four small plots on ONE scale, so a longer box or a point
-        // further right really is more wear than the tyre next to it.
-        const float smallPlotW = cfg.wearPlotWidthPx * boxUiScale;
-        const float smallPlotH = cfg.wearPlotHeightPx * boxUiScale;
-        const float plotGap = cfg.lineGapPx * boxUiScale;
-        float smallLo = 0.0f, smallHi = 1.0f;
-        if (showWearPlots)
-            WearPlotRange(tyres.distribution, 4, smallLo, smallHi);
-        auto drawSmallPlots = [&](int leftWheel, int rightWheel)
-        {
-            if (!showWearPlots) return;
-            const float cy = ly + smallPlotH * 0.5f;
-            DrawWearBoxPlot(renderer, tyres.distribution[leftWheel], leftColCX - smallPlotW * 0.5f, leftColCX + smallPlotW * 0.5f,
-                            cy, smallPlotH, smallLo, smallHi, cfg);
-            DrawWearBoxPlot(renderer, tyres.distribution[rightWheel], rightColCX - smallPlotW * 0.5f, rightColCX + smallPlotW * 0.5f,
-                            cy, smallPlotH, smallLo, smallHi, cfg);
-            ly += smallPlotH + plotGap;
-        };
 
         renderer.AddText(groupCenterX, ly, kTyreHeader, boxTextPx, cfg.colorR, cfg.colorG, cfg.colorB, 0.7f, Renderer::HAlign::Center);
         ly += boxLineStep;
@@ -768,72 +655,11 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         drawWheelCell(leftColCX, ly, 0);   // FL
         drawWheelCell(rightColCX, ly, 1);  // FR
         ly += boxLineStep;
-        drawSmallPlots(0, 1);
 
         drawWheelCell(leftColCX, ly, 2);   // RL
         drawWheelCell(rightColCX, ly, 3);  // RR
         ly += boxLineStep;
-        drawSmallPlots(2, 3);
 
-        // The worst tyre, bigger and on its OWN scale for detail, with the
-        // numbers written underneath: range ends at the sides, the median
-        // and the last lap (in red) in the middle.
-        if (showWearPlots)
-        {
-            const TyreWearStore::WearDistribution& d = tyres.distribution[worstWearWheel];
-            char title[48];
-            sprintf_s(title, "Worst %s  (%d lap%s)", kWheelLabel[worstWearWheel], d.count, d.count == 1 ? "" : "s");
-            renderer.AddText(groupCenterX, ly, title, boxTextPx, cfg.colorR, cfg.colorG, cfg.colorB, 0.7f, Renderer::HAlign::Center);
-            ly += boxLineStep;
-
-            // The dot is this lap's wear so far, moving right as the lap
-            // goes on (held at its final value briefly after the line), not
-            // the last completed lap. Coloured against the median pro-rated
-            // to how far through the lap you are: green on target, orange a
-            // little over, red well over.
-            const TyreWearStore::WheelState& live = tyreWheels[worstWearWheel];
-            const float nowWear = static_cast<float>(live.steppedDegradationPercent);
-            float dotR = 0.2f, dotG = 0.85f, dotB = 0.3f;
-            if (live.steppedLapFraction > 0.1 && d.median > 0.0001f)
-            {
-                const double ratio = nowWear / (d.median * live.steppedLapFraction);
-                if (ratio > 1.15)      { dotR = 0.95f; dotG = 0.2f;  dotB = 0.2f; }
-                else if (ratio > 1.03) { dotR = 1.0f;  dotG = 0.6f;  dotB = 0.1f; }
-            }
-
-            TyreWearStore::WearDistribution plotD = d;
-            plotD.lastLap = -1.0f;              // the live dot replaces the last-lap one
-            const float bigH = cfg.wearBigPlotHeightPx * boxUiScale;
-            float bigLo = 0.0f, bigHi = 1.0f;
-            WearPlotRange(&plotD, 1, bigLo, bigHi);
-            bigLo = 0.0f;                       // the dot starts each lap at zero
-            if (nowWear > bigHi) bigHi = nowWear * 1.05f;
-            const float bigCY = ly + bigH * 0.5f;
-            DrawWearBoxPlot(renderer, plotD, leftX, rightX, bigCY, bigH, bigLo, bigHi, cfg);
-            {
-                const float thin = (std::max)(1.0f, bigH * 0.08f);
-                const float dx = leftX + (nowWear - bigLo) / (bigHi - bigLo) * (rightX - leftX);
-                renderer.AddFilledCircle(dx, bigCY, bigH * 0.24f + thin, 0.0f, 0.0f, 0.0f, 0.9f, 16);
-                renderer.AddFilledCircle(dx, bigCY, bigH * 0.24f, dotR, dotG, dotB, 1.0f, 16);
-            }
-            ly += bigH + plotGap;
-
-            const float smallTextPx = boxTextPx * 0.8f;
-            char buf[32];
-            sprintf_s(buf, "%.2f", bigLo);
-            renderer.AddText(leftX, ly, buf, smallTextPx, cfg.colorR, cfg.colorG, cfg.colorB, 0.6f, Renderer::HAlign::Left);
-            sprintf_s(buf, "%.2f", bigHi);
-            renderer.AddText(rightX, ly, buf, smallTextPx, cfg.colorR, cfg.colorG, cfg.colorB, 0.6f, Renderer::HAlign::Right);
-            char med[32], last[32];
-            sprintf_s(med, "med %.2f   ", d.median);
-            sprintf_s(last, "now %.2f", nowWear);
-            const float medW = renderer.MeasureText(med, smallTextPx);
-            const float lastW = renderer.MeasureText(last, smallTextPx);
-            const float startX = groupCenterX - (medW + lastW) * 0.5f;
-            renderer.AddText(startX, ly, med, smallTextPx, cfg.colorR, cfg.colorG, cfg.colorB, 1.0f, Renderer::HAlign::Left);
-            renderer.AddText(startX + medW, ly, last, smallTextPx, dotR, dotG, dotB, 1.0f, Renderer::HAlign::Left);
-            ly += boxLineStep;
-        }
 
         drawLabelValueRow(leftX, rightX, boxUiScale, ly, tyreLifeRow);
         ly += boxLineStep;

@@ -4,6 +4,7 @@
 #include "Renderer.h"
 #include "Config.h"
 #include "Layout.h"
+#include "RenderThrottle.h"
 #include "Log.h"
 #include <algorithm>
 #include <cmath>
@@ -228,6 +229,7 @@ void PedalTraceStore::Update(const TelemInfoV01& info)
         s.ffb = static_cast<float>(m_accFfb / m_accCount);
 
         m_head = (m_head + 1) % kHistory;
+        ++m_total;
         if (m_count < kHistory)
             ++m_count;
 
@@ -240,24 +242,34 @@ void PedalTraceStore::Update(const TelemInfoV01& info)
     LeaveCriticalSection(&m_lock);
 }
 
-int PedalTraceStore::Read(Sample* out, int maxSamples)
+int PedalTraceStore::ReadNew(Sample* ring, long long& total)
 {
     if (!m_ready)
         return 0;
 
     EnterCriticalSection(&m_lock);
 
-    const int n = (m_count < maxSamples) ? m_count : maxSamples;
-    // Walk back n samples from the write head so 'out' is oldest-first.
-    int idx = (m_head - n + kHistory * 2) % kHistory;
-    for (int i = 0; i < n; ++i)
+    const long long newest = m_total;
+    const int count = m_count;
+    // Held now: numbers newest - count .. newest - 1, the last at slot
+    // m_head - 1. Anything the caller has from before that range is gone
+    // from here anyway (a Clear, or more than kHistory samples since).
+    const long long oldest = newest - count;
+    long long from = total;
+    if (from < oldest || from > newest)
+        from = oldest;
+    int slot = static_cast<int>((m_head - (newest - from) + kHistory * 2) % kHistory);
+    int dst = static_cast<int>(from % kHistory);
+    for (long long t = from; t < newest; ++t)
     {
-        out[i] = m_samples[idx];
-        idx = (idx + 1) % kHistory;
+        ring[dst] = m_samples[slot];
+        if (++slot == kHistory) slot = 0;
+        if (++dst == kHistory) dst = 0;
     }
 
     LeaveCriticalSection(&m_lock);
-    return n;
+    total = newest;
+    return count;
 }
 
 PedalTraceStore::SlipState PedalTraceStore::ReadSlip()
@@ -299,28 +311,75 @@ void PedalTraceStore::Clear()
 
 namespace
 {
-    // Draws one pedal channel as a polyline.
-    void DrawTrace(Renderer& renderer, const PedalTraceStore::Sample* samples, int count,
-                   float x0, float yBottom, float plotH, float dx, float thickness,
-                   float r, float g, float b, float a, int channel)
+    // 0 throttle raw, 1 throttle actual, 2 brake raw, 3 brake actual.
+    float ChannelValue(const PedalTraceStore::Sample& s, int channel)
     {
-        auto value = [&](int i) -> float {
-            switch (channel)
-            {
-            case 0: return samples[i].throttleRaw;
-            case 1: return samples[i].throttleActual;
-            case 2: return samples[i].brakeRaw;
-            default: return samples[i].brakeActual;
-            }
-        };
+        switch (channel)
+        {
+        case 0: return s.throttleRaw;
+        case 1: return s.throttleActual;
+        case 2: return s.brakeRaw;
+        default: return s.brakeActual;
+        }
+    }
 
+    // The points a pedal channel's line is drawn through, into 'keep';
+    // returns how many. Flat runs (a pedal resting at 0% or held at 100%)
+    // become one segment: a point equal to the points either side of it adds
+    // nothing.
+    int ThinTrace(const PedalTraceStore::Sample* samples, int count, int channel, int* keep)
+    {
+        int n = 0;
+        keep[n++] = 0;
+        int prev = 0;
         for (int i = 1; i < count; ++i)
         {
-            const float x1 = x0 + (i - 1) * dx;
-            const float x2 = x0 + i * dx;
-            const float y1 = yBottom - value(i - 1) * plotH;
-            const float y2 = yBottom - value(i) * plotH;
-            renderer.AddLineSmooth(x1, y1, x2, y2, thickness, r, g, b, a);
+            const float v = ChannelValue(samples[i], channel);
+            if (i < count - 1 && v == ChannelValue(samples[prev], channel)
+                && ChannelValue(samples[i + 1], channel) == v)
+                continue;
+            keep[n++] = i;
+            prev = i;
+        }
+        return n;
+    }
+
+    // Draws one pedal channel through its kept points.
+    //
+    // 'coverNext' (the post-electronics lines, while the panel is fully
+    // opaque): the raw line drawn later on top of this one, as the next kept
+    // point after each of its kept points (-1 elsewhere). Where that line has
+    // the very same segment -- the same two points at the same values, so the
+    // TC or ABS did nothing there -- its solid core is the identical quad at
+    // full alpha, which hides this line's core pixel for pixel. So only this
+    // line's soft edge is sent there, the halo pass of AddLineSmooth alone:
+    // the raw line's own edge is translucent and that one still shows
+    // through it. With no TC or ABS working that is every segment of both
+    // lines, half their vertices. (AddPolylineSmooth was not used instead: it is 18
+    // vertices a segment against AddLineSmooth's 12, and its mitred corners
+    // pinch the sharp spikes these lines are full of.)
+    void DrawTrace(Renderer& renderer, const PedalTraceStore::Sample* samples, const float* xs,
+                   const int* keep, int keepCount, float yBottom, float plotH, float thickness,
+                   float r, float g, float b, float a, int channel,
+                   const int* coverNext = nullptr, int coverChannel = 0)
+    {
+        for (int k = 1; k < keepCount; ++k)
+        {
+            const int prev = keep[k - 1];
+            const int i = keep[k];
+            const float v1 = ChannelValue(samples[prev], channel);
+            const float v2 = ChannelValue(samples[i], channel);
+            const float x1 = xs[prev];
+            const float x2 = xs[i];
+            const float y1 = yBottom - v1 * plotH;
+            const float y2 = yBottom - v2 * plotH;
+            const bool covered = coverNext && coverNext[prev] == i
+                && ChannelValue(samples[prev], coverChannel) == v1
+                && ChannelValue(samples[i], coverChannel) == v2;
+            if (covered)
+                renderer.AddLine(x1, y1, x2, y2, thickness + 2.0f, r, g, b, a * 0.33f);
+            else
+                renderer.AddLineSmooth(x1, y1, x2, y2, thickness, r, g, b, a);
         }
     }
 }
@@ -330,50 +389,64 @@ bool PedalTrace::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     if (!g_pedalConfig.enabled)
         return false;
 
-    // Static: render thread only, and too big to want on its stack twice.
-    static PedalTraceStore::Sample raw[PedalTraceStore::kHistory];
-    const int rawCount = g_pedalTrace.Read(raw, PedalTraceStore::kHistory);
+    // Not throttled (RenderThrottle) like the FFB graph: a scrolling trace
+    // replayed between rebuilds moves in uneven steps at 144 fps, which read
+    // as the lines jumping and flickering (tried in 26.11.22.5/.6).
+
+    // The render thread's own copy of the history, kept between frames so
+    // each frame copies under the telemetry lock only what is new (it used to
+    // copy all 1440 samples). Sample number n is at ring[n % kHistory].
+    static PedalTraceStore::Sample ring[PedalTraceStore::kHistory];
+    static long long s_total = 0;
+    const int rawCount = g_pedalTrace.ReadNew(ring, s_total);
+    const long long total = s_total;
     if (rawCount < 2)
         return false;
 
     const PedalConfig& cfg = g_pedalConfig;
 
-    // Thinned to about one point per PointSpacingPixels of plot width.
-    // 10 s at 144 Hz is 1440 samples -- more than the plot has pixels -- and
-    // five traces of two-pass smooth lines at that density came to ~65k
-    // vertices a frame, most of the DLL's whole render cost. Each kept point
-    // is the last sample of its bucket; lockup/spin take the bucket's peak,
-    // so a brief slip still shows.
+    // Thinned to about one point per PointSpacingPixels of plot width (10 s
+    // at 144 Hz is 1440 samples, more than the plot has pixels). Buckets are
+    // fixed to ABSOLUTE sample numbers and each point keeps its own sample's
+    // x, so a point keeps its shape as it scrolls left. Buckets counted back
+    // from the newest sample (as before 26.11.22.8) moved every boundary with
+    // each new sample and picked a different sample for every point, so the
+    // whole line's shape wobbled while it scrolled. Each point is the last
+    // sample of its bucket (plus the newest sample); lockup/spin take the
+    // bucket's peak so a brief slip still shows.
     static PedalTraceStore::Sample samples[PedalTraceStore::kHistory];
-    int count = rawCount;
+    static int rawIdx[PedalTraceStore::kHistory];
+    int count = 0;
+    int stride = 1;
     {
         const float plotW = screenWidth * cfg.widthFraction * cfg.scale;
         const float spacing = cfg.pointSpacingPx > 0.5f ? cfg.pointSpacingPx : 0.5f;
         const int maxPoints = (std::max)(2, static_cast<int>(plotW / spacing) + 1);
-        const int stride = (rawCount + maxPoints - 1) / maxPoints;
-        if (stride <= 1)
+        stride = (std::max)(1, (PedalTraceStore::kHistory + maxPoints - 1) / maxPoints);
+        // Raw sample i (0 = oldest held) is absolute number first + i, at
+        // ring[ri]; 'phase' is (first + i + 1) % stride, kept by counting
+        // rather than dividing for every sample.
+        const long long first = total - rawCount;
+        int ri = static_cast<int>(first % PedalTraceStore::kHistory);
+        int phase = static_cast<int>((first + 1) % stride);
+        PedalTraceStore::Sample acc = ring[ri];
+        for (int i = 0; i < rawCount; ++i)
         {
-            memcpy(samples, raw, sizeof(PedalTraceStore::Sample) * rawCount);
-        }
-        else
-        {
-            // Buckets end on the newest sample, so the right-hand edge is
-            // always current.
-            count = 0;
-            // The oldest bucket is the short one (rawCount % stride), so
-            // every other bucket -- and the newest point -- lines up.
-            const int firstLen = rawCount % stride != 0 ? rawCount % stride : stride;
-            for (int s = 0; s < rawCount; s = (s == 0 ? firstLen : s + stride))
-            {
-                const int e = (s == 0) ? firstLen : (std::min)(rawCount, s + stride);
-                PedalTraceStore::Sample out = raw[e - 1];
-                for (int i = s; i < e; ++i)
-                {
-                    if (raw[i].lockup > out.lockup) out.lockup = raw[i].lockup;
-                    if (raw[i].spin > out.spin) out.spin = raw[i].spin;
-                }
-                samples[count++] = out;
-            }
+            const PedalTraceStore::Sample& s = ring[ri];
+            const int next = (ri + 1 == PedalTraceStore::kHistory) ? 0 : ri + 1;
+            const bool bucketEnd = phase == 0 || i == rawCount - 1;
+            phase = (phase + 1 == stride) ? 0 : phase + 1;
+            ri = next;
+            if (s.lockup > acc.lockup) acc.lockup = s.lockup;
+            if (s.spin > acc.spin) acc.spin = s.spin;
+            if (!bucketEnd) continue;
+            PedalTraceStore::Sample out = s;
+            out.lockup = acc.lockup;
+            out.spin = acc.spin;
+            samples[count] = out;
+            rawIdx[count] = i;
+            ++count;
+            if (i + 1 < rawCount) acc = ring[next];
         }
         if (count < 2)
             return false;
@@ -465,7 +538,10 @@ bool PedalTrace::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                                 cfg.borderR, cfg.borderG, cfg.borderB, s_displayAlpha);
     }
 
-    const float dx = w / static_cast<float>(count - 1);
+    const float dxRaw = w / static_cast<float>(rawCount - 1);
+    const float dx = dxRaw * stride;   // width of one bucket, for the slip bars
+    static float xs[PedalTraceStore::kHistory];
+    for (int i = 0; i < count; ++i) xs[i] = x0 + rawIdx[i] * dxRaw;
     const float thickness = h * 0.035f > 2.0f ? h * 0.035f : 2.0f;
 
     // Lockup strip (top) and spin strip (just below it). Each bar grows
@@ -477,7 +553,7 @@ bool PedalTrace::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     const float spinFloorY = y0 + stripH * 1.92f;
     for (int i = 0; i < count; ++i)
     {
-        const float x = x0 + i * dx;
+        const float x = xs[i];
         if (samples[i].lockup > 0.0f)
         {
             const float halfH = maxBarHalfH * samples[i].lockup;
@@ -492,14 +568,33 @@ bool PedalTrace::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         }
     }
 
-    // Actual (post-electronics) underneath, raw input on top of it.
-    DrawTrace(renderer, samples, count, x0, yBottom, plotH, dx, thickness,
-              cfg.throttleActR, cfg.throttleActG, cfg.throttleActB, s_displayAlpha, 1);
-    DrawTrace(renderer, samples, count, x0, yBottom, plotH, dx, thickness,
-              cfg.brakeActR, cfg.brakeActG, cfg.brakeActB, s_displayAlpha, 3);
-    DrawTrace(renderer, samples, count, x0, yBottom, plotH, dx, thickness,
+    // Actual (post-electronics) underneath, raw input on top of it. The raw
+    // lines' points are worked out first, so the actual lines can leave out
+    // the core they would hide (see DrawTrace) -- only while the panel is
+    // fully opaque, since mid-fade the raw core no longer hides anything.
+    static int s_keep[4][PedalTraceStore::kHistory];
+    int keepCount[4];
+    for (int ch = 0; ch < 4; ++ch)
+        keepCount[ch] = ThinTrace(samples, count, ch, s_keep[ch]);
+    const bool opaque = s_displayAlpha >= 1.0f;
+    static int s_coverNext[2][PedalTraceStore::kHistory];
+    for (int p = 0; p < 2 && opaque; ++p)
+    {
+        const int rawCh = p * 2;   // 0 throttle, 2 brake
+        int* next = s_coverNext[p];
+        std::fill(next, next + count, -1);
+        for (int k = 1; k < keepCount[rawCh]; ++k)
+            next[s_keep[rawCh][k - 1]] = s_keep[rawCh][k];
+    }
+    DrawTrace(renderer, samples, xs, s_keep[1], keepCount[1], yBottom, plotH, thickness,
+              cfg.throttleActR, cfg.throttleActG, cfg.throttleActB, s_displayAlpha, 1,
+              opaque ? s_coverNext[0] : nullptr, 0);
+    DrawTrace(renderer, samples, xs, s_keep[3], keepCount[3], yBottom, plotH, thickness,
+              cfg.brakeActR, cfg.brakeActG, cfg.brakeActB, s_displayAlpha, 3,
+              opaque ? s_coverNext[1] : nullptr, 2);
+    DrawTrace(renderer, samples, xs, s_keep[0], keepCount[0], yBottom, plotH, thickness,
               cfg.throttleRawR, cfg.throttleRawG, cfg.throttleRawB, s_displayAlpha, 0);
-    DrawTrace(renderer, samples, count, x0, yBottom, plotH, dx, thickness,
+    DrawTrace(renderer, samples, xs, s_keep[2], keepCount[2], yBottom, plotH, thickness,
               cfg.brakeRawR, cfg.brakeRawG, cfg.brakeRawB, s_displayAlpha, 2);
 
     // Force feedback (replaced the steering line), bipolar (-1..1) across
@@ -508,8 +603,8 @@ bool PedalTrace::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     // line pinned to the top or bottom edge is clipping.
     for (int i = 1; i < count; ++i)
     {
-        const float x1 = x0 + (i - 1) * dx;
-        const float x2 = x0 + i * dx;
+        const float x1 = xs[i - 1];
+        const float x2 = xs[i];
         const float y1 = yBottom - (samples[i - 1].ffb * 0.5f + 0.5f) * plotH;
         const float y2 = yBottom - (samples[i].ffb * 0.5f + 0.5f) * plotH;
         renderer.AddLineSmooth(x1, y1, x2, y2, thickness, cfg.steeringR, cfg.steeringG, cfg.steeringB, s_displayAlpha);

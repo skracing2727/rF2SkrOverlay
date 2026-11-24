@@ -10,6 +10,7 @@
 #include "FrameLatency.h"
 #include "FrameRate.h"
 #include "PerfStats.h"
+#include "ReplayInfo.h"
 #include "AmdGpuPower.h"
 #include "GpuEngineUsage.h"
 #include "GearDisplay.h"
@@ -20,6 +21,7 @@
 #include "TyreSave.h"
 #include "EngineTemps.h"
 #include "FfbLevel.h"
+#include "Conditions.h"
 #include "BrakeCue.h"
 #include "MiniSector.h"
 #include "TyreTemps.h"
@@ -31,6 +33,7 @@
 #include "InputLagEstimate.h"
 #include "Config.h"
 #include "Version.h"
+#include "UpdateCheck.h"
 #include "Layout.h"
 #include "Log.h"
 #include "RenderThrottle.h"
@@ -178,22 +181,47 @@ namespace
         g_boundSwapChain = nullptr;
     }
 
-    // Binds device/context/renderer for this swapchain. The render target view is
-    // NOT cached here: with flip-model swapchains buffer 0 rotates every frame, so
-    // a cached RTV would point at the wrong texture. It is built per frame instead.
+    // Binds device/context/renderer for this swapchain.
+    //
+    // The render target view is NOT cached here, deliberately, though building
+    // it costs a few microseconds a frame. (Not because of buffer rotation: in
+    // D3D11 buffer 0 is always the current back buffer, flip model included.)
+    // A view holds a reference on the back buffer, and the back buffer keeps
+    // its swapchain alive: one held between frames would make the game's
+    // ResizeBuffers1 (not hooked) fail, and would keep a released swapchain
+    // alive behind the game's back -- with flip model, a window can't get a
+    // new swapchain while the old one lives. Built and released per frame,
+    // nothing of ours is ever held when the game touches its swapchain.
     bool BindTo(IDXGISwapChain* swapChain)
     {
         if (g_boundSwapChain == swapChain && g_rendererReady)
             return true;
 
-        ReleaseBinding();
-
         ID3D11Device* device = nullptr;
         if (FAILED(swapChain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&device))) || !device)
         {
+            ReleaseBinding();
             Log::Write("BindTo: swapchain %p is not a D3D11 device, skipping", swapChain);
             return false;
         }
+
+        // Same device, different (or just resized) swapchain: everything the
+        // renderer holds -- shaders, buffers, states, the glyph atlas --
+        // belongs to the device, not to the swapchain, so it all stays valid.
+        // Only the screen size changes, and BeginFrame takes that every frame.
+        // This used to tear the renderer down and rebuild it, recompiling the
+        // shaders and re-rasterizing the font: ~14 ms on the render thread on
+        // every resize. (Holding our reference on g_device rules out a new
+        // device that merely reuses the old one's address.)
+        if (g_rendererReady && device == g_device)
+        {
+            device->Release();   // we already hold one
+            g_boundSwapChain = swapChain;
+            Log::Write("BindTo: rebound to swapchain %p (same device %p) -- renderer kept", swapChain, g_device);
+            return true;
+        }
+
+        ReleaseBinding();
 
         device->GetImmediateContext(&g_context);
         g_device = device;
@@ -213,93 +241,42 @@ namespace
         return true;
     }
 
-    // Case-insensitive "does haystack contain needle" -- car class/name
-    // strings arrive in whatever case the mod/content author used.
-    bool ContainsCI(const char* haystack, const char* needle)
-    {
-        if (haystack[0] == '\0' || needle[0] == '\0')
-            return false;
-        const size_t hLen = strlen(haystack);
-        const size_t nLen = strlen(needle);
-        if (nLen > hLen)
-            return false;
-        for (size_t i = 0; i + nLen <= hLen; ++i)
-        {
-            size_t j = 0;
-            for (; j < nLen; ++j)
-            {
-                if (tolower(static_cast<unsigned char>(haystack[i + j])) != tolower(static_cast<unsigned char>(needle[j])))
-                    break;
-            }
-            if (j == nLen)
-                return true;
-        }
-        return false;
-    }
-
-    // Typical real footprint for a handful of recognisable categories,
-    // matched against the car's own VehicleScoringInfoV01 class and name.
-    // The SDK exposes no actual per-car dimension field, so this is not
-    // exact for any one specific car -- but it is a genuine improvement over
-    // one flat box shared by every car on a mixed grid (a BTCC-style touring
-    // car IS narrower and shorter than a GT3 car). Checked in order; the
-    // first match wins. A car matching none of these keeps the configured
-    // CarHalfWidthMeters/CarHalfLengthMeters/CarCornerRadiusMeters box,
-    // exactly as with RadarConfig::useRealCarSize turned off.
-    //
-    // Figures are half of a real published overall length/width for a
-    // representative car in each class (converted from mm), not invented:
-    //   GT3   -- Audi R8 LMS GT3 evo: 4600 x 1996mm
-    //   GTE   -- Porsche 911 RSR (2017): 4557 x 2045mm (axle-width figure)
-    //   LMP   -- Oreca 07 LMP2: 4745 x 1895mm (LMP1/LMP3 regs land within a
-    //            few cm of this too -- Toyota TS050 4650x1900, Ligier
-    //            JS P320 4605x1900 -- so one shared bucket stays accurate)
-    //   NASCAR (Cup) -- Next Gen car: 4912 x 1996mm
-    //   INDYCAR -- Dallara IR18, ~5080 x 2000mm (published figures for this
-    //            one are inconsistent between sources; used the wider,
-    //            more conservative reading)
-    // GT4/TCR/TOURING/BTCC/FORMULA/PROTOTYPE/TRUCK are class-typical
-    // approximations, not each individually sourced.
-    struct CarCategory { const char* keyword; float halfWidthM, halfLengthM, cornerRadiusM; };
-    const CarCategory kCarCategories[] =
-    {
-        { "GTE",       1.02f, 2.28f, 0.45f },  // ~2.05m x 4.56m
-        { "GT3",       1.00f, 2.30f, 0.45f },  // ~2.0m x 4.6m
-        { "GT4",       0.95f, 2.20f, 0.40f },  // ~1.9m x 4.4m
-        { "TCR",       0.90f, 2.15f, 0.40f },  // ~1.8m x 4.3m
-        { "TOURING",   0.90f, 2.15f, 0.40f },
-        { "BTCC",      0.90f, 2.15f, 0.40f },
-        { "TRUCK",     1.00f, 2.45f, 0.45f },  // NASCAR truck -- approximate, no verified source found
-        { "NASCAR",    1.00f, 2.45f, 0.45f },  // ~2.0m x 4.9m
-        { "DPI",       0.95f, 2.38f, 0.40f },  // ~1.9m x 4.75m
-        { "LMP",       0.95f, 2.37f, 0.40f },  // ~1.9m x 4.75m
-        { "PROTOTYPE", 0.95f, 2.37f, 0.40f },
-        { "INDYCAR",   1.00f, 2.54f, 0.35f },  // ~2.0m x 5.08m
-        { "IR18",      1.00f, 2.54f, 0.35f },
-        { "FORMULA",   0.90f, 2.50f, 0.30f },  // open-wheel: narrower, longer
-    };
-
-    void LookupCarFootprint(const RadarConfig& cfg, const char* vehClass, const char* vehName,
+    // Each car's box on the radar: its class's real footprint (matched once
+    // per car on the scoring thread; the table and its sources are in
+    // CarState.cpp), or the configured CarHalfWidthMeters/CarHalfLengthMeters/
+    // CarCornerRadiusMeters box when nothing matched or
+    // RadarConfig::useRealCarSize is off.
+    void LookupCarFootprint(const RadarConfig& cfg, int footprint,
                             float& outHalfWidthM, float& outHalfLengthM, float& outCornerRadiusM)
     {
         outHalfWidthM = cfg.carHalfWidthM;
         outHalfLengthM = cfg.carHalfLengthM;
         outCornerRadiusM = cfg.carCornerRadiusM;
-        if (cfg.useRealCarSize)
+        CarFootprint fp;
+        if (cfg.useRealCarSize && GetCarFootprint(footprint, fp))
         {
-            for (const CarCategory& cat : kCarCategories)
-            {
-                if (ContainsCI(vehClass, cat.keyword) || ContainsCI(vehName, cat.keyword))
-                {
-                    outHalfWidthM = cat.halfWidthM;
-                    outHalfLengthM = cat.halfLengthM;
-                    outCornerRadiusM = cat.cornerRadiusM;
-                    break;
-                }
-            }
+            outHalfWidthM = fp.halfWidthM;
+            outHalfLengthM = fp.halfLengthM;
+            outCornerRadiusM = fp.cornerRadiusM;
         }
         outHalfWidthM += cfg.footprintBufferMeters;
         outHalfLengthM += cfg.footprintBufferMeters;
+    }
+
+    // The interpolated car positions, read once per frame and shared by the
+    // radar and the side bars (they used to take a full read each, lock and
+    // all). Read lazily, so a frame with neither drawn does not read at all.
+    CarSnapshot g_frameCars;
+    bool g_frameCarsRead = false;
+
+    const CarSnapshot& FrameCars()
+    {
+        if (!g_frameCarsRead)
+        {
+            g_carState.Read(g_frameCars);
+            g_frameCarsRead = true;
+        }
+        return g_frameCars;
     }
 
     void DrawRadar(int screenWidth, int screenHeight)
@@ -307,10 +284,11 @@ namespace
         if (!g_radarConfig.enabled)
             return;
 
-        CarPos cars[128];
-        double playerHeading = 0.0;
-        bool hasPlayer = false;
-        const int count = g_carState.Read(cars, 128, playerHeading, hasPlayer);
+        const CarSnapshot& snap = FrameCars();
+        const CarPos* cars = snap.cars;
+        const double playerHeading = snap.playerHeading;
+        const bool hasPlayer = snap.hasPlayer;
+        const int count = snap.count;
 
         if (count == 0 || !hasPlayer)
             return; // not on track -- draw nothing rather than covering menus
@@ -454,7 +432,7 @@ namespace
             blips[blipCount].rot = static_cast<float>(playerHeading - cars[i].heading);
             blips[blipCount].alpha = static_cast<float>(alpha);
             blips[blipCount].danger = inLongitudinalWindow && lateralOverlap;
-            LookupCarFootprint(cfg, cars[i].vehicleClass, cars[i].vehicleName,
+            LookupCarFootprint(cfg, cars[i].footprint,
                                blips[blipCount].halfWm, blips[blipCount].halfLm, blips[blipCount].cornerRm);
 
             if (logThisFrame)
@@ -538,7 +516,7 @@ namespace
         // Player: green, centred. Matches the nearest car's opacity so the
         // whole radar fades up and away as one, instead of the marker popping.
         float playerHalfWm, playerHalfLm, playerCornerRm;
-        LookupCarFootprint(cfg, player->vehicleClass, player->vehicleName,
+        LookupCarFootprint(cfg, player->footprint,
                            playerHalfWm, playerHalfLm, playerCornerRm);
         g_renderer.AddFilledRoundedRect(centerX, centerY,
                                         playerHalfWm * scale, playerHalfLm * scale, playerCornerRm * scale, 0.0f,
@@ -718,6 +696,24 @@ namespace
     // Wall-clock time of day, top right. Styled to match the frametime stats
     // (same font colour and translucent plate) so the two read as one family
     // of "information about the machine, not the car".
+    // When GitHub has a newer release (UpdateCheck.h): one message in the
+    // shortcuts' message box, once per game start, the first time the
+    // player is out of the car after the answer came in. Never while driving.
+    void ShowUpdateNotice()
+    {
+        static bool s_shown = false;
+        if (s_shown || g_inRealtime.load(std::memory_order_relaxed))
+            return;
+        char latest[32];
+        if (!UpdateCheck::NewerAvailable(latest, sizeof(latest)))
+            return;
+        s_shown = true;
+        char line[160];
+        sprintf_s(line, "Plugin update available: %s (you have %s) - github.com/skracing2727/rF2SkrOverlay/releases",
+                  latest, RF2RO_VERSION);
+        Shortcuts::ShowMessage(line, 15.0);
+    }
+
     void DrawClock(int screenWidth, int screenHeight)
     {
         const ClockConfig& cfg = g_clockConfig;
@@ -793,7 +789,13 @@ namespace
         static char s_cpuBuf[32] = "";
         static char s_gpuBuf[32] = "";
         static char s_ramBuf[32] = "";
-        static char s_vramBuf[48] = "";
+        static char s_vramBuf[64] = "";
+        static char s_pluginRamBuf[32] = "";
+        static char s_pcRamBuf[64] = "";
+        static char s_replayBuf[48] = "";
+        static bool s_haveReplay = false;
+        static float s_replayR = 1.0f, s_replayG = 1.0f, s_replayB = 1.0f;
+        static bool s_havePluginRam = false, s_havePcRam = false;
         static char s_gpuPowerBuf[32] = "";
         static bool s_haveFps = false, s_haveLatency = false;
         static bool s_haveInputLag = false;
@@ -902,8 +904,8 @@ namespace
             // Extra diagnostic stats -- polled here at the same refresh
             // cadence as everything else above (see PerfStats.h for why
             // this shouldn't run every frame).
-            PerfStats::Poll();
-            GpuEngineUsage::Poll();
+            // (RAM / VRAM / GPU counters / AMD power are polled on their
+            // own thread now -- see PerfStats::StartPoller.)
 
             char valBuf2[16], valBuf3[16];
 
@@ -959,7 +961,7 @@ namespace
                 if (PerfStats::GetProcessRamMB(ramMB))
                 {
                     FormatSigFigs(ramMB, 4, valBuf, sizeof(valBuf));
-                    sprintf_s(s_ramBuf, "RAM %s MB", valBuf);
+                    sprintf_s(s_ramBuf, "rF2 RAM %s MB", valBuf);
                     s_haveRam = true;
                 }
             }
@@ -968,12 +970,89 @@ namespace
             if (cfg.showVram)
             {
                 double vramUsedMB = 0.0, vramBudgetMB = 0.0;
-                if (PerfStats::GetVramMB(vramUsedMB, vramBudgetMB))
+                double cardUsedMB = 0.0, cardTotalMB = 0.0;
+                const bool haveGame = PerfStats::GetVramMB(vramUsedMB, vramBudgetMB);
+                if (haveGame && PerfStats::GetCardVramMB(cardUsedMB, cardTotalMB))
                 {
-                    FormatSigFigs(vramUsedMB, 4, valBuf, sizeof(valBuf));
-                    FormatSigFigs(vramBudgetMB, 4, valBuf2, sizeof(valBuf2));
-                    sprintf_s(s_vramBuf, "VRAM %s/%s MB", valBuf, valBuf2);
+                    // Like RTSS: the whole card's use (every process), rF2's
+                    // own share, and the card's size minus that use.
+                    const double freeMB = cardTotalMB > cardUsedMB ? cardTotalMB - cardUsedMB : 0.0;
+                    sprintf_s(s_vramBuf, "VRAM %.1f used, rF2 %.1f, %.1f free GB",
+                              cardUsedMB / 1024.0, vramUsedMB / 1024.0, freeMB / 1024.0);
                     s_haveVram = true;
+                }
+                else if (haveGame)
+                {
+                    // No whole-card counter: rF2's use and what is left of
+                    // the budget Windows gives it.
+                    const double freeMB = vramBudgetMB > vramUsedMB ? vramBudgetMB - vramUsedMB : 0.0;
+                    sprintf_s(s_vramBuf, "VRAM rF2 %.1f, %.1f free GB", vramUsedMB / 1024.0, freeMB / 1024.0);
+                    s_haveVram = true;
+                }
+            }
+
+            s_havePluginRam = false;
+            if (cfg.showPluginRam)
+            {
+                double mb = 0.0;
+                if (PerfStats::GetPluginRamMB(mb))
+                {
+                    sprintf_s(s_pluginRamBuf, "HUD RAM %.1f MB", mb);
+                    s_havePluginRam = true;
+                }
+            }
+
+            s_havePcRam = false;
+            if (cfg.showPcRam)
+            {
+                double usedMB = 0.0, totalMB = 0.0;
+                if (PerfStats::GetPcRamMB(usedMB, totalMB))
+                {
+                    // The whole PC's RAM in use, the game's share of it
+                    // (its working set), and what is still free.
+                    double gameMB = 0.0;
+                    const bool haveGame = PerfStats::GetProcessRamMB(gameMB);
+                    const double freeMB = totalMB > usedMB ? totalMB - usedMB : 0.0;
+                    if (haveGame)
+                        sprintf_s(s_pcRamBuf, "RAM %.1f used, rF2 %.1f, %.1f free GB",
+                                  usedMB / 1024.0, gameMB / 1024.0, freeMB / 1024.0);
+                    else
+                        sprintf_s(s_pcRamBuf, "RAM %.1f used, %.1f free GB", usedMB / 1024.0, freeMB / 1024.0);
+                    s_havePcRam = true;
+                }
+            }
+
+            // The game's replay recording (ReplayInfo.h), polled on the
+            // stats thread. Amber from 1.5 GB, red from 1.9 GB: a recording
+            // file that reached 2 GB was seen to stop there and the session's
+            // replay was never saved.
+            s_haveReplay = false;
+            if (cfg.showReplay)
+            {
+                const ReplayInfo::State rp = ReplayInfo::Get();
+                if (rp.known)
+                {
+                    char fid[24];
+                    const char* name = ReplayInfo::FidelityName(rp.fidelity);
+                    if (name) sprintf_s(fid, "%s fidelity", name);
+                    else if (rp.fidelity >= 0) sprintf_s(fid, "fidelity %d", rp.fidelity);
+                    else strcpy_s(fid, "fidelity ?");
+                    s_replayR = cfg.colorR; s_replayG = cfg.colorG; s_replayB = cfg.colorB;
+                    if (!rp.recording)
+                        strcpy_s(s_replayBuf, "Replay off");
+                    else if (rp.toMemory)
+                        sprintf_s(s_replayBuf, "Replay RAM, %s", fid);
+                    else if (!rp.haveFile)
+                        sprintf_s(s_replayBuf, "Replay disk, %s", fid);
+                    else
+                    {
+                        const double gb = rp.fileMB / 1024.0;
+                        if (gb >= 1.0) sprintf_s(s_replayBuf, "Replay disk %.2f GB, %s", gb, fid);
+                        else sprintf_s(s_replayBuf, "Replay disk %.0f MB, %s", rp.fileMB, fid);
+                        if (gb >= 1.9) { s_replayR = 1.0f; s_replayG = 0.25f; s_replayB = 0.2f; }
+                        else if (gb >= 1.5) { s_replayR = 1.0f; s_replayG = 0.7f; s_replayB = 0.15f; }
+                    }
+                    s_haveReplay = true;
                 }
             }
 
@@ -993,7 +1072,8 @@ namespace
         }
 
         if (!s_haveFps && !(s_haveLatency && cfg.showDisplayLatency) && !s_haveInputLag
-            && !s_haveFpsRange && !s_haveCpu && !s_haveGpu && !s_haveRam && !s_haveVram && !s_haveGpuPower)
+            && !s_haveFpsRange && !s_haveCpu && !s_haveGpu && !s_haveRam && !s_haveVram && !s_haveGpuPower
+            && !s_havePluginRam && !s_havePcRam && !s_haveReplay)
             return;
 
         // Colors (and the flash animation) are recomputed every frame even
@@ -1004,7 +1084,7 @@ namespace
         // StatSegment's comment), so the box's width and every segment's
         // position stay put regardless of which vsync phrase, digit count,
         // etc. actually shows this frame.
-        StatSegment segs[10];
+        StatSegment segs[16];   // one per stat below, with room to spare
         int segCount = 0;
         // Which stats appear is chosen in the INI ([FrameLatency] Show* keys),
         // in this fixed order. Each has a fixed-width slot (widthRef) so the
@@ -1021,9 +1101,12 @@ namespace
         if (s_haveLatency && cfg.showDisplayLatency) segs[segCount++] = { s_latencyBuf, cfg.colorR, cfg.colorG, cfg.colorB,
             s_latencyIsFallback ? nullptr : "Display Latency >100 ms" };
         if (s_haveInputLag) segs[segCount++] = { s_inputLagBuf, cfg.colorR, cfg.colorG, cfg.colorB, "Input Lag (est) 99 ms" };
-        if (s_haveRam) segs[segCount++] = { s_ramBuf, cfg.colorR, cfg.colorG, cfg.colorB, "RAM 9999 MB" };
-        if (s_haveVram) segs[segCount++] = { s_vramBuf, cfg.colorR, cfg.colorG, cfg.colorB, "VRAM 9999/9999 MB" };
+        if (s_havePluginRam) segs[segCount++] = { s_pluginRamBuf, cfg.colorR, cfg.colorG, cfg.colorB, "HUD RAM 999.9 MB" };
+        if (s_haveRam) segs[segCount++] = { s_ramBuf, cfg.colorR, cfg.colorG, cfg.colorB, "rF2 RAM 99999 MB" };
+        if (s_havePcRam) segs[segCount++] = { s_pcRamBuf, cfg.colorR, cfg.colorG, cfg.colorB, "RAM 99.9 used, rF2 99.9, 99.9 free GB" };
+        if (s_haveVram) segs[segCount++] = { s_vramBuf, cfg.colorR, cfg.colorG, cfg.colorB, "VRAM 99.9 used, rF2 99.9, 99.9 free GB" };
         if (s_haveGpuPower) segs[segCount++] = { s_gpuPowerBuf, cfg.colorR, cfg.colorG, cfg.colorB, "GPU 999 W" };
+        if (s_haveReplay) segs[segCount++] = { s_replayBuf, s_replayR, s_replayG, s_replayB, "Replay disk 9.99 GB, Medium fidelity" };
 
         // cfg.scale is the layout-mode corner-handle multiplier. Folded in
         // HERE rather than applied to the drawn box, so every pixel value
@@ -1124,8 +1207,10 @@ namespace
         if (!BindTo(swapChain))
             return;
         if (trace) Log::Write("  step 2: bound OK");
+        g_frameCarsRead = false;   // a fresh car snapshot for this frame (FrameCars)
 
-        // Fresh RTV every frame -- correct for both bitblt and flip swap models.
+        // Fresh RTV every frame, released at the end of it -- see BindTo for
+        // why it is not kept between frames.
         ID3D11Texture2D* backBuffer = nullptr;
         if (FAILED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backBuffer))) || !backBuffer)
             return;
@@ -1155,11 +1240,29 @@ namespace
         // monitor and menus still fire UpdateTelemetry/UpdateScoring with
         // stale or placeholder data (e.g. gear "N", speed 0) that would
         // otherwise show up over the monitor/UI screens.
+        //
+        // Timed separately, so the spike log can say which of them it was
+        // (all three used to share one "Shortcuts" entry).
         {
-            PROF("Shortcuts");
+            PROF("Shortcuts poll");
             Shortcuts::Poll();
+        }
+        {
+            PROF("Car layout");
             CarLayout::Poll(); // after Shortcuts::Poll: needs the toggles loaded
+        }
+        {
+            PROF("Shortcuts poll");
             Shortcuts::NoteRealtime(g_inRealtime);
+        }
+
+        // Display latency (GetFrameStatistics, after the real Present) is
+        // only measured while something shows it: the perf line with Display
+        // Latency or the Input Lag estimate (which needs it) switched on.
+        {
+            const FrameLatencyConfig& fl = g_frameLatencyConfig;
+            FrameLatency::SetWanted(Shortcuts::OverlayEnabled() && Shortcuts::Visible(Shortcuts::Perf) && fl.enabled
+                                    && (fl.showDisplayLatency || fl.showInputLagEstimate));
         }
 
         // Diagnostics are driven from HERE, the one path known to run during
@@ -1191,7 +1294,7 @@ namespace
             // mode is deliberately used FROM THE COCKPIT (see Layout.cpp),
             // not from the monitor/garage. Out of the car, only the perf
             // overlay below stays up, as the one "the plugin is alive" sign.
-            if (g_inRealtime)
+            if (g_inRealtime || Shortcuts::AlwaysOn() || Shortcuts::ListOpen())
             {
                 // Each panel timed for the DLL-cost panel (Profiler.h).
                 // Cover boxes first: they hide the car's own display, and
@@ -1201,7 +1304,7 @@ namespace
                 if (Shortcuts::Visible(Shortcuts::Radar))
                     { DRAWN("Radar"); DrawRadar(sw, sh); }
                 if (Shortcuts::Visible(Shortcuts::SideBar))
-                    { DRAWN("Side bars"); g_proximityHue.Draw(g_renderer, sw, sh, desc.OutputWindow); }
+                    { DRAWN("Side bars"); g_proximityHue.Draw(g_renderer, sw, sh, desc.OutputWindow, FrameCars()); }
                 if (Shortcuts::Visible(Shortcuts::PedalTrace))
                     { DRAWN("Pedal trace"); PedalTrace::Draw(g_renderer, sw, sh); }
                 if (Shortcuts::Visible(Shortcuts::Gear))
@@ -1225,12 +1328,16 @@ namespace
                 }
                 if (Shortcuts::Visible(Shortcuts::RelativeTiming))
                     { DRAWN("Relative"); RelativeTiming::Draw(g_renderer, sw, sh); }
-                if (Shortcuts::Visible(Shortcuts::FuelTyre))
-                    { DRAWN("Fuel + tyres"); FuelTyrePanel::Draw(g_renderer, sw, sh); }
+                { DRAWN("Gap box"); RelativeTiming::DrawGapBox(g_renderer, sw, sh); }
+                // No master switch: the fuel, tyres and brake bias boxes each
+                // have their own row. The old "Fuel + tyres" row hid all three
+                // together, which read as the separate rows not working.
+                { DRAWN("Fuel + tyres"); FuelTyrePanel::Draw(g_renderer, sw, sh); }
                 { DRAWN("Fuel save"); FuelSave::Draw(g_renderer, sw, sh); }
                 { DRAWN("Tyre target"); TyreSave::Draw(g_renderer, sw, sh); }
                 { DRAWN("Engine temps"); EngineTemps::Draw(g_renderer, sw, sh); }
                 { DRAWN("FFB strength"); FfbLevel::Draw(g_renderer, sw, sh); }
+                { DRAWN("Track conditions"); Conditions::Draw(g_renderer, sw, sh); }
                 if (Shortcuts::Visible(Shortcuts::BrakeCue))
                     { DRAWN("Brake cue"); BrakeCue::Draw(g_renderer, sw, sh); }
             }
@@ -1239,6 +1346,8 @@ namespace
                 { DRAWN("Frametime stats"); DrawPerfOverlay(sw, sh); }
             if (Shortcuts::Visible(Shortcuts::Clock))
                 { DRAWN("Clock"); DrawClock(sw, sh); }
+            // Not timed: it only hands one message to the toast, once.
+            ShowUpdateNotice();
             // Times itself (as "DLL cost panel").
             if (Shortcuts::Visible(Shortcuts::DllCost))
                 Profiler::Draw(g_renderer, sw, sh);
@@ -1251,7 +1360,10 @@ namespace
             Layout::Draw(g_renderer, sw, sh, g_inRealtime);
         }
 
-        { PROF("Shortcuts"); Shortcuts::Draw(g_renderer, sw, sh, desc.OutputWindow); }
+        // The knob bar, rotary lists and messages are temporary boxes: above
+        // every panel's text as well as its shapes.
+        g_renderer.BeginTopLayer();
+        { PROF("Shortcuts draw"); Shortcuts::Draw(g_renderer, sw, sh, desc.OutputWindow); }
         // Every panel above only queues geometry; this is where it is all
         // uploaded and drawn (timed inside, upload and draw separately).
         LogPanelVertices();
@@ -1331,8 +1443,9 @@ namespace
 {
     void OnResizeBody()
     {
-        // RTVs are per-frame now, so nothing of ours holds a buffer reference
-        // here. Just drop the cached binding so it re-derives after the resize.
+        // RTVs are per-frame, so nothing of ours holds a buffer reference
+        // here. Just drop the cached binding so it re-derives after the
+        // resize -- cheap now: on the same device BindTo keeps the renderer.
         Log::Write("OnResize: dropping cached binding");
         g_boundSwapChain = nullptr;
     }
@@ -1379,4 +1492,9 @@ void Overlay::OnResize()
 ID3D11DeviceContext* Overlay::GetContext()
 {
     return g_context;
+}
+
+bool Overlay::IsMainSwapChain(IDXGISwapChain* swapChain)
+{
+    return g_boundSwapChain == nullptr || g_boundSwapChain == swapChain;
 }

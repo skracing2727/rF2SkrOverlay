@@ -5,10 +5,18 @@
 #include "Config.h"
 #include "Layout.h"
 #include "Log.h"
+#include "Persist.h"
+#include "RenderThrottle.h"
+#include "StoreFile.h"
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 
+// Draw runs on the render thread, so it never opens the profile file itself:
+// loading and saving are handed to the save thread (TyreSave::FlushIfDirty,
+// run by Persist.cpp) and the result picked up on a later frame -- the same
+// hand-over as FuelSave.cpp.
 namespace
 {
     const int kBins = 50;
@@ -26,31 +34,100 @@ namespace
     double s_target[4] = { -1, -1, -1, -1 };          // required wear %/lap, this lap
     double s_lastLap[4] = { -1, -1, -1, -1 };         // last lap's wear %
     double s_lastLapTarget[4] = { -1, -1, -1, -1 };   // what was required on that lap
+    double s_wearSum[4] = {};             // this set: summed wear % of completed laps
+    int s_wearLaps[4] = {};               //            and how many laps
     double s_setSeconds = 0.0;            // driving time on this set, completed laps
     double s_lastLapTime = 0.0;
 
-    void LoadProfile()
+    // Hand-over between Draw (render thread) and FlushIfDirty (save thread).
+    // s_ioLock is only ever held to copy these, never across file I/O.
+    SRWLOCK s_ioLock = SRWLOCK_INIT;
+    struct ProfileIo
+    {
+        bool saveDirty = false;               // a learned profile is waiting to be written
+        char savePath[MAX_PATH] = "";
+        float save[4][kBins + 1] = {};
+        bool loadPending = false;             // Draw wants loadPath read
+        char loadPath[MAX_PATH] = "";
+        bool loadDone = false;                // read: result below, for loadPath
+        bool loadOk = false;
+        float loaded[4][kBins + 1] = {};
+    } s_io;
+    std::atomic<bool> s_loadReady{ false };      // loadDone, checked without the lock
+    bool s_loadWaiting = false;                  // render thread: s_profilePath's file not applied yet
+
+    // Render thread: a new car+track's profile (s_profilePath already set).
+    // Until it arrives each tyre's share is the plain distance fraction,
+    // exactly as for a car+track with no profile yet.
+    void RequestLoad()
     {
         for (int w = 0; w < 4; ++w) s_haveProfile[w] = false;
-        FILE* f = nullptr;
-        if (fopen_s(&f, s_profilePath, "r") != 0 || !f) return;
-        int n = 0;
-        for (; n <= kBins; ++n)
-            if (fscanf_s(f, "%f %f %f %f", &s_profile[0][n], &s_profile[1][n], &s_profile[2][n], &s_profile[3][n]) != 4) break;
-        fclose(f);
-        if (n == kBins + 1)
-            for (int w = 0; w < 4; ++w) s_haveProfile[w] = true;
+        s_loadWaiting = true;
+        AcquireSRWLockExclusive(&s_ioLock);
+        strcpy_s(s_io.loadPath, s_profilePath);
+        s_io.loadPending = true;
+        s_io.loadDone = false;
+        s_loadReady.store(false);
+        ReleaseSRWLockExclusive(&s_ioLock);
+        Persist::RequestLearned();
     }
 
-    void SaveProfile()
+    // Render thread, each frame while a load is outstanding.
+    void ApplyLoadIfReady()
+    {
+        if (!s_loadWaiting || !s_loadReady.load())
+            return;
+        AcquireSRWLockExclusive(&s_ioLock);
+        const bool mine = s_io.loadDone && strcmp(s_io.loadPath, s_profilePath) == 0;
+        if (mine)
+        {
+            if (s_io.loadOk)
+                memcpy(s_profile, s_io.loaded, sizeof(s_profile));
+            for (int w = 0; w < 4; ++w) s_haveProfile[w] = s_io.loadOk;
+        }
+        s_io.loadDone = false;
+        s_loadReady.store(false);
+        ReleaseSRWLockExclusive(&s_ioLock);
+        if (mine)
+            s_loadWaiting = false;
+    }
+
+    // Render thread, after learning a lap: written by the next save pass.
+    void QueueSave()
     {
         if (!s_profilePath[0]) return;
         for (int w = 0; w < 4; ++w) if (!s_haveProfile[w]) return;
+        AcquireSRWLockExclusive(&s_ioLock);
+        strcpy_s(s_io.savePath, s_profilePath);
+        memcpy(s_io.save, s_profile, sizeof(s_io.save));
+        s_io.saveDirty = true;
+        ReleaseSRWLockExclusive(&s_ioLock);
+        // Learned at the line, but a frame or more after the line's own
+        // save request may already have been served.
+        Persist::RequestLearned();
+    }
+
+    // Save thread only.
+    bool ReadProfile(const char* path, float out[4][kBins + 1])
+    {
         FILE* f = nullptr;
-        if (fopen_s(&f, s_profilePath, "w") != 0 || !f) { Log::Write("TyreSave: cannot write %s", s_profilePath); return; }
-        for (int i = 0; i <= kBins; ++i)
-            fprintf(f, "%.5f %.5f %.5f %.5f\n", s_profile[0][i], s_profile[1][i], s_profile[2][i], s_profile[3][i]);
+        if (!path[0] || fopen_s(&f, path, "r") != 0 || !f) return false;
+        int n = 0;
+        for (; n <= kBins; ++n)
+            if (fscanf_s(f, "%f %f %f %f", &out[0][n], &out[1][n], &out[2][n], &out[3][n]) != 4) break;
         fclose(f);
+        return n == kBins + 1;
+    }
+
+    void WriteProfile(const char* path, const float profile[4][kBins + 1])
+    {
+        char tmp[StoreFile::kTmpPathSize];
+        FILE* f = StoreFile::Begin(path, tmp, sizeof(tmp), "w");
+        if (!f) { Log::Write("TyreSave: cannot write %s", path); return; }
+        for (int i = 0; i <= kBins; ++i)
+            fprintf(f, "%.5f %.5f %.5f %.5f\n", profile[0][i], profile[1][i], profile[2][i], profile[3][i]);
+        if (!StoreFile::Commit(f, tmp, path))
+            Log::Write("TyreSave: cannot write %s", path);
     }
 
     void LearnLap(int w, double lapTotal)
@@ -109,7 +186,7 @@ namespace
     void NewSet()
     {
         s_setSeconds = 0.0;
-        for (int w = 0; w < 4; ++w) { s_target[w] = -1.0; s_lastLap[w] = -1.0; s_lastLapTarget[w] = -1.0; }
+        for (int w = 0; w < 4; ++w) { s_target[w] = -1.0; s_lastLap[w] = -1.0; s_lastLapTarget[w] = -1.0; s_wearSum[w] = 0.0; s_wearLaps[w] = 0; }
         s_lapClean = false;
         Log::Write("TyreSave: fresh tyres, set clock restarted");
     }
@@ -133,15 +210,68 @@ namespace
     }
 }
 
+void TyreSave::FlushIfDirty()
+{
+    // Save thread, any time (see Persist.cpp): copy out under s_ioLock,
+    // touch the disk after letting go. Writes before reading, so a profile
+    // saved and then asked for again comes back as saved.
+    bool doSave = false, doLoad = false;
+    char savePath[MAX_PATH] = "", loadPath[MAX_PATH] = "";
+    float save[4][kBins + 1];
+    AcquireSRWLockExclusive(&s_ioLock);
+    if (s_io.saveDirty)
+    {
+        strcpy_s(savePath, s_io.savePath);
+        memcpy(save, s_io.save, sizeof(save));
+        s_io.saveDirty = false;
+        doSave = true;
+    }
+    if (s_io.loadPending)
+    {
+        strcpy_s(loadPath, s_io.loadPath);
+        s_io.loadPending = false;
+        doLoad = true;
+    }
+    ReleaseSRWLockExclusive(&s_ioLock);
+
+    if (doSave)
+        WriteProfile(savePath, save);
+    if (doLoad)
+    {
+        float loaded[4][kBins + 1] = {};
+        const bool ok = ReadProfile(loadPath, loaded);
+        AcquireSRWLockExclusive(&s_ioLock);
+        // Dropped if Draw has asked for another file in the meantime.
+        if (!s_io.loadPending && strcmp(s_io.loadPath, loadPath) == 0)
+        {
+            memcpy(s_io.loaded, loaded, sizeof(s_io.loaded));
+            s_io.loadOk = ok;
+            s_io.loadDone = true;
+            s_loadReady.store(true);
+        }
+        ReleaseSRWLockExclusive(&s_ioLock);
+    }
+}
+
 bool TyreSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
 {
     TyreSaveConfig& cfg = g_tyreSaveConfig;
     if (!cfg.enabled || cfg.targetMinutes <= 0.0f)
         return false;
 
+    // Medium tier (~25Hz): the box tint is eased over 1.5 s and the numbers
+    // change once a lap, the set clock adds up real elapsed time between
+    // updates (so it does not care how often they come), and the lap
+    // bookkeeping only needs a sample per 1/50th of a lap. Bypassed in
+    // layout mode so dragging/resizing stays smooth.
+    static RenderThrottle s_throttle(0.04);
+    if (!Layout::Active() && s_throttle.TryReplay(renderer))
+        return true;
+    RenderThrottle::Capture throttleCapture(s_throttle, renderer);
+
     const FuelStore::State fuel = g_fuelStore.Read();
     const TyreWearStore::State tyres = g_tyreWear.Read();
-    const bool placeholder = Layout::Active();
+    const bool placeholder = Layout::Preview();
     const bool live = fuel.valid && tyres.valid;
     if (!live && !placeholder)
         return false;
@@ -163,10 +293,11 @@ bool TyreSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
             char* dot = strstr(s_profilePath, "_profile.txt");
             if (dot) strcpy_s(dot, sizeof(s_profilePath) - (dot - s_profilePath), "_tyreprofile.txt");
             else s_profilePath[0] = 0;
-            LoadProfile();
+            RequestLoad();
             s_lap = -1;
             NewSet();
         }
+        ApplyLoadIfReady();
 
         // Fresh tyres (any wheel's remaining life jumps up): new set.
         bool fresh = false;
@@ -186,20 +317,23 @@ bool TyreSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         {
             if (s_lap >= 0 && fuel.telemLapNumber == s_lap + 1 && s_wornAtLapStart[0] >= 0.0)
             {
-                if (lapTime > 5.0) s_setSeconds += lapTime;
                 bool learned = false;
                 for (int w = 0; w < 4; ++w)
                 {
                     const double used = worn[w] - s_wornAtLapStart[w];
                     if (used <= 0.0) continue;
+                    s_wearSum[w] += used;
+                    ++s_wearLaps[w];
                     if (s_target[w] > 0.0)
                     {
                         s_lastLap[w] = used;
                         s_lastLapTarget[w] = s_target[w];
                     }
-                    if (s_lapClean) { LearnLap(w, used); learned = true; }
+                    // Not while the saved profile is still on its way in:
+                    // learning onto "none yet" would overwrite it.
+                    if (s_lapClean && !s_loadWaiting) { LearnLap(w, used); learned = true; }
                 }
-                if (learned) SaveProfile();
+                if (learned) QueueSave();
             }
             s_lap = fuel.telemLapNumber;
             for (int w = 0; w < 4; ++w) s_wornAtLapStart[w] = worn[w];
@@ -221,6 +355,27 @@ bool TyreSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
             }
         }
 
+        // Set clock: only time actually driven on track (lap progress moving,
+        // not in the pits). Adding whole lap times instead counted any garage
+        // or pit-lane wait inside a lap, which could add hours.
+        {
+            static LARGE_INTEGER s_clkPrev = {};
+            static double s_lastProgress = -1.0;
+            LARGE_INTEGER q, qf;
+            QueryPerformanceCounter(&q);
+            QueryPerformanceFrequency(&qf);
+            double cdt = s_clkPrev.QuadPart ? static_cast<double>(q.QuadPart - s_clkPrev.QuadPart) / qf.QuadPart : 0.0;
+            s_clkPrev = q;
+            const bool moving = s_lastProgress >= 0.0 && fuel.currentLapFractional != s_lastProgress;
+            s_lastProgress = fuel.currentLapFractional;
+            // Lap progress arrives at ~5 Hz: keep counting through the frames
+            // between updates, but stop once it has stalled for 1 s.
+            static double s_stall = 0.0;
+            s_stall = moving ? 0.0 : s_stall + (cdt > 0.0 && cdt < 0.5 ? cdt : 1.0);
+            if (cdt > 0.0 && cdt < 0.5 && !fuel.inPits && s_stall < 1.0)
+                s_setSeconds += cdt;
+        }
+
         if (fuel.inPits) s_lapClean = false;
         const int bin = static_cast<int>(lapFrac * kBins);
         if (bin > 0 && bin < kBins)
@@ -231,11 +386,15 @@ bool TyreSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
 
     // Geometry (2160p reference): 2x2 boxes in car order, a header above.
     const float s = static_cast<float>(screenHeight) / 2160.0f * (cfg.scale > 0.05f ? cfg.scale : 0.05f);
-    const float boxHalfW = 120.0f * s;
-    const float boxHalfH = 46.0f * s;
     const float gap = 10.0f * s;
     const float textPx = 34.0f * s;
-    const float headPx = 28.0f * s;
+    const float headPx = 40.0f * s;
+    const float cornerPx = 36.0f * s;   // % and laps left, 50% bigger than the old 24
+    const float inset = 6.0f * s;
+    // Sized to the content, no dead space (2026-11-23): the corner line plus
+    // the three lines stacked tight, and as wide as the widest corner text.
+    const float boxHalfW = renderer.MeasureText("100% 99 laps", cornerPx) * 0.5f + 2.0f * inset;
+    const float boxHalfH = (cornerPx + 3.0f * textPx) * 0.5f + inset;
     const float cx = screenWidth * cfg.centerXFraction;
     const float cy = screenHeight * cfg.centerYFraction;
     const float totalHalfW = 2.0f * boxHalfW + gap * 0.5f;
@@ -250,7 +409,7 @@ bool TyreSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     // Header: target and how far into the set's time.
     const float top = cy - totalHalfH;
     {
-        const double setNow = s_setSeconds + (lapTime > 5.0 ? lapFrac * lapTime : 0.0);
+        const double setNow = s_setSeconds;
         const int a = static_cast<int>(setNow), b = static_cast<int>(cfg.targetMinutes * 60.0f + 0.5f);
         char head[96];
         sprintf_s(head, "TYRES  max %.0f%%  |  %d:%02d / %d:%02d", cfg.targetWearPercent, a / 60, a % 60, b / 60, b % 60);
@@ -267,7 +426,6 @@ bool TyreSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     s_prevQpc = now;
     if (dt < 0.0 || dt > 1.0) dt = 1.0;
 
-    const char* const names[4] = { "FL", "FR", "RL", "RR" };
     const float gridTop = top + headPx + gap;
     for (int w = 0; w < 4; ++w)
     {
@@ -290,10 +448,10 @@ bool TyreSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         renderer.AddFilledRoundedRect(bx, by, boxHalfW, boxHalfH, 8.0f * s, 0.0f, r, g, b, 0.75f);
 
         char l1[48], l2[48];
-        if (live && s_lastLap[w] > 0.0) sprintf_s(l1, "%s  Last %.2f", names[w], s_lastLap[w]);
-        else sprintf_s(l1, "%s  Last --", names[w]);
+        if (live && s_lastLap[w] > 0.0) sprintf_s(l1, "Last %.2f", s_lastLap[w]);
+        else strcpy_s(l1, "Last --");
         if (haveTarget) sprintf_s(l2, "Need %.2f", s_target[w]);
-        else if (live && s_target[w] == 0.0) strcpy_s(l2, "Need: at target");
+        else if (live && s_target[w] == 0.0) strcpy_s(l2, "At target");
         else strcpy_s(l2, "Need --");
 
         float tr = 1.0f, tg = 1.0f, tb = 1.0f;
@@ -302,8 +460,49 @@ bool TyreSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
             const bool over = s_lastLap[w] > s_lastLapTarget[w];
             tr = over ? 1.0f : 0.35f; tg = over ? 0.35f : 0.95f; tb = over ? 0.3f : 0.4f;
         }
-        renderer.AddText(bx, by - textPx - 2.0f * s, l1, textPx, tr, tg, tb, 1.0f, Renderer::HAlign::Center);
-        renderer.AddText(bx, by + 2.0f * s, l2, textPx, 0.95f, 0.95f, 0.95f, 1.0f, Renderer::HAlign::Center);
+        // Average wear per lap on this set, green if it is within what is
+        // needed now, red if over.
+        const double avg = s_wearLaps[w] > 0 ? s_wearSum[w] / s_wearLaps[w] : -1.0;
+        char l3[48];
+        float ar = 0.95f, ag = 0.95f, ab = 0.95f;
+        if (live && avg > 0.0)
+        {
+            sprintf_s(l3, "Avg %.2f", avg);
+            if (haveTarget)
+            {
+                const bool over = avg > s_target[w];
+                ar = over ? 1.0f : 0.35f; ag = over ? 0.35f : 0.95f; ab = over ? 0.3f : 0.4f;
+            }
+        }
+        else strcpy_s(l3, "Avg --");
+        // Top row: corner line first, then the three; bottom row: the three,
+        // then the corner line -- each tyre's corner text on the car's side.
+        const float boxTop = by - boxHalfH + inset;
+        const float linesTop = row == 0 ? boxTop + cornerPx : boxTop;
+        renderer.AddText(bx, linesTop, l1, textPx, tr, tg, tb, 1.0f, Renderer::HAlign::Center);
+        renderer.AddText(bx, linesTop + textPx, l3, textPx, ar, ag, ab, 1.0f, Renderer::HAlign::Center);
+        renderer.AddText(bx, linesTop + 2.0f * textPx, l2, textPx, 0.95f, 0.95f, 0.95f, 1.0f, Renderer::HAlign::Center);
+
+        // Tyre life left, in the box's outer corner -- the car's own corner
+        // for that tyre (FL top-left ... RR bottom-right).
+        if (live || placeholder)
+        {
+            // % left, and laps left to the target max wear at the set's
+            // average wear per lap.
+            char pct[32];
+            const double rem = live ? tyres.wheel[w].remainingPercent : 100.0;
+            if (live && avg > 0.0)
+            {
+                double laps = (cfg.targetWearPercent - worn[w]) / avg;
+                if (laps < 0.0) laps = 0.0;
+                sprintf_s(pct, "%.0f%% %.0f laps", rem, floor(laps));
+            }
+            else sprintf_s(pct, "%.0f%%", rem);
+            const float tx = col == 0 ? bx - boxHalfW + inset : bx + boxHalfW - inset;
+            const float ty = row == 0 ? boxTop : boxTop + 3.0f * textPx;
+            renderer.AddText(tx, ty, pct, cornerPx, 0.85f, 0.85f, 0.85f, 0.95f,
+                             col == 0 ? Renderer::HAlign::Left : Renderer::HAlign::Right);
+        }
     }
 
     renderer.SetTextBackground(prevBg);

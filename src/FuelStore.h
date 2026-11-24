@@ -1,5 +1,6 @@
 #pragma once
 #include <Windows.h>
+#include <atomic>
 #include <string>
 
 // Fuel time-left: current fuel load divided by a learned per-lap
@@ -19,11 +20,12 @@ public:
     // shown alongside the fuel estimate so the driver can compare the two.
     void OnScoring(const struct ScoringInfoV01& info);
     void Clear();
-    // Writes the learned fuel rate if it's changed since the last flush --
-    // call only while NOT actively driving (see Plugin.cpp). OnTelemetry()
-    // itself never touches disk; a completed lap just sets the dirty flag,
-    // so the game's telemetry thread can't be stalled by a slow disk or an
-    // antivirus scan intercepting the write.
+    // Writes the learned fuel rate if it's changed since the last flush.
+    // Called from the save thread (Persist.cpp) at any moment: it works out
+    // what to write under m_lock and writes after releasing it.
+    // OnTelemetry() itself never touches disk for a save; a completed lap
+    // just sets the dirty flag, so the game's telemetry thread can't be
+    // stalled by a slow disk or an antivirus scan intercepting the write.
     void FlushIfDirty();
 
     struct State
@@ -114,7 +116,14 @@ private:
     bool m_ready = false;
     State m_state;
 
-    std::string m_key; // sanitized "vehicle__track"
+    std::string m_key; // sanitized "vehicle__track"; written by OnTelemetry only
+    // Telemetry thread only: the raw names m_key was last worked out from,
+    // so OnTelemetry can tell "nothing changed" without building strings.
+    // Clear() asks for a re-key through m_keysInvalidated.
+    char m_rawVehKey[64] = {};
+    char m_rawTrackName[64] = {};
+    bool m_haveRawNames = false;
+    std::atomic<bool> m_keysInvalidated{ false };
 
     long m_lastLapNumber = -1;
     double m_fuelAtLapStart = 0.0;
@@ -156,8 +165,20 @@ private:
     double m_learnedFuelPerLap = 0.0;
     bool m_hasLearnedValue = false;
     // Set instead of saving directly whenever m_learnedFuelPerLap changes;
-    // cleared by FlushIfDirty() once actually written.
+    // cleared by FlushIfDirty() once copied out for writing.
     bool m_dirty = false;
+    // What one save writes. m_stash holds one for the car/track just left,
+    // when it changed with a rate still unsaved (under m_lock).
+    struct SaveSnapshot
+    {
+        bool valid = false;
+        std::string key;
+        double norm = 0.0;     // L/lap at 1x fuel
+        double lapTime = 0.0;
+    };
+    SaveSnapshot m_stash;
+    SaveSnapshot SnapshotForSaveLocked() const;
+    static void WriteFuelStats(const SaveSnapshot& s);
 
     // Fuel-learning validity gate: a completed lap is only folded into the
     // learned average if it is BOTH a lap that counts for time (rF2's own
@@ -215,8 +236,6 @@ private:
     double MedianOfHistory() const;
 
     void RecomputeFuelPerLap();
-    void LoadFuelStats(const char* vehicleName, const char* trackName);
-    void SaveFuelStats() const;
 };
 
 extern FuelStore g_fuelStore;

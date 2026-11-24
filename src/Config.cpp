@@ -10,6 +10,7 @@
 TextBackgroundConfig g_textBackgroundConfig;
 TextFontConfig g_textFontConfig;
 ClockConfig g_clockConfig;
+UpdateCheckConfig g_updateCheckConfig;
 DllCostConfig g_dllCostConfig;
 PerfUpdateConfig g_perfUpdateConfig;
 ShortcutConfig g_shortcutConfig;
@@ -24,6 +25,7 @@ LayoutConfig g_layoutConfig;
 FrameLatencyConfig g_frameLatencyConfig;
 GearDisplayConfig g_gearDisplayConfig;
 PitLimiterConfig g_pitLimiterConfig;
+TrackAlertConfig g_trackAlertConfig;
 LapDeltaConfig g_lapDeltaConfig;
 RelativeTimingConfig g_relativeTimingConfig;
 FuelTyrePanelConfig g_fuelTyrePanelConfig;
@@ -31,6 +33,7 @@ FuelSaveConfig g_fuelSaveConfig;
 TyreSaveConfig g_tyreSaveConfig;
 EngineTempsConfig g_engineTempsConfig;
 FfbLevelConfig g_ffbLevelConfig;
+ConditionsConfig g_conditionsConfig;
 BrakeCueConfig g_brakeCueConfig;
 DrsCueConfig g_drsCueConfig;
 
@@ -490,6 +493,10 @@ namespace
 "ShowFpsRange=0\n"
 "ShowGpuFrameTime=0\n"
 "ShowGpuPower=0\n"
+"; The game's replay recording: off, to RAM, or to disk with the size of the\n"
+"; recording so far (amber from 1.5 GB, red from 1.9 GB: a recording that\n"
+"; reached 2 GB was seen to stop and never be saved), plus replay fidelity.\n"
+"ShowReplay=0\n"
 "\n"
 "; Dark grey panel behind the line.\n"
 "BackgroundEnabled=1\n"
@@ -672,11 +679,6 @@ namespace
 "; Only drawn while the limiter is actually engaged.\n"
 "Enabled=0\n"
 "\n"
-"; Horizontal position of the flashing ENGAGE PIT LIMITER reminder. Its\n"
-"; vertical position is EngageWarningYFraction, further down this section;\n"
-"; it had no X at all before, so it was welded to screen centre.\n"
-"EngageWarningXFraction=0.5\n"
-"\n"
 "; Horizontal position is automatic -- flush against whichever of the\n"
 "; gear/speed dashboard's panels ends up rightmost. This is a small\n"
 "; vertical-only nudge, in fractions of screen height.\n"
@@ -715,11 +717,36 @@ namespace
 "ShowLimitAndDelta=1\n"
 "InfoTextHeightPixels=24.0\n"
 "\n"
-"; The SDK's pit location does not land exactly on the pit-lane entry line,\n"
-"; which the engage reminder above uses. This many metres is added to it\n"
-"; (positive = later) until a track has its own offset, learned automatically\n"
-"; the first time you enter that pit lane (PitEntryOffsets folder).\n"
-"EntryOffsetMeters=0.0\n"
+"[TrackAlerts]\n"
+"; Yellow warning lines above the gear/speed boxes: stopped cars ahead\n"
+"; (\"STOPPED 420 m\", \"(3 cars)\" for a pile-up, \"OFF TRACK\" when they are\n"
+"; all beyond the track edge), which sector has a yellow flag, and the pit-lane\n"
+"; speed limit once a pit stop is requested. The limit is set per track\n"
+"; with the wheel knob setting \"Pit lane limit\" (saved in PitLaneLimits).\n"
+"Enabled=1\n"
+"; Only cars this far ahead along the lap, metres.\n"
+"RangeMeters=1000\n"
+"; Under this a car counts as stopped.\n"
+"StoppedKmh=40\n"
+"; In a corner your own best lap took that slowly (a hairpin), a car only\n"
+"; counts under this share of your speed there. 0 = off.\n"
+"SlowCornerFraction=0.8\n"
+"; Stopped cars this close together are one incident, shown with a count.\n"
+"GroupMeters=150\n"
+"; Seconds a car must stay slow before it is reported (and fast again\n"
+"; before the warning clears).\n"
+"DwellSeconds=1.0\n"
+"; Flashes inside this distance, metres.\n"
+"FlashWithinMeters=200\n"
+"; Yellow flag sector (needs local yellows on the server).\n"
+"ShowSectorYellow=1\n"
+"; \"PIT LIMIT 60 km/h\" above the speed box once a pit stop is requested.\n"
+"ShowPitLimitReminder=1\n"
+"TextHeightPixels=56.0\n"
+"GapPixels=10.0\n"
+"TextColorR=1.0\n"
+"TextColorG=0.85\n"
+"TextColorB=0.1\n"
 "\n"
 "[LapDelta]\n"
 "; Live delta-to-best-lap, compared at the SAME TRACK DISTANCE (not the same\n"
@@ -864,6 +891,12 @@ namespace
 "Font=Auto\n"
 "FontWeight=Light\n"
 "\n"
+"[Updates]\n"
+"; Once per game start, ask GitHub (api.github.com) which release of the\n"
+"; plugin is the latest, and say in the menus when a newer one is out.\n"
+"; Nothing is downloaded or installed, and nothing about you is sent. 0 = off.\n"
+"CheckForUpdates=1\n"
+"\n"
 "[Clock]\n"
 "; Panel size multiplier, set by dragging the corner handle in layout\n"
 "; mode and clamped there to 0.5-2.5. Scales text, padding\n"
@@ -944,6 +977,47 @@ namespace
 "; and gaps together, in proportion.\n"
 "ListScale=1.0\n"
 "MessageScale=1.0\n"
+"\n"
+"; Rotary menu. Home/End walk the on/off list, Insert/Delete and Page\n"
+"; Up/Page Down pick the left / right setting. Wheel buttons (1-128, 0 =\n"
+"; none) can do the same; *Up/*Down change the picked setting.\n"
+"ShowKnobBox=1\n"
+"ElementToggleButton=0\n"
+"CentreKnobPrevButton=0\n"
+"CentreKnobNextButton=0\n"
+"LeftKnobPrevButton=0\n"
+"LeftKnobNextButton=0\n"
+"LeftSettingUpButton=0\n"
+"LeftSettingDownButton=0\n"
+"RightKnobPrevButton=0\n"
+"RightKnobNextButton=0\n"
+"RightSettingUpButton=0\n"
+"RightSettingDownButton=0\n"
+"; Keys some settings press (DirectInput scan codes, 0 = none); bind the\n"
+"; same keys to the matching rF2 controls.\n"
+"FovUpKey=0\n"
+"FovDownKey=0\n"
+"MixtureUpKey=0\n"
+"MixtureDownKey=0\n"
+"TcUpKey=0\n"
+"TcDownKey=0\n"
+"TcCutUpKey=0\n"
+"TcCutDownKey=0\n"
+"TcSlipUpKey=0\n"
+"TcSlipDownKey=0\n"
+"HeadlightsKey=0\n"
+"FrontArbUpKey=0\n"
+"FrontArbDownKey=0\n"
+"RearArbUpKey=0\n"
+"RearArbDownKey=0\n"
+"AbsUpKey=0\n"
+"AbsDownKey=0\n"
+"BiasForwardKey=0\n"
+"BiasRearwardKey=0\n"
+"SeatForeKey=0\n"
+"SeatAftKey=0\n"
+"SeatUpKey=0\n"
+"SeatDownKey=0\n"
 "\n"
 "; Which elements are shown. These are REWRITTEN by the plugin whenever\n"
 "; you toggle something with a hotkey, so the last state is restored the\n"
@@ -1147,6 +1221,8 @@ void Config::Load()
             if (_stricmp(name, Renderer::kWeightNames[i]) == 0) g_textFontConfig.weight = i;
     }
 
+    g_updateCheckConfig.enabled = ReadBool("Updates", "CheckForUpdates", g_updateCheckConfig.enabled);
+
     ClockConfig& clk = g_clockConfig;
     clk.enabled = ReadBool("Clock", "Enabled", clk.enabled);
     clk.showSeconds = ReadBool("Clock", "ShowSeconds", clk.showSeconds);
@@ -1167,6 +1243,7 @@ void Config::Load()
     cost.barWidthPx = ReadFloat("DllCost", "BarWidthPixels", cost.barWidthPx);
     cost.barHeightPx = ReadFloat("DllCost", "BarHeightPixels", cost.barHeightPx);
     cost.labelMinShare = ReadFloat("DllCost", "LabelMinShare", cost.labelMinShare);
+    cost.logSpikes = ReadBool("DllCost", "LogSpikes", cost.logSpikes);
 
 
     ShortcutConfig& sc = g_shortcutConfig;
@@ -1191,7 +1268,6 @@ void Config::Load()
     sc.tyreTemps = ReadKey("Shortcuts", "TyreTemps", sc.tyreTemps);
     sc.ffbGraph = ReadKey("Shortcuts", "FfbGraph", sc.ffbGraph);
     sc.trackMap = ReadKey("Shortcuts", "TrackMap", sc.trackMap);
-    sc.tyreWearPlots = ReadKey("Shortcuts", "TyreWearPlots", sc.tyreWearPlots);
     sc.dllCost = ReadKey("Shortcuts", "DllCost", sc.dllCost);
     sc.coverBoxes = ReadKey("Shortcuts", "CoverBoxes", sc.coverBoxes);
     sc.list = ReadKey("Shortcuts", "List", sc.list);
@@ -1200,6 +1276,8 @@ void Config::Load()
     sc.resetPersonalBest = ReadKey("Shortcuts", "ResetPersonalBest", sc.resetPersonalBest);
     sc.layoutMode = ReadKey("Shortcuts", "LayoutMode", sc.layoutMode);
     sc.masterToggle = ReadKey("Shortcuts", "MasterToggle", sc.masterToggle);
+    sc.alwaysOnToggle = ReadKey("Shortcuts", "AlwaysOnToggle", sc.alwaysOnToggle);
+    sc.alwaysOn = ReadBool("Shortcuts", "AlwaysOn", sc.alwaysOn);
 
     LayoutConfig& lay = g_layoutConfig;
     lay.gridEnabled = ReadBool("Layout", "GridEnabled", lay.gridEnabled);
@@ -1234,7 +1312,6 @@ void Config::Load()
     sc.showTyreTemps = ReadBool("Shortcuts", "ShowTyreTemps", sc.showTyreTemps);
     sc.showFfbGraph = ReadBool("Shortcuts", "ShowFfbGraph", sc.showFfbGraph);
     sc.showTrackMap = ReadBool("Shortcuts", "ShowTrackMap", sc.showTrackMap);
-    sc.showTyreWearPlots = ReadBool("Shortcuts", "ShowTyreWearPlots", sc.showTyreWearPlots);
     sc.showDllCost = ReadBool("Shortcuts", "ShowDllCost", sc.showDllCost);
     sc.showCoverBoxes = ReadBool("Shortcuts", "ShowCoverBoxes", sc.showCoverBoxes);
     sc.showOverlay = ReadBool("Shortcuts", "ShowOverlay", sc.showOverlay);
@@ -1244,8 +1321,49 @@ void Config::Load()
     sc.listPosXFraction = ReadFloat("Shortcuts", "ListPosXFraction", sc.listPosXFraction);
     sc.listPosYFraction = ReadFloat("Shortcuts", "ListPosYFraction", sc.listPosYFraction);
     sc.listScale = ReadFloat("Shortcuts", "ListScale", sc.listScale);
+    sc.listTextSize = ReadInt("Shortcuts", "ListTextSize", sc.listTextSize);
+    if (sc.listTextSize < 0 || sc.listTextSize > 2) sc.listTextSize = 0;
     sc.messageScale = ReadFloat("Shortcuts", "MessageScale", sc.messageScale);
     sc.startupHintSeconds = ReadFloat("Shortcuts", "StartupHintSeconds", sc.startupHintSeconds);
+    sc.showKnobBox = ReadBool("Shortcuts", "ShowKnobBox", sc.showKnobBox);
+    sc.knobBoxCenterXFraction = ReadFloat("Shortcuts", "KnobBoxCenterXFraction", sc.knobBoxCenterXFraction);
+    sc.knobBoxCenterYFraction = ReadFloat("Shortcuts", "KnobBoxCenterYFraction", sc.knobBoxCenterYFraction);
+    sc.knobBoxScale = ReadFloat("Shortcuts", "KnobBoxScale", sc.knobBoxScale);
+    sc.knobNeighbourSeconds = ReadFloat("Shortcuts", "KnobNeighbourSeconds", sc.knobNeighbourSeconds);
+    sc.fovUpKey = ReadInt("Shortcuts", "FovUpKey", sc.fovUpKey);
+    sc.fovDownKey = ReadInt("Shortcuts", "FovDownKey", sc.fovDownKey);
+    sc.mixtureUpKey = ReadInt("Shortcuts", "MixtureUpKey", sc.mixtureUpKey);
+    sc.mixtureDownKey = ReadInt("Shortcuts", "MixtureDownKey", sc.mixtureDownKey);
+    sc.tcUpKey = ReadInt("Shortcuts", "TcUpKey", sc.tcUpKey);
+    sc.tcDownKey = ReadInt("Shortcuts", "TcDownKey", sc.tcDownKey);
+    sc.tcCutUpKey = ReadInt("Shortcuts", "TcCutUpKey", sc.tcCutUpKey);
+    sc.tcCutDownKey = ReadInt("Shortcuts", "TcCutDownKey", sc.tcCutDownKey);
+    sc.tcSlipUpKey = ReadInt("Shortcuts", "TcSlipUpKey", sc.tcSlipUpKey);
+    sc.tcSlipDownKey = ReadInt("Shortcuts", "TcSlipDownKey", sc.tcSlipDownKey);
+    sc.headlightsKey = ReadInt("Shortcuts", "HeadlightsKey", sc.headlightsKey);
+    sc.frontArbUpKey = ReadInt("Shortcuts", "FrontArbUpKey", sc.frontArbUpKey);
+    sc.frontArbDownKey = ReadInt("Shortcuts", "FrontArbDownKey", sc.frontArbDownKey);
+    sc.rearArbUpKey = ReadInt("Shortcuts", "RearArbUpKey", sc.rearArbUpKey);
+    sc.rearArbDownKey = ReadInt("Shortcuts", "RearArbDownKey", sc.rearArbDownKey);
+    sc.absUpKey = ReadInt("Shortcuts", "AbsUpKey", sc.absUpKey);
+    sc.absDownKey = ReadInt("Shortcuts", "AbsDownKey", sc.absDownKey);
+    sc.biasForwardKey = ReadInt("Shortcuts", "BiasForwardKey", sc.biasForwardKey);
+    sc.biasRearwardKey = ReadInt("Shortcuts", "BiasRearwardKey", sc.biasRearwardKey);
+    sc.seatForeKey = ReadInt("Shortcuts", "SeatForeKey", sc.seatForeKey);
+    sc.seatAftKey = ReadInt("Shortcuts", "SeatAftKey", sc.seatAftKey);
+    sc.seatUpKey = ReadInt("Shortcuts", "SeatUpKey", sc.seatUpKey);
+    sc.seatDownKey = ReadInt("Shortcuts", "SeatDownKey", sc.seatDownKey);
+    sc.elementToggleButton = ReadInt("Shortcuts", "ElementToggleButton", sc.elementToggleButton);
+    sc.centreKnobPrevButton = ReadInt("Shortcuts", "CentreKnobPrevButton", sc.centreKnobPrevButton);
+    sc.centreKnobNextButton = ReadInt("Shortcuts", "CentreKnobNextButton", sc.centreKnobNextButton);
+    sc.rightKnobPrevButton = ReadInt("Shortcuts", "RightKnobPrevButton", sc.rightKnobPrevButton);
+    sc.rightKnobNextButton = ReadInt("Shortcuts", "RightKnobNextButton", sc.rightKnobNextButton);
+    sc.leftKnobPrevButton = ReadInt("Shortcuts", "LeftKnobPrevButton", sc.leftKnobPrevButton);
+    sc.leftKnobNextButton = ReadInt("Shortcuts", "LeftKnobNextButton", sc.leftKnobNextButton);
+    sc.leftSettingUpButton = ReadInt("Shortcuts", "LeftSettingUpButton", sc.leftSettingUpButton);
+    sc.leftSettingDownButton = ReadInt("Shortcuts", "LeftSettingDownButton", sc.leftSettingDownButton);
+    sc.rightSettingUpButton = ReadInt("Shortcuts", "RightSettingUpButton", sc.rightSettingUpButton);
+    sc.rightSettingDownButton = ReadInt("Shortcuts", "RightSettingDownButton", sc.rightSettingDownButton);
 
     r.enabled = ReadBool("Radar", "Enabled", r.enabled);
     r.widthFraction = ReadFloat("Radar", "WidthFraction", r.widthFraction);
@@ -1467,6 +1585,9 @@ void Config::Load()
     fl.showCpuFrameTime = ReadBool("FrameLatency", "ShowCpuFrameTime", fl.showCpuFrameTime);
     fl.showProcessRam = ReadBool("FrameLatency", "ShowProcessRam", fl.showProcessRam);
     fl.showVram = ReadBool("FrameLatency", "ShowVram", fl.showVram);
+    fl.showPluginRam = ReadBool("FrameLatency", "ShowPluginRam", fl.showPluginRam);
+    fl.showPcRam = ReadBool("FrameLatency", "ShowPcRam", fl.showPcRam);
+    fl.showReplay = ReadBool("FrameLatency", "ShowReplay", fl.showReplay);
     fl.showFpsRange = ReadBool("FrameLatency", "ShowFpsRange", fl.showFpsRange);
     fl.showGpuFrameTime = ReadBool("FrameLatency", "ShowGpuFrameTime", fl.showGpuFrameTime);
     fl.showGpuPower = ReadBool("FrameLatency", "ShowGpuPower", fl.showGpuPower);
@@ -1608,22 +1729,25 @@ void Config::Load()
     pl.showLimitAndDelta = ReadBool("PitLimiter", "ShowLimitAndDelta", pl.showLimitAndDelta);
     pl.infoTextHeightPx = ReadFloat("PitLimiter", "InfoTextHeightPixels", pl.infoTextHeightPx);
     pl.deltaTextHeightPx = ReadFloat("PitLimiter", "DeltaTextHeightPixels", pl.deltaTextHeightPx);
-    pl.engageBeepEnabled = ReadBool("PitLimiter", "EngageBeepEnabled", pl.engageBeepEnabled);
-    pl.engageBeepFrequencyHz = ReadInt("PitLimiter", "EngageBeepFrequencyHz", pl.engageBeepFrequencyHz);
-    pl.engageBeepDurationMs = ReadInt("PitLimiter", "EngageBeepDurationMs", pl.engageBeepDurationMs);
-    pl.engageWarningEnabled = ReadBool("PitLimiter", "EngageWarningEnabled", pl.engageWarningEnabled);
-    pl.engageWarningMaxDistanceM = ReadFloat("PitLimiter", "EngageWarningMaxDistanceMeters", pl.engageWarningMaxDistanceM);
-    pl.engageWarningTextHeightPx = ReadFloat("PitLimiter", "EngageWarningTextHeightPixels", pl.engageWarningTextHeightPx);
     pl.barXFraction = ReadFloat("PitLimiter", "BarXFraction", pl.barXFraction);
     pl.barYFraction = ReadFloat("PitLimiter", "BarYFraction", pl.barYFraction);
     pl.barScale = ReadFloat("PitLimiter", "BarScale", pl.barScale);
-    pl.engageWarningXFraction = ReadFloat("PitLimiter", "EngageWarningXFraction", pl.engageWarningXFraction);
-    pl.engageWarningYFraction = ReadFloat("PitLimiter", "EngageWarningYFraction", pl.engageWarningYFraction);
-    pl.engageWarningBlinkPeriodSeconds = ReadFloat("PitLimiter", "EngageWarningBlinkPeriodSeconds", pl.engageWarningBlinkPeriodSeconds);
-    pl.engageWarningR = ReadFloat("PitLimiter", "EngageWarningColorR", pl.engageWarningR);
-    pl.engageWarningG = ReadFloat("PitLimiter", "EngageWarningColorG", pl.engageWarningG);
-    pl.engageWarningB = ReadFloat("PitLimiter", "EngageWarningColorB", pl.engageWarningB);
-    pl.entryOffsetMeters = ReadFloat("PitLimiter", "EntryOffsetMeters", pl.entryOffsetMeters);
+
+    TrackAlertConfig& ta = g_trackAlertConfig;
+    ta.enabled = ReadBool("TrackAlerts", "Enabled", ta.enabled);
+    ta.rangeMeters = ReadFloat("TrackAlerts", "RangeMeters", ta.rangeMeters);
+    ta.stoppedKmh = ReadFloat("TrackAlerts", "StoppedKmh", ta.stoppedKmh);
+    ta.groupMeters = ReadFloat("TrackAlerts", "GroupMeters", ta.groupMeters);
+    ta.slowCornerFraction = ReadFloat("TrackAlerts", "SlowCornerFraction", ta.slowCornerFraction);
+    ta.dwellSeconds = ReadFloat("TrackAlerts", "DwellSeconds", ta.dwellSeconds);
+    ta.flashWithinMeters = ReadFloat("TrackAlerts", "FlashWithinMeters", ta.flashWithinMeters);
+    ta.showSectorYellow = ReadBool("TrackAlerts", "ShowSectorYellow", ta.showSectorYellow);
+    ta.showPitLimitReminder = ReadBool("TrackAlerts", "ShowPitLimitReminder", ta.showPitLimitReminder);
+    ta.textHeightPx = ReadFloat("TrackAlerts", "TextHeightPixels", ta.textHeightPx);
+    ta.gapPx = ReadFloat("TrackAlerts", "GapPixels", ta.gapPx);
+    ta.r = ReadFloat("TrackAlerts", "TextColorR", ta.r);
+    ta.g = ReadFloat("TrackAlerts", "TextColorG", ta.g);
+    ta.b = ReadFloat("TrackAlerts", "TextColorB", ta.b);
 
     TyreTempsConfig& tt = g_tyreTempsConfig;
     tt.enabled = ReadBool("TyreTemps", "Enabled", tt.enabled);
@@ -1664,6 +1788,9 @@ void Config::Load()
     fg.clipFadeSeconds = ReadFloat("FfbGraph", "ClipFadeSeconds", fg.clipFadeSeconds);
     fg.minPercent = ReadFloat("FfbGraph", "MinPercent", fg.minPercent);
     fg.maxPercent = ReadFloat("FfbGraph", "MaxPercent", fg.maxPercent);
+    fg.bandsPerDecade = ReadInt("FfbGraph", "BandsPerDecade", fg.bandsPerDecade);
+    if (fg.bandsPerDecade < 0) fg.bandsPerDecade = 0;
+    if (fg.bandsPerDecade > 30) fg.bandsPerDecade = 30;
     fg.bgA = ReadFloat("FfbGraph", "BackgroundAlpha", fg.bgA);
 
     CoverBoxConfig& cb = g_coverBoxConfig;
@@ -1698,6 +1825,7 @@ void Config::Load()
     tm.showSectors = ReadBool("TrackMap", "ShowSectors", tm.showSectors);
     tm.showNorth = ReadBool("TrackMap", "ShowNorth", tm.showNorth);
     tm.deltaColourMode = ReadInt("TrackMap", "DeltaColourMode", tm.deltaColourMode);
+    // 4 was "wet sections" (removed 2026-11-23: never showed the wet parts).
     if (tm.deltaColourMode < 0 || tm.deltaColourMode > 3) tm.deltaColourMode = 0;
     tm.deltaPrevButton = ReadInt("TrackMap", "DeltaPrevButton", tm.deltaPrevButton);
     tm.deltaNextButton = ReadInt("TrackMap", "DeltaNextButton", tm.deltaNextButton);
@@ -1796,6 +1924,12 @@ void Config::Load()
     rt.posYFraction = ReadFloat("RelativeTiming", "PosYFraction", rt.posYFraction);
     rt.scale = ReadFloat("RelativeTiming", "Scale", rt.scale);
     rt.showTyre = ReadBool("RelativeTiming", "ShowTyre", rt.showTyre);
+    rt.showPitLaps = ReadBool("RelativeTiming", "ShowPitLaps", rt.showPitLaps);
+    rt.showCarNumber = ReadBool("RelativeTiming", "ShowCarNumber", rt.showCarNumber);
+    rt.showGapBox = ReadBool("RelativeTiming", "ShowGapBox", rt.showGapBox);
+    rt.gapPosXFraction = ReadFloat("RelativeTiming", "GapBoxPosXFraction", rt.gapPosXFraction);
+    rt.gapPosYFraction = ReadFloat("RelativeTiming", "GapBoxPosYFraction", rt.gapPosYFraction);
+    rt.gapScale = ReadFloat("RelativeTiming", "GapBoxScale", rt.gapScale);
     rt.textHeightPx = ReadFloat("RelativeTiming", "TextHeightPixels", rt.textHeightPx);
     rt.rowGapPx = ReadFloat("RelativeTiming", "RowGapPixels", rt.rowGapPx);
     rt.columnGapPx = ReadFloat("RelativeTiming", "ColumnGapPixels", rt.columnGapPx);
@@ -1879,6 +2013,15 @@ void Config::Load()
     ffl.centerYFraction = ReadFloat("FfbLevel", "CenterYFraction", ffl.centerYFraction);
     ffl.scale = ReadFloat("FfbLevel", "Scale", ffl.scale);
 
+    ConditionsConfig& cnd = g_conditionsConfig;
+    cnd.enabled = ReadBool("Conditions", "Enabled", cnd.enabled);
+    cnd.wetsAtWetness = ReadFloat("Conditions", "WetsAtWetness", cnd.wetsAtWetness);
+    cnd.nearMargin = ReadFloat("Conditions", "NearMargin", cnd.nearMargin);
+    cnd.realWeather = ReadBool("Conditions", "RealWeather", cnd.realWeather);
+    cnd.centerXFraction = ReadFloat("Conditions", "CenterXFraction", cnd.centerXFraction);
+    cnd.centerYFraction = ReadFloat("Conditions", "CenterYFraction", cnd.centerYFraction);
+    cnd.scale = ReadFloat("Conditions", "Scale", cnd.scale);
+
     FuelTyrePanelConfig& ft = g_fuelTyrePanelConfig;
     ft.enabled = ReadBool("FuelTyrePanel", "Enabled", ft.enabled);
     ft.showFuel = ReadBool("FuelTyrePanel", "ShowFuel", ft.showFuel);
@@ -1924,9 +2067,6 @@ void Config::Load()
     ft.tyreCriticalVsRaceB = ReadFloat("FuelTyrePanel", "TyreCriticalVsRaceColorB", ft.tyreCriticalVsRaceB);
     ft.tyreCriticalVsRaceA = ReadFloat("FuelTyrePanel", "TyreCriticalVsRaceAlpha", ft.tyreCriticalVsRaceA);
     ft.fuelMarginMinutes = ReadFloat("FuelTyrePanel", "FuelMarginMinutes", ft.fuelMarginMinutes);
-    ft.wearPlotWidthPx = ReadFloat("FuelTyrePanel", "WearPlotWidthPixels", ft.wearPlotWidthPx);
-    ft.wearPlotHeightPx = ReadFloat("FuelTyrePanel", "WearPlotHeightPixels", ft.wearPlotHeightPx);
-    ft.wearBigPlotHeightPx = ReadFloat("FuelTyrePanel", "WearBigPlotHeightPixels", ft.wearBigPlotHeightPx);
     ft.fuelMarginLaps = ReadFloat("FuelTyrePanel", "FuelMarginLaps", ft.fuelMarginLaps);
     ft.fuelGoodR = ReadFloat("FuelTyrePanel", "FuelGoodColorR", ft.fuelGoodR);
     ft.fuelGoodG = ReadFloat("FuelTyrePanel", "FuelGoodColorG", ft.fuelGoodG);
@@ -1959,22 +2099,63 @@ void Config::Load()
 namespace
 {
     struct PendingWrite { std::string section, key, value; };
+    // Queued from the render thread (toggles, layout mode, per-car layouts)
+    // and the scoring thread (last car driven); written out by the Persist
+    // thread. s_writeLock guards both lists. s_inFlight is the batch
+    // being written right now: only the Persist thread changes it (under the
+    // lock), and it stays readable meanwhile so a read-back of a key in
+    // mid-write still sees the new value.
+    SRWLOCK s_writeLock = SRWLOCK_INIT;
     std::vector<PendingWrite> s_pendingWrites;
+    std::vector<PendingWrite> s_inFlight;
+    // Held for a whole flush, so a second caller can never swap s_inFlight
+    // out from under one that is still writing it.
+    SRWLOCK s_flushLock = SRWLOCK_INIT;
 
     // Upsert by (section, key) -- last write wins, and a key touched several
     // times before the next flush (e.g. nudging a layout position repeatedly)
     // only ever queues one final disk write for it, not one per change.
     void QueueWrite(const char* section, const char* key, const std::string& value)
     {
+        AcquireSRWLockExclusive(&s_writeLock);
+        bool found = false;
         for (PendingWrite& w : s_pendingWrites)
         {
             if (w.section == section && w.key == key)
             {
                 w.value = value;
-                return;
+                found = true;
+                break;
             }
         }
-        s_pendingWrites.push_back({ section, key, value });
+        if (!found)
+            s_pendingWrites.push_back({ section, key, value });
+        ReleaseSRWLockExclusive(&s_writeLock);
+    }
+
+    // A value written but not on disk yet. Writes only reach the file out of
+    // the car, on the Persist thread, so a read straight from the INI could
+    // otherwise return the old value for a while.
+    bool PendingValue(const char* section, const char* key, std::string& out)
+    {
+        bool found = false;
+        AcquireSRWLockShared(&s_writeLock);
+        for (const std::vector<PendingWrite>* list : { &s_pendingWrites, &s_inFlight })   // newest first
+        {
+            for (const PendingWrite& w : *list)
+            {
+                if (_stricmp(w.section.c_str(), section) == 0 && _stricmp(w.key.c_str(), key) == 0)
+                {
+                    out = w.value;
+                    found = true;
+                    break;
+                }
+            }
+            if (found)
+                break;
+        }
+        ReleaseSRWLockShared(&s_writeLock);
+        return found;
     }
 }
 
@@ -2025,30 +2206,61 @@ bool Config::WriteString(const char* section, const char* key, const char* value
     return true;
 }
 
+void Config::ReadStringLive(const char* section, const char* key, char* buf, size_t bufSize)
+{
+    if (bufSize) buf[0] = 0;
+    std::string pending;
+    if (PendingValue(section, key, pending))
+    {
+        if (bufSize) strncpy_s(buf, bufSize, pending.c_str(), _TRUNCATE);
+        return;
+    }
+    ReadString(section, key, buf, bufSize);
+}
+
 float Config::ReadFloatLive(const char* section, const char* key, float def)
 {
+    std::string pending;
+    if (PendingValue(section, key, pending))
+        return static_cast<float>(atof(pending.c_str()));
     return ReadFloat(section, key, def);
 }
 
 bool Config::FlushPendingWrites()
 {
-    if (s_pendingWrites.empty())
+    // A flush already under way elsewhere: leave the rest to it or the
+    // next one rather than wait for its disk writes.
+    if (!TryAcquireSRWLockExclusive(&s_flushLock))
         return true;
 
-    // Swapped out before writing (not cleared after) so a write queued by
-    // some OTHER thread while this loop is running -- unlikely, since this
-    // runs from the same scoring-tick trigger every other FlushIfDirty()
-    // does, but not impossible -- lands in the NEXT flush instead of being
-    // dropped on the floor.
-    std::vector<PendingWrite> batch;
-    batch.swap(s_pendingWrites);
+    // Swapped out under the lock, then written with the lock released:
+    // QueueWrite runs on the render thread, which must never wait for a
+    // disk write. A write queued meanwhile lands in the NEXT flush.
+    AcquireSRWLockExclusive(&s_writeLock);
+    if (s_pendingWrites.empty())
+    {
+        ReleaseSRWLockExclusive(&s_writeLock);
+        ReleaseSRWLockExclusive(&s_flushLock);
+        return true;
+    }
+    s_inFlight.swap(s_pendingWrites);
+    ReleaseSRWLockExclusive(&s_writeLock);
 
+    // Still one WritePrivateProfileString per key (not a rewrite of the
+    // whole file), so hand-written comments and edits in the INI survive.
+    // Each one rereads and rewrites the file -- fine here, on the Persist
+    // thread, out of the car.
     bool allOk = true;
-    for (const PendingWrite& w : batch)
+    for (const PendingWrite& w : s_inFlight)
     {
         if (!WritePrivateProfileStringA(w.section.c_str(), w.key.c_str(), w.value.c_str(), s_iniPath))
             allOk = false;
     }
+
+    AcquireSRWLockExclusive(&s_writeLock);
+    s_inFlight.clear();
+    ReleaseSRWLockExclusive(&s_writeLock);
+    ReleaseSRWLockExclusive(&s_flushLock);
     return allOk;
 }
 

@@ -313,21 +313,6 @@ void MiniSectorStore::OnTelemetry(const TelemInfoV01& info)
         const double perSegment = elapsed / crossed;
         const double yourAvgSpeed = (perSegment > 0.0) ? (segmentDistance / perSegment) : 0.0;
 
-        // Diagnostic for the inflated-speed bug: every anomalous crossing
-        // (more than one segment at a time, or an implausible speed) plus a
-        // periodic healthy sample for comparison, so a single lap's log shows
-        // both whether the fix holds and, if it doesn't, which of 'elapsed'
-        // and 'crossed' is wrong -- the two are indistinguishable from the
-        // on-screen readout alone.
-        const double yourKmh = yourAvgSpeed * 3.6;
-        if (crossed != 1 || yourKmh > 350.0 || (m_currentSegment % 25) == 0)
-        {
-            Log::Write("MiniSector: seg %d->%d crossed=%d elapsed=%.4fs perSeg=%.4fs "
-                       "you=%.0fkph | dist=%.1f lastKnownDist=%.1f speed=%.2fm/s tickDt=%.4fs",
-                       m_currentSegment, seg, crossed, elapsed, perSegment, yourKmh,
-                       dist, m_lastKnownDist, m_forwardSpeed, tickDt);
-        }
-
         // Wall-clock "now" -- each segment's fade-in start, independent of
         // sim-time elapsed/perSegment above (which drive the speed math).
         // Setting every segment's own start to the same instant they were
@@ -336,6 +321,30 @@ void MiniSectorStore::OnTelemetry(const TelemInfoV01& info)
         // own moment rather than all popping in together -- see DrawRow.
         LARGE_INTEGER nowQpc;
         QueryPerformanceCounter(&nowQpc);
+
+        // Diagnostic for the inflated-speed bug: an anomalous crossing (more
+        // than one segment at a time, or an implausible speed) is logged, so
+        // a lap's log shows whether the fix holds and, if it doesn't, which
+        // of 'elapsed' and 'crossed' is wrong -- the two are
+        // indistinguishable from the on-screen readout alone. This runs on
+        // the telemetry thread with no INI switch, so the healthy sample it
+        // also used to log every 25th segment (~8 lines a lap, every lap) is
+        // gone, and anomalies are capped at one line a second so a bad patch
+        // cannot flood it.
+        const double yourKmh = yourAvgSpeed * 3.6;
+        if (crossed != 1 || yourKmh > 350.0)
+        {
+            static LARGE_INTEGER s_lastAnomalyLog = {};
+            if (s_lastAnomalyLog.QuadPart == 0 || m_freq.QuadPart <= 0
+                || nowQpc.QuadPart - s_lastAnomalyLog.QuadPart >= m_freq.QuadPart)
+            {
+                s_lastAnomalyLog = nowQpc;
+                Log::Write("MiniSector: seg %d->%d crossed=%d elapsed=%.4fs perSeg=%.4fs "
+                           "you=%.0fkph | dist=%.1f lastKnownDist=%.1f speed=%.2fm/s tickDt=%.4fs",
+                           m_currentSegment, seg, crossed, elapsed, perSegment, yourKmh,
+                           dist, m_lastKnownDist, m_forwardSpeed, tickDt);
+            }
+        }
         const double nowSeconds = (m_freq.QuadPart > 0)
                                  ? static_cast<double>(nowQpc.QuadPart) / static_cast<double>(m_freq.QuadPart)
                                  : 0.0;

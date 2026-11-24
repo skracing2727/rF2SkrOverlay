@@ -59,6 +59,116 @@ namespace
         }
         return font;
     }
+
+    // Compiled shader bytecode, kept for the life of the process. It does not
+    // depend on the device, so a rebind to a new device creates the shader
+    // objects straight from it instead of running the HLSL compiler again
+    // (a resize no longer rebuilds the renderer at all -- see Overlay.cpp's
+    // BindTo). Never released: four small blobs, and releasing them from a
+    // static destructor at unload would call into d3dcompiler at a moment
+    // that is not guaranteed safe. Render thread only.
+    enum ShaderId { kShapeVS, kShapePS, kTextVS, kTextPS, kShaderCount };
+    ID3DBlob* g_shaderBlobs[kShaderCount] = {};
+
+    // Borrowed pointer (the cache keeps it), or null if compiling failed --
+    // a failure is not cached, so the next Init tries again.
+    ID3DBlob* CompiledShader(ShaderId id, const char* src, const char* entry, const char* target)
+    {
+        if (!g_shaderBlobs[id])
+        {
+            ID3DBlob* blob = nullptr;
+            ID3DBlob* errBlob = nullptr;
+            const HRESULT hr = D3DCompile(src, strlen(src), nullptr, nullptr, nullptr, entry, target, 0, 0, &blob, &errBlob);
+            if (errBlob) errBlob->Release();
+            if (FAILED(hr))
+            {
+                if (blob) blob->Release();
+                return nullptr;
+            }
+            g_shaderBlobs[id] = blob;
+        }
+        return g_shaderBlobs[id];
+    }
+
+    // AddFilledRoundedRect's arc points: 5 per corner over 90 degrees, at
+    // the same fixed angles every call, so their cos/sin are worked out once
+    // (with exactly the expressions the draw used to evaluate each time --
+    // 20 sinf/cosf pairs per box, and every text plate is one).
+    const int kArcPerCorner = 5;
+    const int kArcPoints = kArcPerCorner * 4;
+    struct ArcTable
+    {
+        float cosA[kArcPoints];
+        float sinA[kArcPoints];
+        ArcTable()
+        {
+            // Start angle for each corner, sweeping 90 degrees each.
+            const float start[4] = { -1.57079633f, 0.0f, 1.57079633f, 3.14159265f };
+            int n = 0;
+            for (int c = 0; c < 4; ++c)
+            {
+                for (int i = 0; i < kArcPerCorner; ++i)
+                {
+                    const float t = static_cast<float>(i) / static_cast<float>(kArcPerCorner - 1);
+                    const float ang = start[c] + t * 1.57079633f;
+                    cosA[n] = cosf(ang);
+                    sinA[n] = sinf(ang);
+                    ++n;
+                }
+            }
+        }
+    };
+    const ArcTable kArc;
+}
+
+namespace
+{
+    // float -> IEEE half, round to nearest even, with infinities, NaN and
+    // subnormals handled (the well-known branch-light conversion; FP16C
+    // instructions would need a CPU check). The GPU widens halves back to
+    // floats exactly.
+    UINT64 FloatToHalf(float value)
+    {
+        UINT32 x;
+        memcpy(&x, &value, sizeof(x));
+        const UINT32 sign = x & 0x80000000u;
+        x ^= sign;
+        UINT32 h;
+        if (x >= (127u + 16u) << 23)                    // too big for a half: Inf, or NaN
+        {
+            h = (x > 0x7F800000u) ? 0x7E00u : 0x7C00u;
+        }
+        else if (x < (113u << 23))                      // half subnormal or zero
+        {
+            const UINT32 magicBits = ((127u - 15u) + (23u - 10u) + 1u) << 23;
+            float magic, f;
+            memcpy(&magic, &magicBits, sizeof(magic));
+            memcpy(&f, &x, sizeof(f));
+            f += magic;                                 // the FPU's own rounding does the work
+            UINT32 bits;
+            memcpy(&bits, &f, sizeof(bits));
+            h = bits - magicBits;
+        }
+        else
+        {
+            const UINT32 mantOdd = (x >> 13) & 1u;
+            x += (static_cast<UINT32>(15 - 127) << 23) + 0xFFFu;
+            x += mantOdd;
+            h = x >> 13;
+        }
+        return static_cast<UINT64>((h | (sign >> 16)) & 0xFFFFu);
+    }
+}
+
+// Each channel as a half float (R16G16B16A16_FLOAT). Not 8-bit UNORM, which
+// would be smaller still: callers do pass values above 1 (the side bars'
+// corner alphas with SideBarOpacityMultiplier above 1), and those must reach
+// the GPU unclamped -- the blend clamps per PIXEL, after interpolation, which
+// is what gives an over-1 gradient its solid band. Halves keep that, and
+// their ~11 bits are finer than the 8-bit back buffer.
+UINT64 Renderer::PackColor(float r, float g, float b, float a)
+{
+    return FloatToHalf(r) | (FloatToHalf(g) << 16) | (FloatToHalf(b) << 32) | (FloatToHalf(a) << 48);
 }
 
 void Renderer::SetFont(int font, int weight)
@@ -116,24 +226,13 @@ bool Renderer::Init(ID3D11Device* device)
 {
     m_device = device;
 
-    ID3DBlob* vsBlob = nullptr;
-    ID3DBlob* psBlob = nullptr;
-    ID3DBlob* errBlob = nullptr;
-
-    if (FAILED(D3DCompile(kShaderSrc, strlen(kShaderSrc), nullptr, nullptr, nullptr,
-        "VSMain", "vs_4_0", 0, 0, &vsBlob, &errBlob)))
-    {
-        if (errBlob) errBlob->Release();
+    // Borrowed from the process-wide cache (see CompiledShader) -- not released here.
+    ID3DBlob* vsBlob = CompiledShader(kShapeVS, kShaderSrc, "VSMain", "vs_4_0");
+    if (!vsBlob)
         return false;
-    }
-
-    if (FAILED(D3DCompile(kShaderSrc, strlen(kShaderSrc), nullptr, nullptr, nullptr,
-        "PSMain", "ps_4_0", 0, 0, &psBlob, &errBlob)))
-    {
-        if (errBlob) errBlob->Release();
-        vsBlob->Release();
+    ID3DBlob* psBlob = CompiledShader(kShapePS, kShaderSrc, "PSMain", "ps_4_0");
+    if (!psBlob)
         return false;
-    }
 
     // Every one of these HRESULTs used to go unchecked -- if any failed
     // (plausible right when the device is in flux from a resolution/mode
@@ -154,13 +253,10 @@ bool Renderer::Init(ID3D11Device* device)
 
     D3D11_INPUT_ELEMENT_DESC layout[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR", 0, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
     if (FAILED(device->CreateInputLayout(layout, 2, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &m_inputLayout)))
         ok = false;
-
-    vsBlob->Release();
-    psBlob->Release();
 
     D3D11_BUFFER_DESC vbDesc = {};
     vbDesc.Usage = D3D11_USAGE_DYNAMIC;
@@ -215,6 +311,17 @@ bool Renderer::Init(ID3D11Device* device)
 void Renderer::Shutdown()
 {
     ShutdownText();
+    for (StaticBatch* b : m_batches)
+    {
+        if (b->buf) { b->buf->Release(); b->buf = nullptr; }
+        b->capacity = 0;
+        b->count = 0;
+        b->valid = false;
+    }
+    m_batches.clear();
+    m_vbPos = 0;
+    m_textVbPos = 0;
+    m_inserts.clear();
 
     // Null after release -- otherwise a second Shutdown (or Init-after-Shutdown)
     // double-releases and crashes.
@@ -232,10 +339,25 @@ void Renderer::Shutdown()
 void Renderer::BeginFrame(ID3D11DeviceContext* context, ID3D11RenderTargetView* rtv, int screenWidth, int screenHeight)
 {
     m_context = context;
-    m_screenWidth = screenWidth > 0 ? screenWidth : 1;
-    m_screenHeight = screenHeight > 0 ? screenHeight : 1;
+    const int width = screenWidth > 0 ? screenWidth : 1;
+    const int height = screenHeight > 0 ? screenHeight : 1;
+    if (width != m_screenWidth || height != m_screenHeight)
+    {
+        // Static batches hold NDC positions, only right at the size they were
+        // built for. A resize used to rebuild the whole renderer, which
+        // dropped them; it no longer does, so they are marked stale here and
+        // their widgets rebuild them (into the same GPU buffers) this frame.
+        for (StaticBatch* b : m_batches)
+            b->valid = false;
+    }
+    m_screenWidth = width;
+    m_screenHeight = height;
+    m_ndcScaleX = 2.0f / static_cast<float>(m_screenWidth);
+    m_ndcScaleY = 2.0f / static_cast<float>(m_screenHeight);
     m_vertices.clear();
     m_textVertices.clear();
+    m_inserts.clear();
+    m_topShape = m_topText = static_cast<size_t>(-1);
 
     // A font change from the menu: rebuild the glyph atlas before anything
     // is drawn with it. Keeps the old atlas if the new one fails.
@@ -307,12 +429,22 @@ void Renderer::EndFrame()
     D3D11_MAPPED_SUBRESOURCE mapped;
     bool textReady = false;
     UINT textCount = 0;
+    UINT base = 0, textBase = 0;   // where this frame's vertices start in each ring
+    bool shapesReady = false;
     {
         PROF("Renderer upload");
-        if (SUCCEEDED(m_context->Map(m_vertexBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        if (count > 0)
         {
-            memcpy(mapped.pData, m_vertices.data(), count * sizeof(Vertex));
-            m_context->Unmap(m_vertexBuffer, 0);
+            const bool wrap = m_vbPos + count > kMaxVertices;
+            if (wrap) m_vbPos = 0;
+            if (SUCCEEDED(m_context->Map(m_vertexBuffer, 0, wrap ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped)))
+            {
+                memcpy(static_cast<Vertex*>(mapped.pData) + m_vbPos, m_vertices.data(), count * sizeof(Vertex));
+                m_context->Unmap(m_vertexBuffer, 0);
+                base = m_vbPos;
+                m_vbPos += count;
+                shapesReady = true;
+            }
         }
         if (!m_textVertices.empty() && m_fontSRV)
         {
@@ -321,10 +453,14 @@ void Renderer::EndFrame()
                 textCount = kMaxTextVertices;
 
             D3D11_MAPPED_SUBRESOURCE textMapped;
-            if (SUCCEEDED(m_context->Map(m_textVertexBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &textMapped)))
+            const bool wrap = m_textVbPos + textCount > kMaxTextVertices;
+            if (wrap) m_textVbPos = 0;
+            if (SUCCEEDED(m_context->Map(m_textVertexBuffer, 0, wrap ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &textMapped)))
             {
-                memcpy(textMapped.pData, m_textVertices.data(), textCount * sizeof(TextVertex));
+                memcpy(static_cast<TextVertex*>(textMapped.pData) + m_textVbPos, m_textVertices.data(), textCount * sizeof(TextVertex));
                 m_context->Unmap(m_textVertexBuffer, 0);
+                textBase = m_textVbPos;
+                m_textVbPos += textCount;
                 textReady = true;
             }
         }
@@ -333,13 +469,42 @@ void Renderer::EndFrame()
     PROF("Renderer draw");
     UINT stride = sizeof(Vertex);
     UINT offset = 0;
-    m_context->IASetVertexBuffers(0, 1, &m_vertexBuffer, &stride, &offset);
-    m_context->Draw(count, 0);
-
-    // Text batch: same blend/raster/depth state (still alpha blending, no
-    // depth, no culling), different shaders/input-layout/texture.
-    if (textReady)
+    // Shapes [from, to) in order, with any static batches drawn at the
+    // point they were added.
+    auto drawShapes = [&](UINT from, UINT to, bool upper)
     {
+        if (upper)
+        {
+            m_context->IASetInputLayout(m_inputLayout);
+            m_context->VSSetShader(m_vs, nullptr, 0);
+            m_context->PSSetShader(m_ps, nullptr, 0);
+        }
+        m_context->IASetVertexBuffers(0, 1, &m_vertexBuffer, &stride, &offset);
+        UINT start = from;
+        for (const StaticInsert& ins : m_inserts)
+        {
+            const UINT at = ins.at > count ? count : static_cast<UINT>(ins.at);
+            // A batch added exactly at the split was added before
+            // BeginTopLayer: it belongs to the lower range.
+            if (at > to || (upper && at <= from)) continue;
+            if (at > start && shapesReady) m_context->Draw(at - start, base + start);
+            start = at > start ? at : start;
+            StaticBatch* b = ins.batch;
+            if (b && b->valid && b->buf && b->count)
+            {
+                m_context->IASetVertexBuffers(0, 1, &b->buf, &stride, &offset);
+                m_context->Draw(b->count, 0);
+                m_context->IASetVertexBuffers(0, 1, &m_vertexBuffer, &stride, &offset);
+            }
+        }
+        if (to > start && shapesReady) m_context->Draw(to - start, base + start);
+    };
+    // Text [from, to): same blend/raster/depth state (still alpha blending,
+    // no depth, no culling), different shaders/input-layout/texture.
+    auto drawText = [&](UINT from, UINT to)
+    {
+        if (!textReady || to <= from)
+            return;
         UINT textStride = sizeof(TextVertex);
         UINT textOffset = 0;
         m_context->IASetInputLayout(m_textInputLayout);
@@ -348,14 +513,19 @@ void Renderer::EndFrame()
         m_context->PSSetShader(m_textPs, nullptr, 0);
         m_context->PSSetShaderResources(0, 1, &m_fontSRV);
         m_context->PSSetSamplers(0, 1, &m_fontSampler);
-        m_context->Draw(textCount, 0);
+        m_context->Draw(to - from, textBase + from);
+    };
+    // BeginTopLayer: everything before it (shapes, then text), then
+    // everything after it (shapes, then text).
+    const UINT topShape = m_topShape < count ? static_cast<UINT>(m_topShape) : count;
+    const UINT topText = m_topText < textCount ? static_cast<UINT>(m_topText) : textCount;
+    drawShapes(0, topShape, false);
+    drawText(0, topText);
+    if (m_topShape != static_cast<size_t>(-1))
+    {
+        drawShapes(topShape, count, true);
+        drawText(topText, textCount);
     }
-}
-
-void Renderer::PixelToNDC(float px, float py, float& ndcX, float& ndcY) const
-{
-    ndcX = (px / static_cast<float>(m_screenWidth)) * 2.0f - 1.0f;
-    ndcY = 1.0f - (py / static_cast<float>(m_screenHeight)) * 2.0f;
 }
 
 void Renderer::PushTriangle(const Vertex& a, const Vertex& b, const Vertex& c)
@@ -368,6 +538,48 @@ void Renderer::PushTriangle(const Vertex& a, const Vertex& b, const Vertex& c)
     m_vertices.push_back(a);
     m_vertices.push_back(b);
     m_vertices.push_back(c);
+}
+
+void Renderer::EndStatic(size_t mark, StaticBatch& b)
+{
+    if (mark > m_vertices.size() || !m_device || !m_context) { b.valid = false; return; }
+    const UINT n = static_cast<UINT>(m_vertices.size() - mark);
+    if (!b.buf || n > b.capacity)
+    {
+        if (b.buf) { b.buf->Release(); b.buf = nullptr; }
+        const UINT cap = (n + n / 4) > 1024 ? (n + n / 4) : 1024;
+        D3D11_BUFFER_DESC d = {};
+        d.ByteWidth = static_cast<UINT>(sizeof(Vertex)) * cap;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        if (FAILED(m_device->CreateBuffer(&d, nullptr, &b.buf)))
+        {
+            // Leave the vertices in the normal per-frame stream instead.
+            b.buf = nullptr;
+            b.capacity = 0;
+            b.valid = false;
+            return;
+        }
+        b.capacity = cap;
+        bool known = false;
+        for (StaticBatch* x : m_batches) if (x == &b) known = true;
+        if (!known) m_batches.push_back(&b);
+    }
+    if (n)
+    {
+        D3D11_BOX box = { 0, 0, 0, n * static_cast<UINT>(sizeof(Vertex)), 1, 1 };
+        m_context->UpdateSubresource(b.buf, 0, &box, m_vertices.data() + mark, 0, 0);
+    }
+    b.count = n;
+    b.valid = true;
+    m_vertices.resize(mark);
+    m_inserts.push_back({ mark, &b });
+}
+
+void Renderer::DrawStatic(StaticBatch& b)
+{
+    if (b.valid && b.buf)
+        m_inserts.push_back({ m_vertices.size(), &b });
 }
 
 Renderer::CaptureMark Renderer::BeginCapture() const
@@ -386,6 +598,10 @@ void Renderer::EndCapture(const CaptureMark& mark, Cache& outCache) const
     }
     outCache.shapeVerts.assign(m_vertices.begin() + mark.shapeCount, m_vertices.end());
     outCache.textVerts.assign(m_textVertices.begin() + mark.textCount, m_textVertices.end());
+    outCache.inserts.clear();
+    for (const StaticInsert& ins : m_inserts)
+        if (ins.at >= mark.shapeCount)
+            outCache.inserts.push_back({ ins.at - mark.shapeCount, ins.batch });
     outCache.valid = true;
 }
 
@@ -393,6 +609,9 @@ void Renderer::Replay(const Cache& cache)
 {
     if (!cache.valid)
         return;
+    const size_t base = m_vertices.size();
+    for (const StaticInsert& ins : cache.inserts)
+        m_inserts.push_back({ base + ins.at, ins.batch });
     if (m_vertices.size() + cache.shapeVerts.size() <= kMaxVertices)
         m_vertices.insert(m_vertices.end(), cache.shapeVerts.begin(), cache.shapeVerts.end());
     else
@@ -406,7 +625,8 @@ void Renderer::AddFilledCircle(float cx, float cy, float radius, float r, float 
     float ndcCx, ndcCy;
     PixelToNDC(cx, cy, ndcCx, ndcCy);
 
-    Vertex center{ ndcCx, ndcCy, r, g, b, a };
+    const UINT64 rgba = PackColor(r, g, b, a);
+    Vertex center{ ndcCx, ndcCy, rgba };
 
     float prevX, prevY;
     PixelToNDC(cx + radius, cy, prevX, prevY);
@@ -419,8 +639,8 @@ void Renderer::AddFilledCircle(float cx, float cy, float radius, float r, float 
         float ndcX, ndcY;
         PixelToNDC(px, py, ndcX, ndcY);
 
-        Vertex v1{ prevX, prevY, r, g, b, a };
-        Vertex v2{ ndcX, ndcY, r, g, b, a };
+        Vertex v1{ prevX, prevY, rgba };
+        Vertex v2{ ndcX, ndcY, rgba };
         PushTriangle(center, v1, v2);
 
         prevX = ndcX;
@@ -446,6 +666,8 @@ void Renderer::AddGradientQuad(float leftTop, float rightTop,
     // that vary in only one direction have no bilinear term at all and come
     // out exact either way.
     const int kStrips = 12;
+    const UINT64 rgb = PackColor(r, g, b, 0.0f) & 0x0000FFFFFFFFFFFFull;   // alpha added per corner
+    auto withAlpha = [rgb](float alpha) { return rgb | (FloatToHalf(alpha) << 48); };
 
     for (int i = 0; i < kStrips; ++i)
     {
@@ -468,10 +690,10 @@ void Renderer::AddGradientQuad(float leftTop, float rightTop,
         PixelToNDC(xB0, bottom, nxB0, nyB);
         PixelToNDC(xB1, bottom, nxB1, nyB1);
 
-        const Vertex vTL{ nxT0, nyT, r, g, b, aT0 };
-        const Vertex vTR{ nxT1, nyT, r, g, b, aT1 };
-        const Vertex vBR{ nxB1, nyB, r, g, b, aB1 };
-        const Vertex vBL{ nxB0, nyB, r, g, b, aB0 };
+        const Vertex vTL{ nxT0, nyT, withAlpha(aT0) };
+        const Vertex vTR{ nxT1, nyT, withAlpha(aT1) };
+        const Vertex vBR{ nxB1, nyB, withAlpha(aB1) };
+        const Vertex vBL{ nxB0, nyB, withAlpha(aB0) };
 
         PushTriangle(vTL, vTR, vBR);
         PushTriangle(vTL, vBR, vBL);
@@ -480,8 +702,10 @@ void Renderer::AddGradientQuad(float leftTop, float rightTop,
 
 void Renderer::AddFilledRect(float cx, float cy, float halfWidth, float halfHeight, float rotation, float r, float g, float b, float a)
 {
-    const float cosR = cosf(rotation);
-    const float sinR = sinf(rotation);
+    // Most boxes are upright; cosf(0)/sinf(0) are exactly 1 and 0 anyway.
+    const float cosR = (rotation == 0.0f) ? 1.0f : cosf(rotation);
+    const float sinR = (rotation == 0.0f) ? 0.0f : sinf(rotation);
+    const UINT64 rgba = PackColor(r, g, b, a);
 
     // Local corners: (-w,-h) (+w,-h) (+w,+h) (-w,+h)
     const float lx[4] = { -halfWidth,  halfWidth, halfWidth, -halfWidth };
@@ -494,7 +718,7 @@ void Renderer::AddFilledRect(float cx, float cy, float halfWidth, float halfHeig
         const float py = cy + lx[i] * sinR + ly[i] * cosR;
         float ndcX, ndcY;
         PixelToNDC(px, py, ndcX, ndcY);
-        v[i] = Vertex{ ndcX, ndcY, r, g, b, a };
+        v[i] = Vertex{ ndcX, ndcY, rgba };
     }
 
     PushTriangle(v[0], v[1], v[2]);
@@ -524,8 +748,8 @@ void Renderer::AddFilledRoundedRect(float cx, float cy, float halfWidth, float h
         return;
     }
 
-    const int kPerCorner = 5;                 // arc points per corner
-    const int kTotal = kPerCorner * 4;
+    const int kPerCorner = kArcPerCorner;     // arc points per corner (angles in kArc)
+    const int kTotal = kArcPoints;
     float px[kTotal];
     float py[kTotal];
 
@@ -534,29 +758,27 @@ void Renderer::AddFilledRoundedRect(float cx, float cy, float halfWidth, float h
     const float iy = halfHeight - cr;
     const float cxs[4] = {  ix,  ix, -ix, -ix };
     const float cys[4] = { -iy,  iy,  iy, -iy };
-    // Start angle for each corner, sweeping 90 degrees each.
-    const float start[4] = { -1.57079633f, 0.0f, 1.57079633f, 3.14159265f };
 
     int n = 0;
     for (int c = 0; c < 4; ++c)
     {
         for (int i = 0; i < kPerCorner; ++i)
         {
-            const float t = static_cast<float>(i) / static_cast<float>(kPerCorner - 1);
-            const float ang = start[c] + t * 1.57079633f;
-            px[n] = cxs[c] + cr * cosf(ang);
-            py[n] = cys[c] + cr * sinf(ang);
+            px[n] = cxs[c] + cr * kArc.cosA[n];
+            py[n] = cys[c] + cr * kArc.sinA[n];
             ++n;
         }
     }
 
-    const float cosR = cosf(rotation);
-    const float sinR = sinf(rotation);
+    // Text plates and panels are upright; cosf(0)/sinf(0) are exactly 1 and 0.
+    const float cosR = (rotation == 0.0f) ? 1.0f : cosf(rotation);
+    const float sinR = (rotation == 0.0f) ? 0.0f : sinf(rotation);
+    const UINT64 rgba = PackColor(r, g, b, a);
 
     // Centre vertex for the triangle fan.
     float ndcCx, ndcCy;
     PixelToNDC(cx, cy, ndcCx, ndcCy);
-    const Vertex center{ ndcCx, ndcCy, r, g, b, a };
+    const Vertex center{ ndcCx, ndcCy, rgba };
 
     Vertex prev;
     {
@@ -564,7 +786,7 @@ void Renderer::AddFilledRoundedRect(float cx, float cy, float halfWidth, float h
         const float wy = cy + px[0] * sinR + py[0] * cosR;
         float nx, ny;
         PixelToNDC(wx, wy, nx, ny);
-        prev = Vertex{ nx, ny, r, g, b, a };
+        prev = Vertex{ nx, ny, rgba };
     }
 
     for (int i = 1; i <= kTotal; ++i)
@@ -574,7 +796,7 @@ void Renderer::AddFilledRoundedRect(float cx, float cy, float halfWidth, float h
         const float wy = cy + px[idx] * sinR + py[idx] * cosR;
         float nx, ny;
         PixelToNDC(wx, wy, nx, ny);
-        const Vertex cur{ nx, ny, r, g, b, a };
+        const Vertex cur{ nx, ny, rgba };
 
         PushTriangle(center, prev, cur);
         prev = cur;
@@ -583,6 +805,7 @@ void Renderer::AddFilledRoundedRect(float cx, float cy, float halfWidth, float h
 
 void Renderer::AddRing(float cx, float cy, float innerRadius, float outerRadius, float r, float g, float b, float a, int segments)
 {
+    const UINT64 rgba = PackColor(r, g, b, a);
     float prevInX, prevInY, prevOutX, prevOutY;
     {
         float ndcX, ndcY;
@@ -602,10 +825,10 @@ void Renderer::AddRing(float cx, float cy, float innerRadius, float outerRadius,
         PixelToNDC(cx + innerRadius * cosA, cy + innerRadius * sinA, ndcInX, ndcInY);
         PixelToNDC(cx + outerRadius * cosA, cy + outerRadius * sinA, ndcOutX, ndcOutY);
 
-        Vertex a0{ prevInX, prevInY, r, g, b, a };
-        Vertex a1{ prevOutX, prevOutY, r, g, b, a };
-        Vertex a2{ ndcInX, ndcInY, r, g, b, a };
-        Vertex a3{ ndcOutX, ndcOutY, r, g, b, a };
+        Vertex a0{ prevInX, prevInY, rgba };
+        Vertex a1{ prevOutX, prevOutY, rgba };
+        Vertex a2{ ndcInX, ndcInY, rgba };
+        Vertex a3{ ndcOutX, ndcOutY, rgba };
 
         PushTriangle(a0, a1, a2);
         PushTriangle(a1, a3, a2);
@@ -632,10 +855,11 @@ void Renderer::AddLine(float x1, float y1, float x2, float y2, float thickness, 
     PixelToNDC(x2 + nx, y2 + ny, ndc3x, ndc3y);
     PixelToNDC(x2 - nx, y2 - ny, ndc4x, ndc4y);
 
-    Vertex v1{ ndc1x, ndc1y, r, g, b, a };
-    Vertex v2{ ndc2x, ndc2y, r, g, b, a };
-    Vertex v3{ ndc3x, ndc3y, r, g, b, a };
-    Vertex v4{ ndc4x, ndc4y, r, g, b, a };
+    const UINT64 rgba = PackColor(r, g, b, a);
+    Vertex v1{ ndc1x, ndc1y, rgba };
+    Vertex v2{ ndc2x, ndc2y, rgba };
+    Vertex v3{ ndc3x, ndc3y, rgba };
+    Vertex v4{ ndc4x, ndc4y, rgba };
 
     PushTriangle(v1, v2, v3);
     PushTriangle(v2, v4, v3);
@@ -913,24 +1137,14 @@ bool Renderer::InitText()
     if (FAILED(m_device->CreateSamplerState(&sampDesc, &m_fontSampler)))
         return false;
 
-    // Shaders + input layout for the textured quad pipeline.
-    ID3DBlob* vsBlob = nullptr;
-    ID3DBlob* psBlob = nullptr;
-    ID3DBlob* errBlob = nullptr;
-
-    if (FAILED(D3DCompile(kTextShaderSrc, strlen(kTextShaderSrc), nullptr, nullptr, nullptr,
-        "VSMain", "vs_4_0", 0, 0, &vsBlob, &errBlob)))
-    {
-        if (errBlob) errBlob->Release();
+    // Shaders + input layout for the textured quad pipeline (bytecode
+    // borrowed from the process-wide cache, see CompiledShader).
+    ID3DBlob* vsBlob = CompiledShader(kTextVS, kTextShaderSrc, "VSMain", "vs_4_0");
+    if (!vsBlob)
         return false;
-    }
-    if (FAILED(D3DCompile(kTextShaderSrc, strlen(kTextShaderSrc), nullptr, nullptr, nullptr,
-        "PSMain", "ps_4_0", 0, 0, &psBlob, &errBlob)))
-    {
-        if (errBlob) errBlob->Release();
-        vsBlob->Release();
+    ID3DBlob* psBlob = CompiledShader(kTextPS, kTextShaderSrc, "PSMain", "ps_4_0");
+    if (!psBlob)
         return false;
-    }
 
     // Same "don't trust these to succeed" fix as the shape pipeline in
     // Init() -- a null m_textVertexBuffer in particular would crash
@@ -944,13 +1158,10 @@ bool Renderer::InitText()
     D3D11_INPUT_ELEMENT_DESC layout[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR", 0, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
     if (FAILED(m_device->CreateInputLayout(layout, 3, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &m_textInputLayout)))
         ok = false;
-
-    vsBlob->Release();
-    psBlob->Release();
 
     if (!ok)
         return false;
@@ -977,7 +1188,7 @@ void Renderer::ShutdownText()
     if (m_textVs) { m_textVs->Release(); m_textVs = nullptr; }
 }
 
-void Renderer::PushGlyphQuad(float x, float y, float w, float h, const Glyph& g, float r, float gg, float b, float a)
+void Renderer::PushGlyphQuad(float x, float y, float w, float h, const Glyph& g, UINT64 rgba)
 {
     if (m_textVertices.size() + 6 > kMaxTextVertices)
         return;
@@ -986,10 +1197,10 @@ void Renderer::PushGlyphQuad(float x, float y, float w, float h, const Glyph& g,
     PixelToNDC(x, y, ndcX0, ndcY0);
     PixelToNDC(x + w, y + h, ndcX1, ndcY1);
 
-    TextVertex v0{ ndcX0, ndcY0, g.u0, g.v0, r, gg, b, a };
-    TextVertex v1{ ndcX1, ndcY0, g.u1, g.v0, r, gg, b, a };
-    TextVertex v2{ ndcX0, ndcY1, g.u0, g.v1, r, gg, b, a };
-    TextVertex v3{ ndcX1, ndcY1, g.u1, g.v1, r, gg, b, a };
+    TextVertex v0{ ndcX0, ndcY0, g.u0, g.v0, rgba };
+    TextVertex v1{ ndcX1, ndcY0, g.u1, g.v0, rgba };
+    TextVertex v2{ ndcX0, ndcY1, g.u0, g.v1, rgba };
+    TextVertex v3{ ndcX1, ndcY1, g.u1, g.v1, rgba };
 
     m_textVertices.push_back(v0);
     m_textVertices.push_back(v1);
@@ -1108,11 +1319,14 @@ void Renderer::AddPolylineSmooth(const float* xy, int count, bool closed, float 
         const float cr = rgbPerPoint ? rgbPerPoint[i * 3] : r;
         const float cg = rgbPerPoint ? rgbPerPoint[i * 3 + 1] : g;
         const float cb = rgbPerPoint ? rgbPerPoint[i * 3 + 2] : b;
+        const UINT64 edge = PackColor(cr, cg, cb, alpha[0]);
+        const UINT64 core = PackColor(cr, cg, cb, alpha[1]);
+        const UINT64 colours[4] = { edge, core, core, edge };
         for (int k = 0; k < 4; ++k)
         {
             float nx, ny;
             PixelToNDC(px + mx * offs[k] * scale, py + my * offs[k] * scale, nx, ny);
-            out.v[k] = Vertex{ nx, ny, cr, cg, cb, alpha[k] };
+            out.v[k] = Vertex{ nx, ny, colours[k] };
         }
     };
 
@@ -1165,6 +1379,7 @@ void Renderer::AddText(float x, float y, const char* text, float pixelHeight, fl
 
     const int set = SetFor(pixelHeight);
     const float scale = pixelHeight / m_setHeight[set];
+    const UINT64 rgba = PackColor(r, g, b, a);
 
     float cursor = startX;
     for (const char* p = text; *p; ++p)
@@ -1186,7 +1401,7 @@ void Renderer::AddText(float x, float y, const char* text, float pixelHeight, fl
         const float quadH = pixelHeight;
         const float quadW = gl.advancePx * scale;
 
-        PushGlyphQuad(cursor, y, quadW, quadH, gl, r, g, b, a);
+        PushGlyphQuad(cursor, y, quadW, quadH, gl, rgba);
         cursor += gl.advancePx * scale;
     }
 }

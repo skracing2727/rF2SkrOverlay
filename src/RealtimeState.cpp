@@ -4,6 +4,8 @@
 
 std::atomic<bool> g_inRealtime{ false };
 std::atomic<int> g_fuelMult{ -1 };
+std::atomic<int> g_headlightsOn{ -1 };
+std::atomic<bool> g_playerAiControl{ false };
 
 namespace
 {

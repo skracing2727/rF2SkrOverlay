@@ -3,9 +3,9 @@
 #include "Config.h"
 #include "Shortcuts.h"
 #include "Log.h"
+#include "Sound.h"
 #include <cmath>
 #include <cstring>
-#pragma comment(lib, "winmm.lib")
 
 DrsCueStore g_drsCue;
 
@@ -102,7 +102,8 @@ void DrsCueStore::PlayBeep()
     // one switch for the whole feature.
     if (!Shortcuts::Visible(Shortcuts::Drs))
         return;
-    PlaySoundA(reinterpret_cast<LPCSTR>(m_wavBuffer), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+    // Handed to the sound thread: this runs on the telemetry callback.
+    Sound::PlayMemory(m_wavBuffer);
 }
 
 void DrsCueStore::OnTelemetry(const TelemInfoV01& info)

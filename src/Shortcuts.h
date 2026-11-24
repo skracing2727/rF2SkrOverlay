@@ -15,8 +15,11 @@
 // is done per key in place (never a whole-file rewrite), so the user's own
 // hand-written comments and tuning edits in that file are left untouched.
 //
-// Everything here lives on the render thread (polled once per Present, drawn
-// in the same pass), so no locking is involved.
+// Toggling and drawing live on the render thread (polled once per Present,
+// drawn in the same pass). Reading the keyboard and wheel buttons, sending
+// the rotary menu's key presses and reading rF2's Controller.JSON happen on
+// Shortcuts' own input thread, which hands the results over through atomics
+// (and one small lock), so a frame never waits on any of them.
 class Renderer;
 
 namespace Shortcuts
@@ -47,7 +50,6 @@ namespace Shortcuts
         TyreTemps,        // per-corner tyre temperature box (camber check)
         FfbGraph,         // FFB frequency spectrum
         TrackMap,         // overhead track map
-        TyreWearPlots,    // per-tyre wear box plots inside the Tyres box
         DllCost,          // what the DLL itself costs, by module (Profiler.h)
         CoverBoxes,       // plain boxes hiding parts of the car's own display (CoverBox.h)
         ElementCount
@@ -76,6 +78,16 @@ namespace Shortcuts
     // plugin costs one branch per frame and paints nothing but its own
     // toast, which has to keep working or the key could not be found again.
     bool OverlayEnabled();
+    // HUD drawn even out of the car (Ctrl+Shift+A).
+    bool AlwaysOn();
+    // The shortcut list is open.
+    bool ListOpen();
+
+    // rF2's own "Toggle Cursor" key as display text ("F9", or "not bound"),
+    // for the layout-mode banner. A cached copy of what Controller.JSON says,
+    // kept fresh by the input thread, so it is cheap enough to call every
+    // frame.
+    void ToggleCursorKeyName(char* out, size_t outSize);
 
     // Shows a message in the same transient box as toggle confirmations and
     // the startup hint, for callers outside this file that need to surface a

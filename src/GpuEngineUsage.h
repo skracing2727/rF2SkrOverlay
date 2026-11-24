@@ -1,9 +1,11 @@
 #pragma once
 
-// System GPU 3D-engine utilization %, via the same OS "GPU Engine"
+// The game's GPU 3D-engine utilization %, via the same OS "GPU Engine"
 // performance counters Task Manager's own GPU graph (and tools built on
 // PresentMon-adjacent data) read -- NOT the D3D11 timestamp-query approach
-// PerfStats.cpp uses for CPU/GPU frame *pacing*.
+// PerfStats.cpp uses for CPU/GPU frame *pacing*. Only this process's engine
+// instances are summed (other programs' GPU work used to be included); if
+// none can be told apart, every process's are, as before.
 //
 // That distinction matters: a Present-to-Present GPU timestamp interval
 // includes any idle/wait time the GPU spends pacing to a frame cap or

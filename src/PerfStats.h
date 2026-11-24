@@ -10,6 +10,15 @@
 // GpuEngineUsage.h for why).
 namespace PerfStats
 {
+    // Polls the slow stats (process RAM, VRAM, the Windows "GPU Engine"
+    // counters, AMD board power) on a thread of its own at the perf
+    // panel's update rate. They used to run on the render thread every
+    // refresh: the GPU counter query alone cost ~6 ms, twice a second
+    // (spike log, 2026-11-23). Start after GpuEngineUsage::Init and
+    // AmdGpuPower::Init; Stop before their Shutdown.
+    void StartPoller();
+    void StopPoller();
+
     // Call once a real device/swapchain is bound (see Overlay.cpp's BindTo).
     // Safe to call again on a rebind; re-resolves the VRAM adapter.
     void Init(IDXGISwapChain* swapChain);
@@ -43,4 +52,14 @@ namespace PerfStats
     // GPU VRAM currently committed to this process's budget, in MB. False
     // if IDXGIAdapter3 (Windows 10+ / DXGI 1.4) isn't available.
     bool GetVramMB(double& outUsedMB, double& outBudgetMB);
+    // Whole graphics card, like RTSS/Afterburner: dedicated VRAM in use by
+    // every process (PDH "GPU Adapter Memory\Dedicated Usage" for rF2's
+    // adapter) and the card's dedicated VRAM size. False until both are known.
+    bool GetCardVramMB(double& outUsedMB, double& outTotalMB);
+    // Whole PC: physical RAM in use and installed (GlobalMemoryStatusEx).
+    bool GetPcRamMB(double& outUsedMB, double& outTotalMB);
+    // This plugin alone: its DLL image plus what its own C++ code has
+    // allocated (operator new is counted in PerfStats.cpp). Excludes GPU
+    // memory and anything the game or Windows allocate on its behalf.
+    bool GetPluginRamMB(double& outMB);
 }

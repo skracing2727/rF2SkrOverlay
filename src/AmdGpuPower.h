@@ -27,4 +27,7 @@ namespace AmdGpuPower
     // Current GPU power draw in watts. False if Init() wasn't called, found
     // no usable adapter/sensor, or the query failed this time.
     bool GetPowerWatts(double& outWatts);
+    // The ADL query itself, run on the stats poller thread (PerfStats); the
+    // render thread only reads what it cached via GetPowerWatts.
+    void Sample();
 }

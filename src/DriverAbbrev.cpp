@@ -607,6 +607,8 @@ bool DriverAbbrev::NameParts(long id, char* first, size_t firstSize,
         return false;
     first[0] = 0;
     last[0] = 0;
+    if (!g_ready)   // the lock is made by the first OnScoring
+        return false;
 
     char raw[kNameLen] = {};
     bool found = false;
@@ -657,6 +659,30 @@ bool DriverAbbrev::NameParts(long id, char* first, size_t firstSize,
     }
     first[w] = 0;
     return true;
+}
+
+int DriverAbbrev::Snapshot(CarInfo* out, int maxCars)
+{
+    if (!out || maxCars <= 0 || !g_ready)
+        return 0;
+    EnterCriticalSection(&g_lock);
+    const int n = (g_count < maxCars) ? g_count : maxCars;
+    for (int i = 0; i < n; ++i)
+    {
+        const Entry& e = g_entries[i];
+        CarInfo& c = out[i];
+        c.id = e.id;
+        c.place = e.place;
+        const int ci = e.colorIndex;
+        c.hasColor = ci >= 0 && ci < kPaletteSize;
+        c.r = c.hasColor ? kPalette[ci].r : 0.0f;
+        c.g = c.hasColor ? kPalette[ci].g : 0.0f;
+        c.b = c.hasColor ? kPalette[ci].b : 0.0f;
+        memcpy(c.code, e.code, sizeof(c.code));
+        c.code[sizeof(c.code) - 1] = 0;
+    }
+    LeaveCriticalSection(&g_lock);
+    return n;
 }
 
 void DriverAbbrev::Clear()

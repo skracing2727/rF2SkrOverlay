@@ -1,3 +1,4 @@
+#include "PitStint.h"
 #include "RelativeTiming.h"
 #include "TyreStore.h"
 #include "InternalsPlugin.hpp"
@@ -13,6 +14,26 @@
 #include <cmath>
 
 RelativeTimingStore g_relativeTiming;
+
+namespace
+{
+    // Fills each row's Row::Lookups from the tyre and pit-stint stores --
+    // what Draw() used to look up itself for every row on every frame.
+    void LookUpOtherStores(RelativeTimingStore::Row* rows, int count)
+    {
+        for (int r = 0; r < count; ++r)
+        {
+            const long id = rows[r].carId;
+            RelativeTimingStore::Row::Lookups& out = rows[r].lookups;
+            out = RelativeTimingStore::Row::Lookups{};
+            out.haveTyre = TyreStore::Get(id, out.tyre, sizeof(out.tyre), out.tyreR, out.tyreG, out.tyreB);
+            out.tyreRearR = out.tyreR; out.tyreRearG = out.tyreG; out.tyreRearB = out.tyreB;
+            if (out.haveTyre && out.tyre[1] == '/')
+                TyreStore::GetRearColour(id, out.tyreRearR, out.tyreRearG, out.tyreRearB);
+            out.pitLapsKnown = PitStint::Get(id, out.pitLaps);
+        }
+    }
+}
 
 void RelativeTimingStore::Init()
 {
@@ -33,6 +54,7 @@ void RelativeTimingStore::Clear()
     m_wasInPits = false;
     m_currentTrace.clear();
     m_referenceTrace.clear();
+    m_referenceMaxDist.clear();
     m_referenceLapTime = -1.0;
     m_lastTotalLapsForTrace = -1;
     m_lastLapDistForTrace = -1.0;
@@ -65,20 +87,33 @@ bool RelativeTimingStore::InterpolateTraceAt(double lapDist, double& outTime) co
     if (lapDist <= m_referenceTrace.front().first) { outTime = m_referenceTrace.front().second; return true; }
     if (lapDist >= m_referenceTrace.back().first) { outTime = m_referenceTrace.back().second; return true; }
 
-    // Linear scan -- a lap's worth of 5Hz samples is at most a few hundred
-    // points, cheap enough to not need a binary search (same reasoning as
-    // LapDelta::Reference::InterpolateAt).
-    for (size_t i = 1; i < m_referenceTrace.size(); ++i)
+    // The first sample at or past lapDist, interpolated from the one before.
+    // This runs 70-90 times every scoring tick over a few hundred points, so
+    // it is a binary search -- but not over the trace itself, which is not
+    // strictly in distance order: a sample is added whenever the distance
+    // moves on from the PREVIOUS TICK's, so a step back mid-lap (a spin, a
+    // resync) leaves a smaller distance after a larger one. The running
+    // maximum (m_referenceMaxDist) is always in order, and the first point
+    // where it reaches lapDist is exactly the first sample that does -- the
+    // same sample a front-to-back scan of the trace finds.
+    size_t i = 0;
+    if (m_referenceMaxDist.size() == m_referenceTrace.size() && lapDist == lapDist) // (NaN: no sample matches)
     {
-        if (lapDist <= m_referenceTrace[i].first)
-        {
-            const double d0 = m_referenceTrace[i - 1].first, t0 = m_referenceTrace[i - 1].second;
-            const double d1 = m_referenceTrace[i].first, t1 = m_referenceTrace[i].second;
-            const double span = d1 - d0;
-            const double frac = (span > 0.0001) ? (lapDist - d0) / span : 0.0;
-            outTime = t0 + (t1 - t0) * frac;
-            return true;
-        }
+        i = static_cast<size_t>(std::lower_bound(m_referenceMaxDist.begin() + 1, m_referenceMaxDist.end(), lapDist)
+                                - m_referenceMaxDist.begin());
+    }
+    else
+    {
+        for (i = 1; i < m_referenceTrace.size() && !(lapDist <= m_referenceTrace[i].first); ++i) {}
+    }
+    if (i < m_referenceTrace.size())
+    {
+        const double d0 = m_referenceTrace[i - 1].first, t0 = m_referenceTrace[i - 1].second;
+        const double d1 = m_referenceTrace[i].first, t1 = m_referenceTrace[i].second;
+        const double span = d1 - d0;
+        const double frac = (span > 0.0001) ? (lapDist - d0) / span : 0.0;
+        outTime = t0 + (t1 - t0) * frac;
+        return true;
     }
     outTime = m_referenceTrace.back().second;
     return true;
@@ -283,6 +318,13 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
         if (plausibleLapTime && spansLap)
         {
             m_referenceTrace = m_currentTrace;
+            m_referenceMaxDist.resize(m_referenceTrace.size());
+            double maxDist = m_referenceTrace.front().first;
+            for (size_t k = 0; k < m_referenceTrace.size(); ++k)
+            {
+                if (m_referenceTrace[k].first > maxDist) maxDist = m_referenceTrace[k].first;
+                m_referenceMaxDist[k] = maxDist;
+            }
             m_referenceLapTime = lastLap;
             Log::Write("RelativeTiming: reference lap trace accepted -- %zu points, %.0f..%.0fm, lap %.3fs",
                        m_currentTrace.size(), m_currentTrace.front().first, m_currentTrace.back().first, lastLap);
@@ -365,7 +407,9 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
         return !v->mIsPlayer && (v->mFinishStatus == 2 || v->mFinishStatus == 3);
     };
 
-    auto computeRow = [&](const VehicleScoringInfoV01* v) -> Row
+    // Everything in a row except the position-change highlight (see
+    // computeRow below for why that one is kept apart).
+    auto buildRow = [&](const VehicleScoringInfoV01* v, TrendTracker& tr) -> Row
     {
         Row row;
         const bool isPlayer = v->mIsPlayer;
@@ -479,15 +523,6 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
             gap = trackGap;
         }
 
-        // Position-change highlight: tracked for EVERY car (including the
-        // player), keyed by car ID so an overtake follows the car that moved
-        // rather than whichever row/place it happens to occupy right now. A
-        // raw mPlace change is only confirmed once the new place has held
-        // steady for positionChangeDebounceSeconds -- see TrendTracker's
-        // comment for why (first-lap/first-corner jostling would otherwise
-        // flash the highlight constantly).
-        TrendTracker& tr = GetTracker(v->mID);
-
         // Places gained over the last completed lap: compare the place held
         // at each crossing of the line with the one at the crossing before.
         if (tr.lapsSeen != v->mTotalLaps)
@@ -508,48 +543,6 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
         }
         row.haveLastLapGain = isRaceSession && tr.haveLastLapGain;
         row.lastLapGain = tr.lastLapGain;
-        {
-            const int currentPlace = static_cast<int>(v->mPlace);
-            if (tr.lastConfirmedPlace < 0)
-            {
-                tr.lastConfirmedPlace = currentPlace;
-                tr.pendingPlace = currentPlace;
-                tr.pendingPlaceTime = now;
-            }
-            else if (currentPlace != tr.pendingPlace)
-            {
-                tr.pendingPlace = currentPlace;
-                tr.pendingPlaceTime = now;
-            }
-            else if (currentPlace != tr.lastConfirmedPlace)
-            {
-                double debounceSeconds = g_relativeTimingConfig.positionChangeDebounceSeconds;
-                if (debounceSeconds < 0.0) debounceSeconds = 0.0;
-                const double sincePending = static_cast<double>(now.QuadPart - tr.pendingPlaceTime.QuadPart) / static_cast<double>(m_freq.QuadPart);
-                if (sincePending >= debounceSeconds)
-                {
-                    tr.placeChangeSign = (currentPlace < tr.lastConfirmedPlace) ? -1 : 1;
-                    tr.placeChangeTime = now;
-                    tr.lastConfirmedPlace = currentPlace;
-                }
-            }
-        }
-        if (tr.placeChangeSign != 0)
-        {
-            double holdSeconds = g_relativeTimingConfig.positionChangeHoldSeconds;
-            if (holdSeconds < 0.1) holdSeconds = 0.1;
-            const double sinceChange = (tr.placeChangeTime.QuadPart == 0) ? 1.0e9
-                : static_cast<double>(now.QuadPart - tr.placeChangeTime.QuadPart) / static_cast<double>(m_freq.QuadPart);
-            if (sinceChange < holdSeconds)
-            {
-                row.placeChangeSign = tr.placeChangeSign;
-                row.placeChangeAlpha = static_cast<float>(1.0 - sinceChange / holdSeconds);
-            }
-            else
-            {
-                tr.placeChangeSign = 0;
-            }
-        }
 
         // The player's own row comparing itself to itself is meaningless --
         // force it to exactly 0, no trend. In a race, the leader's row
@@ -601,9 +594,9 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
 
                 // The displayed number follows every ~5Hz scoring tick (the
                 // colour is judged per sector instead, see UpdateSectors).
-                // Once per tick: computeRow runs several times for the same
-                // car within one OnScoring, and a second shift would collapse
-                // prev onto cur and kill the slide.
+                // Once per tick: a car's row can still be built more than
+                // once in one OnScoring (computeRow's uncached path), and a
+                // second shift would collapse prev onto cur and kill the slide.
                 if (tr.lastDisplayTime.QuadPart != now.QuadPart)
                 {
                     // Shift cur -> prev before overwriting, so Draw() can
@@ -644,6 +637,24 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
         row.carId = v->mID;
         row.place = v->mPlace;
         strncpy_s(row.driverName, v->mDriverName, _TRUNCATE);
+        {
+            // Car number: rF2 has no field for it, but entry names carry it
+            // as "#19" (e.g. "Baggies CZ eMotorsport 2012 #19").
+            row.carNumber[0] = 0;
+            const char* vn = v->mVehicleName;
+            for (int k = 0; k < 63 && vn[k]; ++k)
+            {
+                if (vn[k] == '#' && vn[k + 1] >= '0' && vn[k + 1] <= '9')
+                {
+                    int n = 0;
+                    row.carNumber[n++] = '#';
+                    for (int j = k + 1; j < 64 && vn[j] >= '0' && vn[j] <= '9' && n < 6; ++j)
+                        row.carNumber[n++] = vn[j];
+                    row.carNumber[n] = 0;
+                    break;
+                }
+            }
+        }
         row.lastLapTime = v->mLastLapTime;
         row.gapSeconds = gap;
         row.trendPerSecond = trendPerSecond;
@@ -697,6 +708,94 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
         return row;
     };
 
+    // Position-change highlight: tracked for EVERY car (including the
+    // player), keyed by car ID so an overtake follows the car that moved
+    // rather than whichever row/place it happens to occupy right now. A
+    // raw mPlace change is only confirmed once the new place has held
+    // steady for positionChangeDebounceSeconds -- see TrendTracker's
+    // comment for why (first-lap/first-corner jostling would otherwise
+    // flash the highlight constantly).
+    auto updatePlaceChange = [&](const VehicleScoringInfoV01* v, TrendTracker& tr, Row& row)
+    {
+        {
+            const int currentPlace = static_cast<int>(v->mPlace);
+            if (tr.lastConfirmedPlace < 0)
+            {
+                tr.lastConfirmedPlace = currentPlace;
+                tr.pendingPlace = currentPlace;
+                tr.pendingPlaceTime = now;
+            }
+            else if (currentPlace != tr.pendingPlace)
+            {
+                tr.pendingPlace = currentPlace;
+                tr.pendingPlaceTime = now;
+            }
+            else if (currentPlace != tr.lastConfirmedPlace)
+            {
+                double debounceSeconds = g_relativeTimingConfig.positionChangeDebounceSeconds;
+                if (debounceSeconds < 0.0) debounceSeconds = 0.0;
+                const double sincePending = static_cast<double>(now.QuadPart - tr.pendingPlaceTime.QuadPart) / static_cast<double>(m_freq.QuadPart);
+                if (sincePending >= debounceSeconds)
+                {
+                    tr.placeChangeSign = (currentPlace < tr.lastConfirmedPlace) ? -1 : 1;
+                    tr.placeChangeTime = now;
+                    tr.lastConfirmedPlace = currentPlace;
+                }
+            }
+        }
+        row.placeChangeSign = 0;
+        row.placeChangeAlpha = 0.0f;
+        if (tr.placeChangeSign != 0)
+        {
+            double holdSeconds = g_relativeTimingConfig.positionChangeHoldSeconds;
+            if (holdSeconds < 0.1) holdSeconds = 0.1;
+            const double sinceChange = (tr.placeChangeTime.QuadPart == 0) ? 1.0e9
+                : static_cast<double>(now.QuadPart - tr.placeChangeTime.QuadPart) / static_cast<double>(m_freq.QuadPart);
+            if (sinceChange < holdSeconds)
+            {
+                row.placeChangeSign = tr.placeChangeSign;
+                row.placeChangeAlpha = static_cast<float>(1.0 - sinceChange / holdSeconds);
+            }
+            else
+            {
+                tr.placeChangeSign = 0;
+            }
+        }
+    };
+
+    // One vehicle's row. The same car is asked for up to four times a tick
+    // (the standings window, the track-relative pass, the leader's pinned
+    // row, the gap box), each of which used to redo the whole row, trace
+    // lookups included -- so it is built once and reused. Everything in it
+    // comes out the same on a repeat within a tick, except the position-
+    // change step, which is re-run on every request exactly as before (with
+    // a zero debounce, a repeat request is what confirms a new place). Not
+    // cached once more cars have been seen than there are trackers: the
+    // overflow cars then share one, and each request has to see the others'
+    // changes to it, as it always did.
+    const bool rowCacheUsable = m_trackerCount < kMaxTrackedCars;
+    bool rowCached[kMaxRowCache] = {};
+    auto computeRow = [&](const VehicleScoringInfoV01* v) -> Row
+    {
+        const ptrdiff_t idx = v - info.mVehicle;
+        if (!rowCacheUsable || idx < 0 || idx >= kMaxRowCache)
+        {
+            TrendTracker& tr = GetTracker(v->mID);
+            Row row = buildRow(v, tr);
+            updatePlaceChange(v, tr, row);
+            return row;
+        }
+        if (!rowCached[idx])
+        {
+            m_rowCacheTracker[idx] = &GetTracker(v->mID);
+            m_rowCache[idx] = buildRow(v, *m_rowCacheTracker[idx]);
+            rowCached[idx] = true;
+        }
+        Row row = m_rowCache[idx];
+        updatePlaceChange(v, *m_rowCacheTracker[idx], row);
+        return row;
+    };
+
     State newState;
     newState.totalLapsFractional = totalLapsFractional;
 
@@ -710,6 +809,8 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
             newState.fastestLapSeconds = best;
             strncpy_s(newState.fastestLapName, info.mVehicle[k].mDriverName, _TRUNCATE);
         }
+        if (info.mVehicle[k].mIsPlayer && best > 5.0 && best < 100000.0)
+            newState.myBestLapSeconds = best;
     }
     newState.stintLapsFractional = totalLapsFractional - m_stintStartTotalLaps;
 
@@ -973,6 +1074,30 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
             newState.rows[newState.rowCount++] = candidates[i];
     }
 
+    // Gap box rows: whole field ordered by place, two ahead of the player
+    // and one behind.
+    {
+        const VehicleScoringInfoV01* order[256];
+        int count = 0;
+        for (long i = 0; i < info.mNumVehicles && count < 256; ++i)
+        {
+            const VehicleScoringInfoV01* v = &info.mVehicle[i];
+            if (isRetired(v) || v->mPlace == 0) continue;
+            order[count++] = v;
+        }
+        std::sort(order, order + count, [](const VehicleScoringInfoV01* a, const VehicleScoringInfoV01* b)
+        {
+            return a->mPlace < b->mPlace;
+        });
+        int me = -1;
+        for (int i = 0; i < count; ++i)
+            if (order[i]->mIsPlayer) { me = i; break; }
+        newState.gapRowCount = 0;
+        if (me >= 0)
+            for (int i = (std::max)(0, me - 2); i <= me + 2 && i < count; ++i)
+                newState.gapRows[newState.gapRowCount++] = computeRow(order[i]);
+    }
+
     // Diagnostic (off by default): does the SDK's own gap data actually
     // update continuously? If mTimeBehindNext/mTimeBehindLeader tick along
     // smoothly rather than only changing at line crossings, they are the
@@ -1065,7 +1190,26 @@ void RelativeTimingStore::OnScoring(const ScoringInfoV01& info)
         }
     }
     if (m_raceOverFrozen)
+    {
+        // The table stays as it was, but its tyre and laps-since-stop
+        // columns kept following the cars back when Draw() looked them up
+        // live, so refresh just those. Looked up outside m_lock (it is the
+        // one Draw() takes), then applied wherever the row is still the
+        // same car.
+        State frozen = Read();
+        LookUpOtherStores(frozen.rows, frozen.rowCount);
+        LookUpOtherStores(frozen.gapRows, frozen.gapRowCount);
+        EnterCriticalSection(&m_lock);
+        for (int r = 0; r < m_state.rowCount && r < frozen.rowCount; ++r)
+            if (m_state.rows[r].carId == frozen.rows[r].carId) m_state.rows[r].lookups = frozen.rows[r].lookups;
+        for (int r = 0; r < m_state.gapRowCount && r < frozen.gapRowCount; ++r)
+            if (m_state.gapRows[r].carId == frozen.gapRows[r].carId) m_state.gapRows[r].lookups = frozen.gapRows[r].lookups;
+        LeaveCriticalSection(&m_lock);
         return;
+    }
+
+    LookUpOtherStores(newState.rows, newState.rowCount);
+    LookUpOtherStores(newState.gapRows, newState.gapRowCount);
 
     EnterCriticalSection(&m_lock);
     m_state = newState;
@@ -1106,6 +1250,24 @@ namespace
         _snprintf_s(out, outSize, _TRUNCATE, "%d:%04.1f", minutes, secRemainder);
     }
 
+    // "%+.1f" prints the same text for any two values with the same sign
+    // and the same nearest tenth, so a sliding gap only needs printing again
+    // when one of those changes. This gives the two (tenths, negative), or
+    // false when v sits too near a rounding boundary (or is too big) for
+    // that to be certain without printing it -- the caller then just does.
+    bool GapTextKey(double v, long long& tenths, bool& negative)
+    {
+        const double t = v * 10.0;
+        if (!(fabs(t) < 1.0e9))   // NaN and infinity too
+            return false;
+        const double k = floor(t + 0.5);
+        if (fabs(t - k) > 0.499)
+            return false;
+        tenths = static_cast<long long>(k);
+        negative = std::signbit(v);
+        return true;
+    }
+
     // Gap colour from the last sector both cars ran (Row::sectorVerdict):
     // green the player was faster, red they were -- the same for a car
     // ahead (pulling away) and behind (catching) -- purple for a session-
@@ -1134,7 +1296,19 @@ float RelativeTiming::BottomEdgeY(int screenWidth, int screenHeight)
     return screenHeight * g_relativeTimingConfig.posYFraction;
 }
 
+static bool DrawPanel(Renderer& renderer, int screenWidth, int screenHeight, bool gapBox);
+
 bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
+{
+    return DrawPanel(renderer, screenWidth, screenHeight, false);
+}
+
+bool RelativeTiming::DrawGapBox(Renderer& renderer, int screenWidth, int screenHeight)
+{
+    return DrawPanel(renderer, screenWidth, screenHeight, true);
+}
+
+static bool DrawPanel(Renderer& renderer, int screenWidth, int screenHeight, bool gapBox)
 {
     // Drawn every frame (no RenderThrottle): the gap numbers slide between
     // scoring samples, which a 5Hz replay showed as visible steps.
@@ -1151,10 +1325,15 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     } textBgGuard(renderer);
 
     const RelativeTimingConfig& cfg = g_relativeTimingConfig;
-    if (!cfg.enabled)
+    if (gapBox ? !cfg.showGapBox : !cfg.enabled)
         return false;
 
     RelativeTimingStore::State state = g_relativeTiming.Read();
+    if (gapBox)
+    {
+        for (int i = 0; i < state.gapRowCount; ++i) state.rows[i] = state.gapRows[i];
+        state.rowCount = state.gapRowCount;
+    }
     if (state.rowCount == 0)
     {
         // Normally nothing to show with no other cars on track -- but that
@@ -1162,7 +1341,7 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         // never be dragged or resized outside an actual multi-car session.
         // Layout mode substitutes one placeholder row so the box exists to
         // grab; every field it needs is on this struct already.
-        if (!Layout::Active())
+        if (!Layout::Preview())
             return false;
         state = RelativeTimingStore::State{};
         state.rowCount = 1;
@@ -1172,9 +1351,37 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         strcpy_s(state.rows[0].driverName, "YOU");
     }
 
+    // Layout mode: fill the panel to its full row count with placeholder
+    // rows, so it is sized and placed as it will be in a full race rather
+    // than as whatever few cars happen to be in the session now.
+    if (Layout::Preview())
+    {
+        const int full = gapBox ? 5
+            : (std::min)(static_cast<int>(RelativeTimingStore::kMaxRows),
+                         static_cast<int>(g_relativeTimingConfig.visibleCars + 0.5f));
+        int lastPlace = 0;
+        for (int i = 0; i < state.rowCount; ++i)
+            if (state.rows[i].place > lastPlace) lastPlace = state.rows[i].place;
+        while (state.rowCount < full)
+        {
+            RelativeTimingStore::Row& r = state.rows[state.rowCount++];
+            r = RelativeTimingStore::Row{};
+            r.valid = true;
+            r.place = ++lastPlace;
+            strcpy_s(r.driverName, "Driver name");
+        }
+    }
+
+    // Each row's text is kept between frames and printed again only when
+    // the value behind it changes -- the key* fields are what it was last
+    // printed from. The panel has to be drawn every frame for the sliding
+    // gaps, but re-printing ~8 strings a row for two dozen rows each frame,
+    // when almost none of them had changed, was most of its cost. One set
+    // per panel; render thread only.
     struct RowText
     {
         char place[8];
+        char carNumber[8];
         char name[28];
         char lapTime[16];
         char gap[16];
@@ -1182,7 +1389,7 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         bool isPlayer;
         bool differentLap;
         bool lapAhead;      // a lap or more ahead of you: its own colour
-        long carId;
+        bool inPits;        // car in the pit lane (greys the laps-since-stop column)
         char tyre[8];
         bool haveTyre;
         float tyreR, tyreG, tyreB;
@@ -1193,42 +1400,89 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         float placeChangeAlpha;
         char lapGain[8];
         float lapGainR, lapGainG, lapGainB;
-    };
+        bool pitKnown;      // laps since the last stop known (else "L?", greyed)
+        char pit[16];
 
-    RowText rows[RelativeTimingStore::kMaxRows];
+        bool printed;       // false until this slot's text has been printed once
+        unsigned char keyPlace;
+        char keyDriverName[32];
+        bool keyIsPlayer, keyTrackRelative;
+        int keyLapDelta;
+        double keyLapTime;
+        bool keyShowGain;
+        int keyGain;
+        bool keyPitKnown;
+        int keyPitLaps;
+        int keyGapKind;     // 0 blank (your own row), 1 "PIT", 2 a number
+        bool keyGapExact;   // the three below are valid (see GapTextKey)
+        long long keyGapTenths;
+        bool keyGapNegative;
+    };
+    static RowText s_rowText[2][RelativeTimingStore::kMaxRows];
+    RowText* const rows = s_rowText[gapBox ? 1 : 0];
+
+    // One clock read per frame for every row's gap slide, not one per row.
+    static LARGE_INTEGER s_freq = {};
+    if (s_freq.QuadPart == 0)
+        QueryPerformanceFrequency(&s_freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+
     for (int i = 0; i < state.rowCount; ++i)
     {
         const RelativeTimingStore::Row& row = state.rows[i];
         RowText& rt = rows[i];
+        const bool first = !rt.printed;
+        rt.printed = true;
 
-        sprintf_s(rt.place, "P%u", static_cast<unsigned>(row.place));
+        if (first || rt.keyPlace != row.place)
+        {
+            rt.keyPlace = row.place;
+            sprintf_s(rt.place, "P%u", static_cast<unsigned>(row.place));
+        }
+        strcpy_s(rt.carNumber, row.carNumber);
 
-        char nameBuf[32];
-        strncpy_s(nameBuf, row.driverName, _TRUNCATE);
-        if (strlen(nameBuf) > 14) nameBuf[14] = '\0';
-        if (row.isPlayer)
+        // Name and the laps-ahead/behind column, from the same few fields.
+        if (first || rt.keyIsPlayer != row.isPlayer || rt.keyTrackRelative != row.trackRelative
+            || rt.keyLapDelta != row.lapDelta || strcmp(rt.keyDriverName, row.driverName) != 0)
         {
-            sprintf_s(rt.name, "%s (you)", nameBuf);
-        }
-        else if (row.trackRelative)
-        {
-            // The duplicate "where they are on track right now" row -- the
-            // lap difference is what distinguishes it from the same car's
-            // standings row above, so it is spelled out rather than implied.
-            sprintf_s(rt.name, "%s %+dL", nameBuf, row.lapDelta);
-        }
-        else
-        {
-            sprintf_s(rt.name, "%s", nameBuf);
+            rt.keyIsPlayer = row.isPlayer;
+            rt.keyTrackRelative = row.trackRelative;
+            rt.keyLapDelta = row.lapDelta;
+            strncpy_s(rt.keyDriverName, row.driverName, _TRUNCATE);
+
+            char nameBuf[32];
+            strncpy_s(nameBuf, row.driverName, _TRUNCATE);
+            if (strlen(nameBuf) > 14) nameBuf[14] = '\0';
+            if (row.isPlayer)
+            {
+                sprintf_s(rt.name, "%s (you)", nameBuf);
+            }
+            else if (row.trackRelative)
+            {
+                // The duplicate "where they are on track right now" row -- the
+                // lap difference is what distinguishes it from the same car's
+                // standings row above, so it is spelled out rather than implied.
+                sprintf_s(rt.name, "%s %+dL", nameBuf, row.lapDelta);
+            }
+            else
+            {
+                sprintf_s(rt.name, "%s", nameBuf);
+            }
+
+            // Laps ahead (+) or behind (-) you, in its own column next to the
+            // on-track gap; nothing for a car on your lap.
+            if (!row.isPlayer && row.lapDelta != 0)
+                sprintf_s(rt.lapDiff, "%+d", row.lapDelta);
+            else
+                rt.lapDiff[0] = '\0';
         }
 
-        FormatLapTime(row.lastLapTime, rt.lapTime, sizeof(rt.lapTime));
-        // Laps ahead (+) or behind (-) you, in its own column next to the
-        // on-track gap; nothing for a car on your lap.
-        if (!row.isPlayer && row.lapDelta != 0)
-            sprintf_s(rt.lapDiff, "%+d", row.lapDelta);
-        else
-            rt.lapDiff[0] = '\0';
+        if (first || !(rt.keyLapTime == row.lastLapTime))
+        {
+            rt.keyLapTime = row.lastLapTime;
+            FormatLapTime(row.lastLapTime, rt.lapTime, sizeof(rt.lapTime));
+        }
 
         // Smoothly interpolated between the last two real ~5Hz scoring
         // samples rather than snapping straight to the newest one, so the
@@ -1239,45 +1493,72 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         // samples' timestamps aren't both populated yet (first tick a car
         // is seen).
         double displayGap = row.gapSeconds;
+        if (row.gapPrevTime.QuadPart != 0 && row.gapCurTime.QuadPart != 0 && s_freq.QuadPart != 0)
         {
-            static LARGE_INTEGER s_freq = {};
-            if (s_freq.QuadPart == 0)
-                QueryPerformanceFrequency(&s_freq);
-            if (row.gapPrevTime.QuadPart != 0 && row.gapCurTime.QuadPart != 0 && s_freq.QuadPart != 0)
+            const double tickPeriod = static_cast<double>(row.gapCurTime.QuadPart - row.gapPrevTime.QuadPart) / static_cast<double>(s_freq.QuadPart);
+            if (tickPeriod > 0.001)
             {
-                const double tickPeriod = static_cast<double>(row.gapCurTime.QuadPart - row.gapPrevTime.QuadPart) / static_cast<double>(s_freq.QuadPart);
-                if (tickPeriod > 0.001)
-                {
-                    LARGE_INTEGER now;
-                    QueryPerformanceCounter(&now);
-                    double elapsedSinceCur = static_cast<double>(now.QuadPart - row.gapCurTime.QuadPart) / static_cast<double>(s_freq.QuadPart);
-                    if (elapsedSinceCur < 0.0) elapsedSinceCur = 0.0;
-                    if (elapsedSinceCur > tickPeriod) elapsedSinceCur = tickPeriod;
-                    const double frac = elapsedSinceCur / tickPeriod;
-                    displayGap = row.gapSecondsPrev + (row.gapSeconds - row.gapSecondsPrev) * frac;
-                }
+                double elapsedSinceCur = static_cast<double>(now.QuadPart - row.gapCurTime.QuadPart) / static_cast<double>(s_freq.QuadPart);
+                if (elapsedSinceCur < 0.0) elapsedSinceCur = 0.0;
+                if (elapsedSinceCur > tickPeriod) elapsedSinceCur = tickPeriod;
+                const double frac = elapsedSinceCur / tickPeriod;
+                displayGap = row.gapSecondsPrev + (row.gapSeconds - row.gapSecondsPrev) * frac;
             }
         }
         // Your own row has no gap to show (it would only ever be the gap to
-        // yourself) -- left blank.
-        if (row.isPlayer)
-            rt.gap[0] = '\0';
-        else if (row.carInPits)
-            strcpy_s(rt.gap, "PIT");
+        // yourself) -- left blank. A sliding number is printed again only
+        // when it moves into a different tenth.
+        const int gapKind = row.isPlayer ? 0 : (row.carInPits ? 1 : 2);
+        if (gapKind != 2)
+        {
+            if (first || rt.keyGapKind != gapKind)
+            {
+                if (gapKind == 0) rt.gap[0] = '\0';
+                else strcpy_s(rt.gap, "PIT");
+            }
+            rt.keyGapExact = false;
+        }
         else
-            sprintf_s(rt.gap, "%+.1f", displayGap);
+        {
+            long long tenths = 0;
+            bool negative = false;
+            const bool exact = GapTextKey(displayGap, tenths, negative);
+            if (first || rt.keyGapKind != 2 || !exact || !rt.keyGapExact
+                || tenths != rt.keyGapTenths || negative != rt.keyGapNegative)
+            {
+                sprintf_s(rt.gap, "%+.1f", displayGap);
+            }
+            rt.keyGapExact = exact;
+            rt.keyGapTenths = tenths;
+            rt.keyGapNegative = negative;
+        }
+        rt.keyGapKind = gapKind;
 
         rt.isPlayer = row.isPlayer;
-        rt.carId = row.carId;
-        rt.tyre[0] = '\0';
-        rt.haveTyre = false;
-        rt.tyreR = rt.tyreG = rt.tyreB = 1.0f;
-        if (cfg.showTyre)
-            rt.haveTyre = TyreStore::Get(row.carId, rt.tyre, sizeof(rt.tyre),
-                                         rt.tyreR, rt.tyreG, rt.tyreB);
-        rt.tyreRearR = rt.tyreR; rt.tyreRearG = rt.tyreG; rt.tyreRearB = rt.tyreB;
-        if (rt.haveTyre && rt.tyre[1] == '/')
-            TyreStore::GetRearColour(row.carId, rt.tyreRearR, rt.tyreRearG, rt.tyreRearB);
+        rt.inPits = row.carInPits;
+        // Compound, as looked up at scoring time (Row::Lookups).
+        const RelativeTimingStore::Row::Lookups& found = row.lookups;
+        rt.haveTyre = cfg.showTyre && found.haveTyre;
+        if (rt.haveTyre)
+        {
+            strcpy_s(rt.tyre, found.tyre);
+            rt.tyreR = found.tyreR; rt.tyreG = found.tyreG; rt.tyreB = found.tyreB;
+            rt.tyreRearR = found.tyreRearR; rt.tyreRearG = found.tyreRearG; rt.tyreRearB = found.tyreRearB;
+        }
+        else
+        {
+            rt.tyre[0] = '\0';
+            rt.tyreR = rt.tyreG = rt.tyreB = 1.0f;
+            rt.tyreRearR = rt.tyreRearG = rt.tyreRearB = 1.0f;
+        }
+        // Laps since the car's last pit stop.
+        if (first || rt.keyPitKnown != found.pitLapsKnown || (found.pitLapsKnown && rt.keyPitLaps != found.pitLaps))
+        {
+            rt.keyPitKnown = found.pitLapsKnown;
+            rt.keyPitLaps = found.pitLaps;
+            if (found.pitLapsKnown) sprintf_s(rt.pit, "L%d", found.pitLaps); else strcpy_s(rt.pit, "L?");
+        }
+        rt.pitKnown = found.pitLapsKnown;
         // Blue for any car not on your lap -- one you are lapping, or one
         // lapping you (the blue-flag case, where it matters most).
         // Blue specifically means "this car is a lap down" (classic blue-flag
@@ -1292,15 +1573,20 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         rt.placeChangeAlpha = row.placeChangeAlpha;
 
         // Places gained/lost last lap: green +N, red -N, blank when none.
-        rt.lapGain[0] = '\0';
-        rt.lapGainR = cfg.colorR; rt.lapGainG = cfg.colorG; rt.lapGainB = cfg.colorB;
-        if (row.haveLastLapGain && row.lastLapGain != 0)
+        const bool showGain = row.haveLastLapGain && row.lastLapGain != 0;
+        if (first || rt.keyShowGain != showGain || (showGain && rt.keyGain != row.lastLapGain))
         {
-            sprintf_s(rt.lapGain, "%+d", row.lastLapGain);
+            rt.keyShowGain = showGain;
+            rt.keyGain = row.lastLapGain;
+            if (showGain) sprintf_s(rt.lapGain, "%+d", row.lastLapGain);
+            else rt.lapGain[0] = '\0';
+        }
+        rt.lapGainR = cfg.colorR; rt.lapGainG = cfg.colorG; rt.lapGainB = cfg.colorB;
+        if (showGain)
+        {
             if (row.lastLapGain > 0) { rt.lapGainR = 0.25f; rt.lapGainG = 0.9f; rt.lapGainB = 0.3f; }
             else                     { rt.lapGainR = 1.0f;  rt.lapGainG = 0.25f; rt.lapGainB = 0.25f; }
         }
-
         // The player's own row is always exactly 0 with no trend -- color it
         // plain (the row's own text color) rather than running a trivial 0
         // through the gaining/losing rule, which would just paint it red.
@@ -1355,7 +1641,7 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     // value downstream -- text height, padding, gaps, corner radii --
     // scales with it in exact proportion, because they all already
     // derive from this one value.
-    const float uiScale = static_cast<float>(screenHeight) / 2160.0f * cfg.scale;
+    const float uiScale = static_cast<float>(screenHeight) / 2160.0f * (gapBox ? cfg.gapScale : cfg.scale);
     const float textHeightPx = cfg.textHeightPx * uiScale;
     const float rowGapPx = cfg.rowGapPx * uiScale;
     const float columnGapPx = cfg.columnGapPx * uiScale;
@@ -1370,53 +1656,89 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     // living in the fuel/tyre panel -- this header already carries the
     // session's own lap counters, so the race's overall length belongs
     // alongside them, not off in an unrelated panel.
-    const FuelStore::State fuel = g_fuelStore.Read();
-    char headerBuf[128];
-
-    // Time (or laps) left in whatever session this is -- NOT race-only.
-    // Practice and qualifying report their own time limit through the same
-    // mEndET the race does (see FuelStore), so the clock is just as
-    // available there and just as wanted; it used to be unreachable purely
-    // because the whole branch below was gated on isRaceSession. No session
-    // type is named: the number is what matters, and the driver knows which
-    // session they are in.
-    char remainingBuf[24] = "";
-    if (fuel.isLapRace && fuel.lapsLeft >= 0.0)
-        sprintf_s(remainingBuf, "%d laps left", static_cast<int>(fuel.lapsLeft + 0.5));
-    else if (fuel.isTimedRace && fuel.raceMinutesLeft >= 0.0)
+    //
+    // Standings only -- the gap box has no header or footer, so it skips
+    // both. Kept between frames like the row text above: printed again only
+    // when something it is printed from changes (5Hz at most).
+    static char headerBuf[128] = "";
+    float headerW = 0.0f;
+    if (!gapBox)
     {
-        const int totalSeconds = static_cast<int>(fuel.raceMinutesLeft * 60.0 + 0.5);
-        sprintf_s(remainingBuf, "%d:%02d left", totalSeconds / 60, totalSeconds % 60);
-    }
+        const FuelStore::State fuel = g_fuelStore.Read();
 
-    if (fuel.isRaceSession && fuel.raceTotalLaps >= 0.0)
-    {
+        // Time (or laps) left in whatever session this is -- NOT race-only.
+        // Practice and qualifying report their own time limit through the same
+        // mEndET the race does (see FuelStore), so the clock is just as
+        // available there and just as wanted; it used to be unreachable purely
+        // because the whole branch below was gated on isRaceSession. No session
+        // type is named: the number is what matters, and the driver knows which
+        // session they are in. remainingKind: 0 none, 1 laps, 2 time.
+        int remainingKind = 0, remaining = 0;
+        if (fuel.isLapRace && fuel.lapsLeft >= 0.0)
+        {
+            remainingKind = 1;
+            remaining = static_cast<int>(fuel.lapsLeft + 0.5);
+        }
+        else if (fuel.isTimedRace && fuel.raceMinutesLeft >= 0.0)
+        {
+            remainingKind = 2;
+            remaining = static_cast<int>(fuel.raceMinutesLeft * 60.0 + 0.5);
+        }
         // A race additionally knows its own total distance, so the lap
         // counter can read "lap X of Y" rather than just counting up.
-        char totalLapsBuf[16];
-        const int totalLapsInt = static_cast<int>(fuel.raceTotalLaps + 0.5);
-        if (fuel.raceTotalLapsIsEstimate)
-            sprintf_s(totalLapsBuf, "~%d", totalLapsInt);
-        else
-            sprintf_s(totalLapsBuf, "%d", totalLapsInt);
+        // totalKind: 0 none, 1 exact, 2 an estimate.
+        int totalKind = 0, totalLapsInt = 0;
+        if (fuel.isRaceSession && fuel.raceTotalLaps >= 0.0)
+        {
+            totalKind = fuel.raceTotalLapsIsEstimate ? 2 : 1;
+            totalLapsInt = static_cast<int>(fuel.raceTotalLaps + 0.5);
+        }
 
-        if (remainingBuf[0])
-            sprintf_s(headerBuf, "Stint %.1f | Lap %.1f / %s | %s",
-                      state.stintLapsFractional, state.totalLapsFractional, totalLapsBuf, remainingBuf);
-        else
-            sprintf_s(headerBuf, "Stint %.1f | Lap %.1f / %s",
-                      state.stintLapsFractional, state.totalLapsFractional, totalLapsBuf);
+        static bool s_printed = false;
+        static int s_remainingKind, s_remaining, s_totalKind, s_totalLaps;
+        static double s_stint, s_total;
+        if (!s_printed || remainingKind != s_remainingKind || remaining != s_remaining
+            || totalKind != s_totalKind || totalLapsInt != s_totalLaps
+            || !(state.stintLapsFractional == s_stint) || !(state.totalLapsFractional == s_total))
+        {
+            s_printed = true;
+            s_remainingKind = remainingKind; s_remaining = remaining;
+            s_totalKind = totalKind; s_totalLaps = totalLapsInt;
+            s_stint = state.stintLapsFractional; s_total = state.totalLapsFractional;
+
+            char remainingBuf[24] = "";
+            if (remainingKind == 1)
+                sprintf_s(remainingBuf, "%d laps left", remaining);
+            else if (remainingKind == 2)
+                sprintf_s(remainingBuf, "%d:%02d left", remaining / 60, remaining % 60);
+
+            if (totalKind != 0)
+            {
+                char totalLapsBuf[16];
+                if (totalKind == 2)
+                    sprintf_s(totalLapsBuf, "~%d", totalLapsInt);
+                else
+                    sprintf_s(totalLapsBuf, "%d", totalLapsInt);
+
+                if (remainingBuf[0])
+                    sprintf_s(headerBuf, "Stint %.1f | Lap %.1f / %s | %s",
+                              state.stintLapsFractional, state.totalLapsFractional, totalLapsBuf, remainingBuf);
+                else
+                    sprintf_s(headerBuf, "Stint %.1f | Lap %.1f / %s",
+                              state.stintLapsFractional, state.totalLapsFractional, totalLapsBuf);
+            }
+            else if (remainingBuf[0])
+            {
+                sprintf_s(headerBuf, "Stint %.1f | Total %.1f | %s",
+                          state.stintLapsFractional, state.totalLapsFractional, remainingBuf);
+            }
+            else
+            {
+                sprintf_s(headerBuf, "Stint %.1f | Total %.1f", state.stintLapsFractional, state.totalLapsFractional);
+            }
+        }
+        headerW = renderer.MeasureText(headerBuf, textHeightPx);
     }
-    else if (remainingBuf[0])
-    {
-        sprintf_s(headerBuf, "Stint %.1f | Total %.1f | %s",
-                  state.stintLapsFractional, state.totalLapsFractional, remainingBuf);
-    }
-    else
-    {
-        sprintf_s(headerBuf, "Stint %.1f | Total %.1f", state.stintLapsFractional, state.totalLapsFractional);
-    }
-    const float headerW = renderer.MeasureText(headerBuf, textHeightPx);
 
     // Column widths: measured from FIXED worst-case reference strings, not
     // from the actual rows this frame -- using live content made the whole
@@ -1438,38 +1760,90 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     const float tyreW = cfg.showTyre ? renderer.MeasureText("S/M", textHeightPx) : 0.0f;
     const float tyreAdvance = cfg.showTyre ? (tyreW + colGap) : 0.0f;
     const float gainW = renderer.MeasureText("+99", textHeightPx);
-    const float tableW = placeW + colGap + gainW + colGap + nameW + colGap + gapW + colGap + lapDiffW + colGap + lapW + tyreAdvance;
+    // Laps since the car's last pit stop, "L99" at most wide.
+    const bool showPitLaps = cfg.showPitLaps;
+    const float pitW = showPitLaps ? renderer.MeasureText("L999", textHeightPx) : 0.0f;
+    const float pitAdvance = showPitLaps ? (pitW + colGap) : 0.0f;
+    const float numW = cfg.showCarNumber ? renderer.MeasureText("#999", textHeightPx) : 0.0f;
+    const float numAdvance = cfg.showCarNumber ? (numW + colGap) : 0.0f;
+    const float tableW = numAdvance + placeW + colGap + gainW + colGap + nameW + colGap + gapW + colGap + lapDiffW + colGap + lapW + tyreAdvance + pitAdvance;
 
-    // Footer: the session's fastest lap, who set it, in purple.
-    char fastestBuf[80] = "";
-    if (state.fastestLapSeconds > 0.0)
+    // Footer: the session's fastest lap, who set it, in purple, then your
+    // own best lap this SESSION (not the all-time best) on the same line
+    // after it. Standings only, and printed again only when one changes.
+    static char fastestBuf[80] = "";
+    static char pbBuf[40] = "";
+    float fastestW = 0.0f, footerW = 0.0f;
+    bool haveFooter = false;
+    if (!gapBox)
     {
-        char t[16];
-        FormatLapTime(state.fastestLapSeconds, t, sizeof(t));
-        sprintf_s(fastestBuf, "Fastest lap  %s  %.24s", t, state.fastestLapName);
-    }
-    const bool haveFooter = fastestBuf[0] != '\0';
-    const float footerW = haveFooter ? renderer.MeasureText(fastestBuf, textHeightPx) : 0.0f;
+        static bool s_printed = false;
+        static double s_fastest, s_pb;
+        static char s_fastestName[32];
+        if (!s_printed || !(state.fastestLapSeconds == s_fastest) || !(state.myBestLapSeconds == s_pb)
+            || strcmp(state.fastestLapName, s_fastestName) != 0)
+        {
+            s_printed = true;
+            s_fastest = state.fastestLapSeconds;
+            s_pb = state.myBestLapSeconds;
+            strncpy_s(s_fastestName, state.fastestLapName, _TRUNCATE);
 
-    const float contentW = (std::max)((std::max)(tableW, headerW), footerW);
-    const float contentH = static_cast<float>(state.rowCount + 1 + (haveFooter ? 1 : 0)) * rowStep - rowGapPx; // +1 header, +1 footer
+            fastestBuf[0] = '\0';
+            if (state.fastestLapSeconds > 0.0)
+            {
+                char t[16];
+                FormatLapTime(state.fastestLapSeconds, t, sizeof(t));
+                sprintf_s(fastestBuf, "Fastest lap  %s  %.24s", t, state.fastestLapName);
+            }
+            pbBuf[0] = '\0';
+            const double pb = state.myBestLapSeconds;
+            if (pb > 0.0)
+            {
+                char t[16];
+                FormatLapTime(pb, t, sizeof(t));
+                sprintf_s(pbBuf, "%sPB  %s", fastestBuf[0] ? "    " : "", t);
+            }
+        }
+        fastestW = fastestBuf[0] ? renderer.MeasureText(fastestBuf, textHeightPx) : 0.0f;
+        haveFooter = fastestBuf[0] != '\0' || pbBuf[0] != '\0';
+        footerW = fastestW + (pbBuf[0] ? renderer.MeasureText(pbBuf, textHeightPx) : 0.0f);
+    }
+
+    const bool showHeader = !gapBox;
+    const bool showFooter = haveFooter && !gapBox;
+    const float contentW = gapBox ? tableW : (std::max)((std::max)(tableW, headerW), footerW);
+    const float contentH = static_cast<float>(state.rowCount + (showHeader ? 1 : 0) + (showFooter ? 1 : 0)) * rowStep - rowGapPx;
 
     // (posXFraction, posYFraction) anchors the panel's own top-right outer
     // corner (padding included), matching the "top right = timing metrics"
     // layout convention.
-    const float panelRightX = screenWidth * cfg.posXFraction;
-    const float panelTopY = screenHeight * cfg.posYFraction;
+    if (gapBox && (cfg.gapPosXFraction < 0.0f || cfg.gapPosYFraction < 0.0f))
+    {
+        // First draw: start just under the standings, right edges lined up.
+        g_relativeTimingConfig.gapPosXFraction = cfg.posXFraction;
+        const float under = s_lastBottomEdgeY >= 0.0f ? s_lastBottomEdgeY : screenHeight * (cfg.posYFraction + 0.25f);
+        g_relativeTimingConfig.gapPosYFraction = (under + 12.0f * uiScale) / screenHeight;
+    }
+    const float panelRightX = screenWidth * (gapBox ? cfg.gapPosXFraction : cfg.posXFraction);
+    const float panelTopY = screenHeight * (gapBox ? cfg.gapPosYFraction : cfg.posYFraction);
     const float halfW = contentW * 0.5f + bgPaddingPx;
     const float halfH = contentH * 0.5f + bgPaddingPx;
     const float centerX = panelRightX - halfW;
     const float centerY = panelTopY + halfH;
 
-    s_lastBottomEdgeY = centerY + halfH;
-
-    Layout::Register("Standings", "RelativeTiming", "PosXFraction", "PosYFraction",
-                     &g_relativeTimingConfig.posXFraction, &g_relativeTimingConfig.posYFraction,
-                     centerX, centerY, halfW, halfH,
-                     &g_relativeTimingConfig.scale, "Scale");
+    if (gapBox)
+        Layout::Register("Gap box", "RelativeTiming", "GapBoxPosXFraction", "GapBoxPosYFraction",
+                         &g_relativeTimingConfig.gapPosXFraction, &g_relativeTimingConfig.gapPosYFraction,
+                         centerX, centerY, halfW, halfH,
+                         &g_relativeTimingConfig.gapScale, "GapBoxScale");
+    else
+    {
+        s_lastBottomEdgeY = centerY + halfH;
+        Layout::Register("Standings", "RelativeTiming", "PosXFraction", "PosYFraction",
+                         &g_relativeTimingConfig.posXFraction, &g_relativeTimingConfig.posYFraction,
+                         centerX, centerY, halfW, halfH,
+                         &g_relativeTimingConfig.scale, "Scale");
+    }
 
     if (cfg.bgEnabled)
     {
@@ -1480,8 +1854,11 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     const float leftX = centerX - contentW * 0.5f;
     float y = centerY - contentH * 0.5f;
 
-    renderer.AddText(leftX, y, headerBuf, textHeightPx, cfg.colorR, cfg.colorG, cfg.colorB, 1.0f, Renderer::HAlign::Left);
-    y += rowStep;
+    if (showHeader)
+    {
+        renderer.AddText(leftX, y, headerBuf, textHeightPx, cfg.colorR, cfg.colorG, cfg.colorB, 1.0f, Renderer::HAlign::Left);
+        y += rowStep;
+    }
 
     for (int i = 0; i < state.rowCount; ++i)
     {
@@ -1519,6 +1896,12 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         float x = leftX;
         rowText(x, rt.place);
         x += placeW + colGap;
+        if (cfg.showCarNumber)
+        {
+            if (rt.carNumber[0])
+                renderer.AddText(x, y, rt.carNumber, textHeightPx, rowR, rowG, rowB, 0.75f, Renderer::HAlign::Left);
+            x += numW + colGap;
+        }
         if (rt.lapGain[0])
             renderer.AddText(x + gainW, y, rt.lapGain, textHeightPx, rt.lapGainR, rt.lapGainG, rt.lapGainB, 1.0f, Renderer::HAlign::Right);
         x += gainW + colGap;
@@ -1561,12 +1944,26 @@ bool RelativeTiming::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                                  rowR, rowG, rowB, 0.5f, Renderer::HAlign::Left);
             }
         }
+        if (showPitLaps)
+        {
+            // x is at the last drawn column's left edge: step past it.
+            x += cfg.showTyre ? (tyreW + colGap) : (lapW + colGap);
+            // Greyed while the car is in the pits, or when not known.
+            const float a = (rt.inPits || !rt.pitKnown) ? 0.45f : 1.0f;
+            renderer.AddText(x + pitW, y, rt.pit, textHeightPx, rowR, rowG, rowB, a, Renderer::HAlign::Right);
+        }
 
         y += rowStep;
     }
 
-    if (haveFooter)
-        renderer.AddText(leftX, y, fastestBuf, textHeightPx, kPurpleR, kPurpleG, kPurpleB, 1.0f, Renderer::HAlign::Left);
+    if (showFooter)
+    {
+        if (fastestBuf[0])
+            renderer.AddText(leftX, y, fastestBuf, textHeightPx, kPurpleR, kPurpleG, kPurpleB, 1.0f, Renderer::HAlign::Left);
+        if (pbBuf[0])
+            renderer.AddText(leftX + fastestW, y, pbBuf, textHeightPx, cfg.colorR, cfg.colorG, cfg.colorB, 1.0f,
+                             Renderer::HAlign::Left);
+    }
 
     return true;
 }

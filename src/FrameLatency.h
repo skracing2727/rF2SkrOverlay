@@ -15,6 +15,12 @@ namespace FrameLatency
 {
     void Init();
 
+    // Whether anything currently shows the latency (Overlay.cpp sets this
+    // every frame). While false, nothing is measured at all -- no
+    // GetLastPresentCount/GetFrameStatistics calls around Present -- and the
+    // last value is simply kept.
+    void SetWanted(bool wanted);
+
     // Call immediately before the real (unhooked) Present().
     void OnBeforePresent();
     // Call immediately after the real (unhooked) Present() returns.

@@ -1,27 +1,69 @@
 #include "Log.h"
+#include "Persist.h"
 #include "RealtimeState.h"
 #include <Windows.h>
 #include <cstdio>
 #include <cstdarg>
-#include <string>
+#include <cstring>
+#include <memory>
+#include <vector>
 
 namespace
 {
     char g_logPath[MAX_PATH] = {};
     CRITICAL_SECTION g_lock;
     bool g_ready = false;
-    std::string g_buffer;
+
+    // The buffer is a list of fixed-size chunks rather than one growing
+    // string: a string has to be copied whole every time it outgrows its
+    // allocation, and at tens of MB that copy -- under the lock, on whatever
+    // thread happened to log -- was a frame-sized stall. Appending to a chunk
+    // is one short copy; a full chunk just starts a new one.
+    //
+    // A line never straddles two chunks, so dropping the oldest chunk (below)
+    // always leaves the buffer starting on a whole line.
+    const size_t kChunkBytes = 256 * 1024;
+    struct Chunk
+    {
+        size_t used = 0;
+        char data[kChunkBytes];
+    };
+    std::vector<std::unique_ptr<Chunk>> g_chunks;
+
     // Cap against unbounded growth across an extremely long continuous
     // realtime stint -- drops the OLDEST buffered text rather than refusing
     // new lines, since the newest diagnostic context is the more useful half
     // to keep. 256 KB used to hold only ~7 minutes with the old BalanceLog and
     // LogRaceGaps on (~37 KB/min), losing most of a race; 64 MB is ~29 hours
     // at that rate, so in practice nothing is ever dropped.
-    const size_t kMaxBufferBytes = 64 * 1024 * 1024;
-    // When the cap is hit, trim down to this much in one go rather than a
-    // line at a time -- erasing the front of a 64 MB string on every Write()
-    // would move the whole buffer each line.
-    const size_t kTrimToBytes = kMaxBufferBytes / 4 * 3;
+    const size_t kMaxChunks = 64 * 1024 * 1024 / kChunkBytes;
+
+    // Caller holds g_lock. 'len' is at most one formatted line (~512 bytes).
+    void Append(const char* text, size_t len)
+    {
+        if (g_chunks.empty() || g_chunks.back()->used + len > kChunkBytes)
+        {
+            if (g_chunks.size() >= kMaxChunks)
+                g_chunks.erase(g_chunks.begin());   // a pointer move per chunk, not a text copy
+            g_chunks.push_back(std::unique_ptr<Chunk>(new Chunk));
+        }
+        Chunk& c = *g_chunks.back();
+        memcpy(c.data + c.used, text, len);
+        c.used += len;
+    }
+
+    void WriteChunks(const std::vector<std::unique_ptr<Chunk>>& chunks)
+    {
+        if (chunks.empty())
+            return;
+        FILE* f = nullptr;
+        if (fopen_s(&f, g_logPath, "a") == 0 && f)
+        {
+            for (const std::unique_ptr<Chunk>& c : chunks)
+                fwrite(c->data, 1, c->used, f);
+            fclose(f);
+        }
+    }
 }
 
 void Log::Init()
@@ -79,27 +121,21 @@ void Log::Write(const char* fmt, ...)
     // buffer must NOT reach the CRT's default invalid-parameter handler,
     // which __fastfails the whole process rather than just this one line
     // (confirmed the hard way in an earlier build). A clipped log line is a
-    // fine trade for that.
-    _vsnprintf_s(line + prefixLen, sizeof(line) - static_cast<size_t>(prefixLen), _TRUNCATE, fmt, args);
+    // fine trade for that. One byte is kept back for the newline.
+    _vsnprintf_s(line + prefixLen, sizeof(line) - 1 - static_cast<size_t>(prefixLen), _TRUNCATE, fmt, args);
     va_end(args);
+    size_t len = strlen(line);
+    line[len++] = '\n';
 
     EnterCriticalSection(&g_lock);
-    g_buffer += line;
-    g_buffer += '\n';
-    if (g_buffer.size() > kMaxBufferBytes)
-    {
-        // Cut at a line boundary so the file never starts mid-line.
-        size_t cut = g_buffer.find('\n', g_buffer.size() - kTrimToBytes);
-        cut = (cut == std::string::npos) ? g_buffer.size() - kTrimToBytes : cut + 1;
-        g_buffer.erase(0, cut);
-    }
+    Append(line, len);
     LeaveCriticalSection(&g_lock);
 
-    // Driving: buffer only, no disk touch -- see FlushBuffered(). Anywhere
-    // else (menu, garage, session monitor) there's no frame-time budget to
-    // protect, so this keeps the exact same immediacy Write() always had.
+    // Never any disk access here (the disk rule, Persist.cpp). Out of the
+    // car, ask the Persist thread for a pass so the line still reaches the
+    // file within about a second; while driving it waits for the car to stop.
     if (!g_inRealtime)
-        FlushBuffered();
+        Persist::RequestAll();
 }
 
 void Log::FlushBuffered()
@@ -107,18 +143,15 @@ void Log::FlushBuffered()
     if (!g_ready)
         return;
 
+    // Swap the chunk list out under the lock (a few pointers), write with
+    // the lock released, so a thread logging meanwhile never waits for the
+    // disk. Only the Persist thread and the render hook's crash handler call
+    // this; two writers at once could interleave whole chunks in the file,
+    // never corrupt one.
+    std::vector<std::unique_ptr<Chunk>> toWrite;
     EnterCriticalSection(&g_lock);
-    std::string toWrite;
-    toWrite.swap(g_buffer);
+    toWrite.swap(g_chunks);
     LeaveCriticalSection(&g_lock);
 
-    if (toWrite.empty())
-        return;
-
-    FILE* f = nullptr;
-    if (fopen_s(&f, g_logPath, "a") == 0 && f)
-    {
-        fwrite(toWrite.data(), 1, toWrite.size(), f);
-        fclose(f);
-    }
+    WriteChunks(toWrite);
 }

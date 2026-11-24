@@ -30,6 +30,15 @@ namespace
     // is visible in the log instead of just "no number appeared".
     int g_diagLogCount = 0;
     const int kMaxDiagLogs = 20;
+
+    // Set from the render thread before each Present (see SetWanted).
+    bool g_wanted = true;
+
+    // Once the "not fullscreen" failure is established (the usual case in
+    // windowed/borderless), GetFrameStatistics is only retried about once a
+    // second instead of after every Present, so a switch to exclusive
+    // fullscreen is still noticed within a second.
+    LARGE_INTEGER g_lastFailedRetry = {};
 }
 
 void FrameLatency::Init()
@@ -37,16 +46,49 @@ void FrameLatency::Init()
     QueryPerformanceFrequency(&g_freq);
 }
 
+void FrameLatency::SetWanted(bool wanted)
+{
+    if (wanted && !g_wanted)
+    {
+        // Present counts noted before the pause are of no use any more (and
+        // could belong to another swapchain by now): start the ring afresh.
+        for (Entry& e : g_history)
+            e.valid = false;
+        g_consecutiveInvalidCall = 0;
+    }
+    g_wanted = wanted;
+}
+
 void FrameLatency::OnBeforePresent()
 {
+    if (!g_wanted)
+        return;
     QueryPerformanceCounter(&g_pendingCallTime);
     g_hasPending = true;
 }
 
 void FrameLatency::OnAfterPresent(IDXGISwapChain* swapChain)
 {
+    if (!g_wanted)
+    {
+        g_hasPending = false;
+        return;
+    }
     if (!swapChain || g_freq.QuadPart == 0)
         return;
+
+    // Known not to work right now (see g_lastFailedRetry): skip this frame
+    // entirely unless a second has passed since the last try.
+    if (g_consecutiveInvalidCall >= kInvalidCallThreshold && g_hasPending)
+    {
+        if (g_lastFailedRetry.QuadPart != 0
+            && g_pendingCallTime.QuadPart - g_lastFailedRetry.QuadPart < g_freq.QuadPart)
+        {
+            g_hasPending = false;
+            return;
+        }
+        g_lastFailedRetry = g_pendingCallTime;
+    }
 
     // Tag the frame we just submitted with the call time recorded a moment ago.
     if (g_hasPending)

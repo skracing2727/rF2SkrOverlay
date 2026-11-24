@@ -1,3 +1,4 @@
+#include <atomic>
 #include "AmdGpuPower.h"
 #include "Log.h"
 #include <windows.h>
@@ -164,7 +165,29 @@ void AmdGpuPower::Shutdown()
     g_QueryPMLog = nullptr;
 }
 
+namespace
+{
+    std::atomic<double> g_cachedWatts{ 0.0 };
+    std::atomic<bool> g_haveCachedWatts{ false };
+}
+static bool QueryPowerWatts(double& outWatts);
+
+void AmdGpuPower::Sample()
+{
+    double w = 0.0;
+    const bool ok = QueryPowerWatts(w);
+    if (ok) g_cachedWatts.store(w, std::memory_order_relaxed);
+    g_haveCachedWatts.store(ok, std::memory_order_relaxed);
+}
+
 bool AmdGpuPower::GetPowerWatts(double& outWatts)
+{
+    if (!g_haveCachedWatts.load(std::memory_order_relaxed)) return false;
+    outWatts = g_cachedWatts.load(std::memory_order_relaxed);
+    return true;
+}
+
+static bool QueryPowerWatts(double& outWatts)
 {
     if (!g_context || !g_haveSensor || !g_QueryPMLog)
         return false;

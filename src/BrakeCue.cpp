@@ -7,11 +7,13 @@
 #include "Shortcuts.h"
 #include "Log.h"
 #include "LapDelta.h"
+#include "Persist.h"
+#include "Sound.h"
+#include "StoreFile.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
-#pragma comment(lib, "winmm.lib")
 
 BrakeCueStore g_brakeCue;
 
@@ -103,9 +105,9 @@ void BrakeCueStore::PlayBeep()
     // still beeping at you from a widget you cannot see.
     if (!Shortcuts::Visible(Shortcuts::BrakeCue))
         return;
-    // SND_ASYNC: returns immediately, plays on a system-managed thread -- does
-    // not block the game's telemetry callback.
-    PlaySoundA(reinterpret_cast<LPCSTR>(m_wavBuffer), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+    // Handed to the sound thread: even SND_ASYNC PlaySound opens the wave
+    // device before returning, and this is the game's telemetry callback.
+    Sound::PlayMemory(m_wavBuffer);
 }
 
 double BrakeCueStore::LeadTimeSeconds() const
@@ -443,9 +445,11 @@ void BrakeCueStore::Clear()
     m_referenceLapTime = -1.0;
 
     // Callers flush first (see Plugin.cpp); reloaded on the next scoring tick.
+    AcquireSRWLockExclusive(&m_saveLock);
     m_savedLaps.clear();
     m_savedKey.clear();
     m_savedDirty = false;
+    ReleaseSRWLockExclusive(&m_saveLock);
     m_pendingSave = false;
     m_pendingBrake.clear();
 
@@ -496,7 +500,7 @@ bool BrakeCue::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     // dragged or resized before you had driven enough to populate it.
     // Layout mode bypasses the guard; the state's own -1/0 defaults print as
     // harmless placeholder numbers below.
-    if (state.sampleCount <= 0 && !Layout::Active())
+    if (state.sampleCount <= 0 && !Layout::Preview())
         return false;
 
     // Same reference-resolution scaling as the other pixel-sized widgets.
@@ -561,10 +565,10 @@ namespace
 
 void BrakeCueStore::LoadSavedLaps(const std::string& key, size_t bins)
 {
-    m_savedKey = key;
-    m_savedLaps.clear();
-    m_savedDirty = false;
-
+    // Read into a local list first, outside any lock; m_saveLock is only
+    // taken to swap it in (FlushIfDirty may be copying the old list on the
+    // save thread at the same moment).
+    std::vector<SavedLap> laps;
     char dir[MAX_PATH];
     LapDeltaStore::SaveDir(dir, sizeof(dir));
     char path[MAX_PATH];
@@ -585,7 +589,7 @@ void BrakeCueStore::LoadSavedLaps(const std::string& key, size_t bins)
                     if (fread(&lap.lapTime, sizeof(double), 1, f) != 1
                         || fread(lap.brake.data(), sizeof(float), bins, f) != bins)
                         break;
-                    m_savedLaps.push_back(std::move(lap));
+                    laps.push_back(std::move(lap));
                 }
             }
             else
@@ -593,8 +597,15 @@ void BrakeCueStore::LoadSavedLaps(const std::string& key, size_t bins)
         }
         fclose(f);
     }
-    std::sort(m_savedLaps.begin(), m_savedLaps.end(),
+    std::sort(laps.begin(), laps.end(),
               [](const SavedLap& a, const SavedLap& b) { return a.lapTime < b.lapTime; });
+
+    AcquireSRWLockExclusive(&m_saveLock);
+    m_savedKey = key;
+    m_savedLaps.swap(laps);
+    m_savedDirty = false;
+    ReleaseSRWLockExclusive(&m_saveLock);
+
     if (m_savedLaps.empty())
         Log::Write("BrakeCue: no saved brake profiles yet for %s", key.c_str());
     else
@@ -603,31 +614,36 @@ void BrakeCueStore::LoadSavedLaps(const std::string& key, size_t bins)
     RebuildReferenceFromSaved();
 }
 
-void BrakeCueStore::SaveSavedLaps() const
+void BrakeCueStore::WriteSavedLaps(const std::string& key, const std::vector<SavedLap>& laps)
 {
-    if (m_savedKey.empty() || m_savedLaps.empty())
+    if (key.empty() || laps.empty())
         return;
     char dir[MAX_PATH];
     LapDeltaStore::SaveDir(dir, sizeof(dir));
     CreateDirectoryA(dir, nullptr);
     char path[MAX_PATH];
-    sprintf_s(path, "%s\\%s.brake", dir, m_savedKey.c_str());
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "wb") != 0 || !f)
+    sprintf_s(path, "%s\\%s.brake", dir, key.c_str());
+    char tmp[StoreFile::kTmpPathSize];
+    FILE* f = StoreFile::Begin(path, tmp, sizeof(tmp), "wb");
+    if (!f)
     {
         Log::Write("BrakeCue: failed to save brake profiles to %s", path);
         return;
     }
-    const unsigned bins = static_cast<unsigned>(m_savedLaps.front().brake.size());
-    const unsigned hdr[4] = { kBrakeFileMagic, kBrakeFileVersion, static_cast<unsigned>(m_savedLaps.size()), bins };
-    fwrite(hdr, sizeof(unsigned), 4, f);
-    for (const SavedLap& lap : m_savedLaps)
+    const unsigned bins = static_cast<unsigned>(laps.front().brake.size());
+    const unsigned hdr[4] = { kBrakeFileMagic, kBrakeFileVersion, static_cast<unsigned>(laps.size()), bins };
+    bool ok = fwrite(hdr, sizeof(unsigned), 4, f) == 4;
+    for (const SavedLap& lap : laps)
     {
-        fwrite(&lap.lapTime, sizeof(double), 1, f);
-        fwrite(lap.brake.data(), sizeof(float), bins, f);
+        ok = ok && fwrite(&lap.lapTime, sizeof(double), 1, f) == 1;
+        ok = ok && fwrite(lap.brake.data(), sizeof(float), bins, f) == bins;
     }
-    fclose(f);
-    Log::Write("BrakeCue: saved %zu brake profiles to %s", m_savedLaps.size(), path);
+    if (!StoreFile::Commit(f, tmp, path, ok))
+    {
+        Log::Write("BrakeCue: failed to save brake profiles to %s", path);
+        return;
+    }
+    Log::Write("BrakeCue: saved %zu brake profiles to %s", laps.size(), path);
 }
 
 void BrakeCueStore::AddSavedLap(double lapTime, const std::vector<float>& brake)
@@ -638,12 +654,18 @@ void BrakeCueStore::AddSavedLap(double lapTime, const std::vector<float>& brake)
         return; // track length changed under us -- not comparable
     if (static_cast<int>(m_savedLaps.size()) >= kKeptLaps && lapTime >= m_savedLaps.back().lapTime)
         return;
-    m_savedLaps.push_back(SavedLap{ lapTime, brake });
+    SavedLap lap{ lapTime, brake };   // copied before taking the lock
+    AcquireSRWLockExclusive(&m_saveLock);
+    m_savedLaps.push_back(std::move(lap));
     std::sort(m_savedLaps.begin(), m_savedLaps.end(),
               [](const SavedLap& a, const SavedLap& b) { return a.lapTime < b.lapTime; });
     if (static_cast<int>(m_savedLaps.size()) > kKeptLaps)
         m_savedLaps.resize(kKeptLaps);
     m_savedDirty = true;
+    ReleaseSRWLockExclusive(&m_saveLock);
+    // Learned at (or a tick or two after) the line: the save pass the line
+    // itself asked for may already have run.
+    Persist::RequestLearned();
     Log::Write("BrakeCue: %.3fs joins the best %d brake profiles", lapTime, kKeptLaps);
     RebuildReferenceFromSaved();
 }
@@ -671,8 +693,19 @@ void BrakeCueStore::RebuildReferenceFromSaved()
 
 void BrakeCueStore::FlushIfDirty()
 {
-    if (!m_ready || !m_savedDirty)
+    if (!m_ready)
         return;
-    SaveSavedLaps();
-    m_savedDirty = false;
+    // Save thread, any time. Copy under m_saveLock (which only the scoring
+    // thread's list changes also take), write after letting go.
+    std::string key;
+    std::vector<SavedLap> laps;
+    AcquireSRWLockExclusive(&m_saveLock);
+    if (m_savedDirty)
+    {
+        key = m_savedKey;
+        laps = m_savedLaps;
+        m_savedDirty = false;
+    }
+    ReleaseSRWLockExclusive(&m_saveLock);
+    WriteSavedLaps(key, laps);
 }

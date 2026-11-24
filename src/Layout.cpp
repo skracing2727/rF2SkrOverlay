@@ -2,6 +2,7 @@
 #include "Renderer.h"
 #include "Config.h"
 #include "Log.h"
+#include "Shortcuts.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -100,6 +101,27 @@ namespace
     float g_boxTop = 0.0f;
     const float kMinBoxPx = 20.0f; // at 2160p
 
+    // Corner resize, both kinds: the corner OPPOSITE the grabbed handle stays
+    // where it was at grab time (screen pixels), and the panel's position is
+    // nudged each frame so its box keeps that corner there -- it grows from
+    // the dragged corner, not out of its centre.
+    float* g_rsXF = nullptr;
+    float* g_rsYF = nullptr;
+    const char* g_rsSection = nullptr;
+    const char* g_rsXKey = nullptr;
+    const char* g_rsYKey = nullptr;
+    float g_anchorX = 0.0f, g_anchorY = 0.0f;
+    float g_anchorSideX = 0.0f, g_anchorSideY = 0.0f; // -1/+1: which side of the centre the anchor is
+    float g_rsLastScale = 1.0f;   // scale the panel last registered with
+
+    void SaveResizedPosition()
+    {
+        if (!g_rsXF || !g_rsYF) return;
+        Config::WriteFloat(g_rsSection, g_rsXKey, *g_rsXF);
+        Config::WriteFloat(g_rsSection, g_rsYKey, *g_rsYF);
+        g_rsXF = g_rsYF = nullptr;
+    }
+
     // Below half, text stops being legible; above 2.5x a panel swallows the
     // screen and buries whatever is under it.
     const float kMinScale = 0.5f;
@@ -182,7 +204,12 @@ bool Layout::IsCursorVisible()
 
 bool Layout::SuppressFade()
 {
-    return g_active;
+    return Preview();
+}
+
+bool Layout::Preview()
+{
+    return g_active || Shortcuts::ListOpen();
 }
 
 namespace
@@ -295,6 +322,7 @@ void Layout::Toggle()
         }
         if (g_resizeScale)
             Config::WriteFloat(g_resizeSection, g_resizeKey, *g_resizeScale);
+        SaveResizedPosition();
         if (g_boxW && g_boxH)
         {
             Config::WriteFloat(g_boxSection, g_boxWKey, *g_boxW);
@@ -309,16 +337,14 @@ void Layout::Toggle()
 
         // Every Config::Write* call above (and every one made by a panel's
         // own release-handler during this layout session, e.g. the side bar
-        // sliders) only QUEUES the write -- it is not actually on disk until
-        // Config::FlushPendingWrites() runs, which otherwise only happens
-        // back at the garage/menu (see RealtimeState.h). Layout mode is
-        // routinely toggled off while still driving, so without this, a
-        // session that ends uncleanly (crash, alt-F4, a plugin reload)
-        // between turning layout mode off and next reaching the menu would
-        // silently lose every position/size change just made. Forced here
-        // regardless of g_inRealtime, since the whole point is not to wait.
-        if (!Config::FlushPendingWrites())
-            Log::Write("Layout: one or more queued INI writes failed on exiting layout mode (read-only? UAC?)");
+        // sliders) only QUEUES the write. They used to be forced to disk
+        // right here, but that is one whole-INI rewrite per queued key
+        // (3-30 ms) on the render thread, and layout mode is routinely turned
+        // off while driving. The rule now: disk writes only at the line or
+        // out of the car, and only on the Persist thread (Persist.cpp), which
+        // writes these queued keys the next time the car is left (or at
+        // plugin shutdown). A crash before then loses the changes just made
+        // -- the accepted price of never writing mid-lap.
     }
 }
 
@@ -372,10 +398,27 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
             if ((!p.scale && !p.boxW) || p.screenW != bbW || p.screenH != bbH) continue;
             float pcx, pcy;
             PanelBox(p, bbW, bbH, pcx, pcy);
-            const float hx = pcx + p.halfW;
-            const float hy = pcy + p.halfH;
-            if (cx < hx - handlePx || cx > hx + handlePx) continue;
-            if (cy < hy - handlePx || cy > hy + handlePx) continue;
+            // Any corner resizes; the opposite one stays put.
+            int corner = -1;
+            for (int c = 0; c < 4 && corner < 0; ++c)
+            {
+                const float hx = pcx + ((c & 1) ? -p.halfW : p.halfW);
+                const float hy = pcy + ((c & 2) ? -p.halfH : p.halfH);
+                if (cx >= hx - handlePx && cx <= hx + handlePx &&
+                    cy >= hy - handlePx && cy <= hy + handlePx)
+                    corner = c;
+            }
+            if (corner < 0) continue;
+            // The anchor is the opposite corner.
+            g_anchorSideX = (corner & 1) ? 1.0f : -1.0f;
+            g_anchorSideY = (corner & 2) ? 1.0f : -1.0f;
+            g_anchorX = pcx + g_anchorSideX * p.halfW;
+            g_anchorY = pcy + g_anchorSideY * p.halfH;
+            g_rsXF = p.xFraction;
+            g_rsYF = p.yFraction;
+            g_rsSection = p.section;
+            g_rsXKey = p.xKey;
+            g_rsYKey = p.yKey;
 
             if (p.boxW && p.boxH)
             {
@@ -390,9 +433,10 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
                 break;
             }
 
-            const float dx = cx - pcx, dy = cy - pcy;
+            const float dx = cx - g_anchorX, dy = cy - g_anchorY;
             const float dist = sqrtf(dx * dx + dy * dy);
-            if (dist < 1.0f) continue;
+            if (dist < 1.0f) { g_rsXF = g_rsYF = nullptr; continue; }
+            g_rsLastScale = *p.scale;
 
             if (p.onDragStart) p.onDragStart();
             g_resizeScale = p.scale;
@@ -448,21 +492,52 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
     }
     else if (buttonDown && g_resizeScale)
     {
-        // Measured against the centre FIXED at grab time (g_resizeCenterX/Y),
-        // not re-read from the panel this frame -- see the comment on those
-        // globals for why re-deriving a moving centre here fed the box's own
-        // growth back into the distance driving that growth.
-        const float dx = cx - g_resizeCenterX, dy = cy - g_resizeCenterY;
+        // Distance from the fixed opposite corner, against the same at grab.
+        const float dx = cx - g_anchorX, dy = cy - g_anchorY;
         const float dist = sqrtf(dx * dx + dy * dy);
-        *g_resizeScale = ClampScale(g_resizeStartScale * (dist / g_resizeStartDist));
+        const float newScale = ClampScale(g_resizeStartScale * (dist / g_resizeStartDist));
+        // Keep the opposite corner put: the panel's half size scales with its
+        // scale, so predict this frame's box from last frame's and shift.
+        for (int i = 0; i < g_panelCount; ++i)
+        {
+            Panel& p = g_panels[i];
+            if (p.xFraction != g_rsXF || p.yFraction != g_rsYF) continue;
+            float pcx, pcy;
+            PanelBox(p, bbW, bbH, pcx, pcy);
+            const float k = g_rsLastScale > 0.0f ? newScale / g_rsLastScale : 1.0f;
+            const float hw = p.halfW * k, hh = p.halfH * k;
+            const float wantCx = g_anchorX - g_anchorSideX * hw;
+            const float wantCy = g_anchorY - g_anchorSideY * hh;
+            *p.xFraction += (wantCx - pcx) / bbW;
+            *p.yFraction += (wantCy - pcy) / bbH;
+            break;
+        }
+        *g_resizeScale = newScale;
+        g_rsLastScale = newScale;
     }
     else if (buttonDown && g_boxW && g_boxH)
     {
+        // Size from the fixed opposite corner to the cursor; the box's centre
+        // moves to the middle of the two.
         const float px = static_cast<float>(bbH) / 2160.0f; // sizes are kept at 2160p
-        const float w = (cx - g_boxLeft) / px;
-        const float h = (cy - g_boxTop) / px;
-        *g_boxW = w > kMinBoxPx ? w : kMinBoxPx;
-        *g_boxH = h > kMinBoxPx ? h : kMinBoxPx;
+        float w = fabsf(cx - g_anchorX) / px;
+        float h = fabsf(cy - g_anchorY) / px;
+        w = w > kMinBoxPx ? w : kMinBoxPx;
+        h = h > kMinBoxPx ? h : kMinBoxPx;
+        *g_boxW = w;
+        *g_boxH = h;
+        for (int i = 0; i < g_panelCount; ++i)
+        {
+            Panel& p = g_panels[i];
+            if (p.xFraction != g_rsXF || p.yFraction != g_rsYF) continue;
+            float pcx, pcy;
+            PanelBox(p, bbW, bbH, pcx, pcy);
+            const float wantCx = g_anchorX - g_anchorSideX * w * px * 0.5f;
+            const float wantCy = g_anchorY - g_anchorSideY * h * px * 0.5f;
+            *p.xFraction += (wantCx - pcx) / bbW;
+            *p.yFraction += (wantCy - pcy) / bbH;
+            break;
+        }
     }
     else if (buttonDown && g_dragX && g_dragY)
     {
@@ -476,6 +551,7 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
         else
             Log::Write("Layout: saved [%s] %s=%.3f", g_resizeSection, g_resizeKey, *g_resizeScale);
         g_resizeScale = nullptr;
+        SaveResizedPosition();
     }
     else if (!buttonDown && g_prevButtonDown && g_boxW && g_boxH)
     {
@@ -485,6 +561,7 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
             Log::Write("Layout: failed to write [%s] %s/%s to the INI", g_boxSection, g_boxWKey, g_boxHKey);
         g_boxW = nullptr;
         g_boxH = nullptr;
+        SaveResizedPosition();
     }
     else if (!buttonDown && g_prevButtonDown && g_dragX && g_dragY)
     {
@@ -603,8 +680,9 @@ void Layout::Draw(Renderer& renderer, int screenWidth, int screenHeight, bool in
             const float hr = resizing ? 1.0f : r;
             const float hg = resizing ? 0.85f : g;
             const float hb = resizing ? 0.20f : b;
-            renderer.AddFilledRect(cx + p.halfW, cy + p.halfH, handlePx * 0.5f, handlePx * 0.5f, 0.0f,
-                                   hr, hg, hb, 0.95f);
+            for (int c = 0; c < 4; ++c)
+                renderer.AddFilledRect(cx + ((c & 1) ? -p.halfW : p.halfW), cy + ((c & 2) ? -p.halfH : p.halfH),
+                                       handlePx * 0.5f, handlePx * 0.5f, 0.0f, hr, hg, hb, 0.95f);
             if (resizing)
             {
                 char sc[32];
@@ -640,14 +718,16 @@ void Layout::Draw(Renderer& renderer, int screenWidth, int screenHeight, bool in
     char layoutKeyName[16];
     Config::KeyName(g_shortcutConfig.layoutMode, layoutKeyName, sizeof(layoutKeyName));
     char banner[128];
-    sprintf_s(banner, "LAYOUT MODE -- drag a panel to move it, its corner square to resize. Ctrl+Shift+%s to exit.",
+    sprintf_s(banner, "LAYOUT MODE -- drag a panel to move it, a corner square to resize. Ctrl+Shift+%s to exit.",
               layoutKeyName);
 
     // Read live rather than assumed: this used to hardcode "F9", which was
     // simply wrong the moment a driver rebound rF2's own Toggle Cursor
     // control away from its default (see Config::ReadToggleCursorKeyName).
+    // A cached copy, kept fresh off the render thread by Shortcuts' input
+    // thread: reading rF2's controller file here took 8-26 ms.
     char cursorKeyName[16];
-    Config::ReadToggleCursorKeyName(cursorKeyName, sizeof(cursorKeyName));
+    Shortcuts::ToggleCursorKeyName(cursorKeyName, sizeof(cursorKeyName));
     char hint2Buf[96];
     sprintf_s(hint2Buf, "Get in the car and press %s (rF2 Controls: \"Toggle Cursor\") to free the mouse.",
               cursorKeyName);

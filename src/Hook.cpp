@@ -25,16 +25,27 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSwapChain, UINT 
     // frames behind -- normal for this kind of live readout.
     Overlay::OnPresent(pSwapChain);
 
-    FrameRate::OnFrameTick();
+    // Frame stats follow the game view's swapchain only (decided after
+    // OnPresent, which binds it): any other swapchain presenting in between
+    // would otherwise count as an extra frame -- halving the frame time and
+    // the per-frame CPU time -- and its GetFrameStatistics would be mixed in.
+    const bool mainSwapChain = Overlay::IsMainSwapChain(pSwapChain);
 
-    FrameLatency::OnBeforePresent();
-    PerfStats::OnBeforePresent();
+    if (mainSwapChain)
+    {
+        FrameRate::OnFrameTick();
+        FrameLatency::OnBeforePresent();
+        PerfStats::OnBeforePresent();
+    }
     const HRESULT hr = s_originalPresent(pSwapChain, SyncInterval, Flags);
-    FrameLatency::OnAfterPresent(pSwapChain);
+    if (mainSwapChain)
+    {
+        FrameLatency::OnAfterPresent(pSwapChain);
 
-    // Right after Present, same as FrameLatency above -- CPU thread time
-    // wants to bracket the real Present() call itself.
-    PerfStats::OnFrame();
+        // Right after Present, same as FrameLatency above -- CPU thread time
+        // wants to bracket the real Present() call itself.
+        PerfStats::OnFrame();
+    }
 
     return hr;
 }

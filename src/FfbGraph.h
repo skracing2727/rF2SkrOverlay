@@ -25,6 +25,9 @@ public:
     // times in seconds. Returns how many were actually available, and the
     // running total of samples ever received.
     int CopyLatest(float* values, double* times, int count, long long& totalOut);
+    // Just the running total CopyLatest would report, for deciding whether
+    // a copy is worth making yet.
+    long long Total();
 
     // The most recent force value (-1..+1, rF2's own sign), lock-free.
     float Latest() const { return m_latest.load(std::memory_order_relaxed); }

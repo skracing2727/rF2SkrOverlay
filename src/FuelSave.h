@@ -13,4 +13,9 @@ class Renderer;
 namespace FuelSave
 {
     bool Draw(Renderer& renderer, int screenWidth, int screenHeight);
+
+    // Save thread (Persist.cpp), any time: writes the fuel-use profile if a
+    // lap was learned since the last call, and reads a new car+track's
+    // profile that Draw asked for (Draw picks it up on a later frame).
+    void FlushIfDirty();
 }

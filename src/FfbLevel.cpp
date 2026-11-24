@@ -51,7 +51,7 @@ bool FfbLevel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
 {
     FfbLevelConfig& cfg = g_ffbLevelConfig;
     if (!cfg.enabled) return false;
-    const bool placeholder = Layout::Active();
+    const bool placeholder = Layout::Preview();
     if (!s_valid.load() && !placeholder) return false;
 
     // Peak-hold the live value ~0.3 s, then let it fall, so the number and

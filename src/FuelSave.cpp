@@ -4,6 +4,10 @@
 #include "Config.h"
 #include "Layout.h"
 #include "Log.h"
+#include "Persist.h"
+#include "RenderThrottle.h"
+#include "StoreFile.h"
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -22,6 +26,10 @@
 //
 // Stint projection: elapsed stint time plus what the fuel left lasts at last
 // lap's rate, against the stint target.
+//
+// Draw runs on the render thread, so it never opens the profile file itself:
+// loading and saving are handed to the save thread (FuelSave::FlushIfDirty,
+// run by Persist.cpp) and the result picked up on a later frame.
 namespace
 {
     const int kBins = 50;                 // profile resolution: share at i/kBins of the lap
@@ -41,27 +49,102 @@ namespace
     double s_lastLapUsed = -1.0;
     double s_lastLapDiff = 0.0;           // last lap used - target
     bool s_wasInPits = false;
+    // What this lap's use is measured from: the fuel and lap-profile share
+    // at the line, or at pit exit on an out-lap (the line is inside the pit
+    // lane at many tracks, so the first crossing after a stop is still "in
+    // pits" and the target used to wait a whole lap). -1 = the line.
+    double s_refFuel = -1.0;
+    double s_refShare = 0.0;
 
-    void LoadProfile(const char* path)
+    // Hand-over between Draw (render thread) and FlushIfDirty (save thread).
+    // s_ioLock is only ever held to copy these few hundred bytes, never
+    // across file I/O, so a frame can't end up waiting on the disk.
+    SRWLOCK s_ioLock = SRWLOCK_INIT;
+    struct ProfileIo
+    {
+        bool saveDirty = false;           // a learned profile is waiting to be written
+        char savePath[MAX_PATH] = "";
+        float save[kBins + 1] = {};
+        bool loadPending = false;         // Draw wants loadPath read
+        char loadPath[MAX_PATH] = "";
+        bool loadDone = false;            // read: result below, for loadPath
+        bool loadOk = false;
+        float loaded[kBins + 1] = {};
+    } s_io;
+    std::atomic<bool> s_loadReady{ false };  // loadDone, checked without the lock
+    bool s_loadWaiting = false;              // render thread: s_profilePath's file not applied yet
+
+    // Render thread: a new car+track's profile. Until it arrives (a moment
+    // later, from the save thread) the share is the plain distance fraction,
+    // exactly as for a car+track with no profile yet.
+    void RequestLoad(const char* path)
     {
         strcpy_s(s_profilePath, path);
         s_haveProfile = false;
-        FILE* f = nullptr;
-        if (fopen_s(&f, path, "r") != 0 || !f) return;
-        int n = 0;
-        for (; n <= kBins; ++n)
-            if (fscanf_s(f, "%f", &s_profile[n]) != 1) break;
-        fclose(f);
-        s_haveProfile = (n == kBins + 1);
+        s_loadWaiting = true;
+        AcquireSRWLockExclusive(&s_ioLock);
+        strcpy_s(s_io.loadPath, path);
+        s_io.loadPending = true;
+        s_io.loadDone = false;
+        s_loadReady.store(false);
+        ReleaseSRWLockExclusive(&s_ioLock);
+        Persist::RequestLearned();
     }
 
-    void SaveProfile()
+    // Render thread, each frame while a load is outstanding.
+    void ApplyLoadIfReady()
+    {
+        if (!s_loadWaiting || !s_loadReady.load())
+            return;
+        AcquireSRWLockExclusive(&s_ioLock);
+        const bool mine = s_io.loadDone && strcmp(s_io.loadPath, s_profilePath) == 0;
+        if (mine)
+        {
+            if (s_io.loadOk)
+                memcpy(s_profile, s_io.loaded, sizeof(s_profile));
+            s_haveProfile = s_io.loadOk;
+        }
+        s_io.loadDone = false;
+        s_loadReady.store(false);
+        ReleaseSRWLockExclusive(&s_ioLock);
+        if (mine)
+            s_loadWaiting = false;
+    }
+
+    // Render thread, after learning a lap: written by the next save pass.
+    void QueueSave()
     {
         if (!s_profilePath[0]) return;
+        AcquireSRWLockExclusive(&s_ioLock);
+        strcpy_s(s_io.savePath, s_profilePath);
+        memcpy(s_io.save, s_profile, sizeof(s_io.save));
+        s_io.saveDirty = true;
+        ReleaseSRWLockExclusive(&s_ioLock);
+        // Learned at the line, but a frame or more after the line's own
+        // save request may already have been served.
+        Persist::RequestLearned();
+    }
+
+    // Save thread only.
+    bool ReadProfile(const char* path, float out[kBins + 1])
+    {
         FILE* f = nullptr;
-        if (fopen_s(&f, s_profilePath, "w") != 0 || !f) { Log::Write("FuelSave: cannot write %s", s_profilePath); return; }
-        for (int i = 0; i <= kBins; ++i) fprintf(f, "%.5f\n", s_profile[i]);
+        if (fopen_s(&f, path, "r") != 0 || !f) return false;
+        int n = 0;
+        for (; n <= kBins; ++n)
+            if (fscanf_s(f, "%f", &out[n]) != 1) break;
         fclose(f);
+        return n == kBins + 1;
+    }
+
+    void WriteProfile(const char* path, const float profile[kBins + 1])
+    {
+        char tmp[StoreFile::kTmpPathSize];
+        FILE* f = StoreFile::Begin(path, tmp, sizeof(tmp), "w");
+        if (!f) { Log::Write("FuelSave: cannot write %s", path); return; }
+        for (int i = 0; i <= kBins; ++i) fprintf(f, "%.5f\n", profile[i]);
+        if (!StoreFile::Commit(f, tmp, path))
+            Log::Write("FuelSave: cannot write %s", path);
     }
 
     // Folds a finished clean lap into the profile.
@@ -97,7 +180,7 @@ namespace
         else
             for (int i = 0; i <= kBins; ++i) s_profile[i] = 0.7f * s_profile[i] + 0.3f * share[i];
         s_haveProfile = true;
-        SaveProfile();
+        QueueSave();
     }
 
     double ShareAt(double frac)
@@ -118,14 +201,67 @@ namespace
     }
 }
 
+void FuelSave::FlushIfDirty()
+{
+    // Save thread, any time (see Persist.cpp): copy out under s_ioLock,
+    // touch the disk after letting go. Writes before reading, so a profile
+    // saved and then asked for again comes back as saved.
+    bool doSave = false, doLoad = false;
+    char savePath[MAX_PATH] = "", loadPath[MAX_PATH] = "";
+    float save[kBins + 1];
+    AcquireSRWLockExclusive(&s_ioLock);
+    if (s_io.saveDirty)
+    {
+        strcpy_s(savePath, s_io.savePath);
+        memcpy(save, s_io.save, sizeof(save));
+        s_io.saveDirty = false;
+        doSave = true;
+    }
+    if (s_io.loadPending)
+    {
+        strcpy_s(loadPath, s_io.loadPath);
+        s_io.loadPending = false;
+        doLoad = true;
+    }
+    ReleaseSRWLockExclusive(&s_ioLock);
+
+    if (doSave)
+        WriteProfile(savePath, save);
+    if (doLoad)
+    {
+        float loaded[kBins + 1] = {};
+        const bool ok = ReadProfile(loadPath, loaded);
+        AcquireSRWLockExclusive(&s_ioLock);
+        // Dropped if Draw has asked for another file in the meantime.
+        if (!s_io.loadPending && strcmp(s_io.loadPath, loadPath) == 0)
+        {
+            memcpy(s_io.loaded, loaded, sizeof(s_io.loaded));
+            s_io.loadOk = ok;
+            s_io.loadDone = true;
+            s_loadReady.store(true);
+        }
+        ReleaseSRWLockExclusive(&s_ioLock);
+    }
+}
+
 bool FuelSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
 {
     FuelSaveConfig& cfg = g_fuelSaveConfig;
     if (!cfg.enabled || cfg.stintMinutes <= 0.0f)
         return false;
 
+    // Medium tier (~25Hz), like the delta bar: the fill and the marker are
+    // eased over 0.6 s and the colour over 1.5 s (see below), so 25 real
+    // updates a second still move smoothly, and the lap bookkeeping only
+    // needs a sample per 1/50th of a lap. Bypassed in layout mode so
+    // dragging/resizing stays smooth.
+    static RenderThrottle s_throttle(0.04);
+    if (!Layout::Active() && s_throttle.TryReplay(renderer))
+        return true;
+    RenderThrottle::Capture throttleCapture(s_throttle, renderer);
+
     const FuelStore::State fuel = g_fuelStore.Read();
-    const bool placeholder = Layout::Active();
+    const bool placeholder = Layout::Preview();
     if (!fuel.valid && !placeholder)
         return false;
 
@@ -139,9 +275,10 @@ bool FuelSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     {
         if (strcmp(fuel.profilePath, s_profilePath) != 0)
         {
-            LoadProfile(fuel.profilePath);
+            RequestLoad(fuel.profilePath);
             s_target = -1.0; s_bankDone = 0.0; s_lastLapUsed = -1.0; s_lap = -1;
         }
+        ApplyLoadIfReady();
 
         // Pit visit or refuel: new stint, new target.
         const bool refuelled = s_prevLapStartFuel >= 0.0 && fuel.fuelLoad > s_prevLapStartFuel + 0.5;
@@ -151,6 +288,18 @@ bool FuelSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
             s_bankDone = 0.0;
             s_lapClean = false;
             if (refuelled) s_prevLapStartFuel = fuel.fuelLoad;
+        }
+        // Pit exit: set the target now, from the fuel in the tank and the
+        // stint time left, instead of at the next line crossing.
+        if (s_wasInPits && !fuel.inPits && lapTime > 5.0 && fuel.stintTimeSeconds >= 0.0)
+        {
+            const double lapsLeft = (stintTargetSec - fuel.stintTimeSeconds) / lapTime;
+            s_target = (lapsLeft > 0.5) ? (fuel.fuelLoad - reserve) / lapsLeft : -1.0;
+            s_refFuel = fuel.fuelLoad;
+            s_refShare = ShareAt(lapFrac);
+            if (s_target > 0.0)
+                Log::Write("FuelSave: target at pit exit %.3f L/lap (%.2f L, %.1f laps of %.0f s left)",
+                           s_target, fuel.fuelLoad, lapsLeft, lapTime);
         }
         s_wasInPits = fuel.inPits;
 
@@ -162,18 +311,24 @@ bool FuelSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                 const double used = s_prevLapStartFuel - fuel.fuelAtLapStart;
                 if (used > 0.05)
                 {
-                    if (s_target > 0.0)
+                    // Scored only for a whole lap: an out-lap measured from
+                    // pit exit is not one.
+                    if (s_target > 0.0 && s_lapClean)
                     {
                         s_lastLapUsed = used;
                         s_lastLapDiff = used - s_target;
                         s_bankDone += s_target - used;
                     }
-                    if (s_lapClean)
+                    // Not while the saved profile is still on its way in:
+                    // learning onto "none yet" would overwrite it.
+                    if (s_lapClean && !s_loadWaiting)
                         LearnLap(used);
                 }
             }
             s_lap = fuel.telemLapNumber;
             s_prevLapStartFuel = fuel.fuelAtLapStart;
+            s_refFuel = -1.0;
+            s_refShare = 0.0;
             ResetLapTrace();
             s_lapClean = !fuel.inPits;
 
@@ -207,16 +362,19 @@ bool FuelSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     const float cy = screenHeight * cfg.centerYFraction;
     Layout::Register("Fuel save", "FuelSave", "CenterXFraction", "CenterYFraction",
                      &cfg.centerXFraction, &cfg.centerYFraction,
-                     cx, cy + (gap + infoPx) * 0.5f, barHalfW, barHalfH + (gap + infoPx) * 0.5f,
+                     cx, cy + (gap + infoPx * 1.2f * 4.0f) * 0.5f, barHalfW, barHalfH + (gap + infoPx * 1.2f * 4.0f) * 0.5f,
                      &cfg.scale, "Scale");
 
     const bool prevBg = renderer.TextBackgroundEnabled();
     renderer.SetTextBackground(false);
 
     const bool haveTarget = fuel.valid && s_target > 0.0;
-    const double usedThisLap = fuel.fuelAtLapStart - fuel.fuelLoad;
-    // Positive = over the target's expected use at this point in the lap.
-    const double expected = haveTarget ? s_target * ShareAt(lapFrac) : 0.0;
+    const double usedThisLap = (s_refFuel >= 0.0 ? s_refFuel : fuel.fuelAtLapStart) - fuel.fuelLoad;
+    // Positive = over the target's expected use at this point in the lap
+    // (from pit exit on an out-lap).
+    double expectedShare = ShareAt(lapFrac) - s_refShare;
+    if (expectedShare < 0.0) expectedShare = 0.0;
+    const double expected = haveTarget ? s_target * expectedShare : 0.0;
     const double rawDelta = haveTarget ? usedThisLap - expected : 0.0;
 
     // Smoothing, so nothing on the bar twitches: the delta (and the colour
@@ -291,42 +449,72 @@ bool FuelSave::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         sprintf_s(line, "FUEL: target after first lap");
     renderer.AddText(cx, cy - textPx * 0.5f, line, textPx, 1.0f, 1.0f, 1.0f, 1.0f, Renderer::HAlign::Center);
 
-    // Info line: target | bank | last lap verdict, each coloured on its own.
+    // The table under the bar (reworked 2026-11-24, the old two lines were
+    // confusing): one question per row, label left, value right.
+    //   Stint target  32:00 (11.0 laps)   the stint you set
+    //   Stint left    23:38 (9.2 laps)    still to drive in it
+    //   Fuel lasts    56:22 (17.5 laps)   at last lap's use; green if it
+    //                                     covers "Stint left", red if not
+    //   Fuel per lap  avg 4.05, last 0.22 under   average use and last lap
+    //                                     against what you can afford
     if (haveTarget)
     {
-        char t1[32], t2[32], t3[64];
-        sprintf_s(t1, "Target %.2f", s_target);
-        // (order on screen: Target | Last | Stint projection)
-        // Stint length the recent laps' rate is heading for.
-        double projSec = -1.0;
         const double rate = (s_lastLapUsed > 0.05) ? s_lastLapUsed : fuel.fuelPerLap;
-        if (rate > 0.05 && lapTime > 5.0 && fuel.stintTimeSeconds >= 0.0)
-            projSec = fuel.stintTimeSeconds + ((fuel.fuelLoad - reserve) / rate) * lapTime;
-        if (projSec >= 0.0)
+        double lapsTarget = -1.0, leftSec = -1.0, lapsLeft = -1.0, lastsSec = -1.0, lastsLaps = -1.0;
+        if (lapTime > 5.0) lapsTarget = stintTargetSec / lapTime;
+        if (fuel.stintTimeSeconds >= 0.0)
         {
-            const int a = static_cast<int>(projSec + 0.5), b = static_cast<int>(stintTargetSec + 0.5);
-            sprintf_s(t2, "Stint %d:%02d / %d:%02d", a / 60, a % 60, b / 60, b % 60);
+            leftSec = stintTargetSec - fuel.stintTimeSeconds;
+            if (leftSec < 0.0) leftSec = 0.0;
+            if (lapTime > 5.0) lapsLeft = leftSec / lapTime;
         }
-        else
-            strcpy_s(t2, "Stint --");
-        const bool projOk = projSec < 0.0 || projSec >= stintTargetSec;
+        if (rate > 0.05)
+        {
+            lastsLaps = (fuel.fuelLoad - reserve) / rate;
+            if (lastsLaps < 0.0) lastsLaps = 0.0;
+            if (lapTime > 5.0) lastsSec = lastsLaps * lapTime;
+        }
+        auto timeLaps = [](char* out, size_t n, double sec, double laps)
+        {
+            if (sec < 0.0) { strcpy_s(out, n, "--"); return; }
+            const int a = static_cast<int>(sec + 0.5);
+            if (laps >= 0.0) sprintf_s(out, n, "%d:%02d (%.1f laps)", a / 60, a % 60, laps);
+            else sprintf_s(out, n, "%d:%02d", a / 60, a % 60);
+        };
+        char v1[48], v2[48], v3[48], v4[64];
+        timeLaps(v1, sizeof(v1), stintTargetSec, lapsTarget);
+        timeLaps(v2, sizeof(v2), leftSec, lapsLeft);
+        if (lastsSec >= 0.0) timeLaps(v3, sizeof(v3), lastsSec, lastsLaps);
+        else if (lastsLaps >= 0.0) sprintf_s(v3, "%.1f laps", lastsLaps);
+        else strcpy_s(v3, "--");
+        const bool lastsOk = lastsLaps < 0.0 || lapsLeft < 0.0 || lastsLaps >= lapsLeft;
+        char avg[24];
+        if (fuel.fuelPerLap > 0.05) sprintf_s(avg, "avg %.2f", fuel.fuelPerLap); else strcpy_s(avg, "avg --");
         if (s_lastLapUsed > 0.0)
-        {
-            if (s_lastLapDiff <= 0.0) sprintf_s(t3, "Last %.2f: %.2f spare", s_lastLapUsed, -s_lastLapDiff);
-            else sprintf_s(t3, "Last %.2f: %.2f over", s_lastLapUsed, s_lastLapDiff);
-        }
+            sprintf_s(v4, "%s, last %.2f %s", avg, fabs(s_lastLapDiff), s_lastLapDiff <= 0.0 ? "under" : "over");
         else
-            strcpy_s(t3, "Last --");
-        const float sep = renderer.MeasureText("   ", infoPx);
-        const float w1 = renderer.MeasureText(t1, infoPx), w2 = renderer.MeasureText(t2, infoPx), w3 = renderer.MeasureText(t3, infoPx);
-        float x = cx - (w1 + w2 + w3 + 2.0f * sep) * 0.5f;
-        const float y = cy + barHalfH + gap;
-        renderer.AddText(x, y, t1, infoPx, 0.9f, 0.9f, 0.9f, 1.0f);
-        x += w1 + sep;
-        renderer.AddText(x, y, t2, infoPx, projOk ? 0.35f : 1.0f, projOk ? 0.9f : 0.35f, projOk ? 0.4f : 0.3f, 1.0f);
-        x += w2 + sep;
+            sprintf_s(v4, "%s, last --", avg);
         const bool lastOk = s_lastLapUsed <= 0.0 || s_lastLapDiff <= 0.0;
-        renderer.AddText(x, y, t3, infoPx, lastOk ? 0.35f : 1.0f, lastOk ? 0.9f : 0.35f, lastOk ? 0.4f : 0.3f, 1.0f);
+
+        const char* labels[4] = { "Stint target", "Stint left", "Fuel lasts", "Fuel per lap" };
+        const char* values[4] = { v1, v2, v3, v4 };
+        const float green[3] = { 0.35f, 0.9f, 0.4f }, red[3] = { 1.0f, 0.35f, 0.3f }, white[3] = { 0.9f, 0.9f, 0.9f };
+        const float* cols[4] = { white, white, lastsOk ? green : red, lastOk ? green : red };
+
+        const float pad = 10.0f * s;
+        const float rowStep = infoPx * 1.2f;
+        const float top = cy + barHalfH + gap;
+        const float left = cx - barHalfW, right = cx + barHalfW;
+        // Standard panel plate (0.08 grey, 60%); shapes draw before text.
+        renderer.AddFilledRoundedRect(cx, top + rowStep * 2.0f, barHalfW, rowStep * 2.0f + pad * 0.5f, 8.0f * s, 0.0f,
+                                      0.08f, 0.08f, 0.08f, 0.6f);
+        for (int row = 0; row < 4; ++row)
+        {
+            const float y = top + row * rowStep + (rowStep - infoPx) * 0.5f;
+            renderer.AddText(left + pad, y, labels[row], infoPx, 0.9f, 0.9f, 0.9f, 1.0f, Renderer::HAlign::Left);
+            renderer.AddText(right - pad, y, values[row], infoPx, cols[row][0], cols[row][1], cols[row][2], 1.0f,
+                             Renderer::HAlign::Right);
+        }
     }
 
     renderer.SetTextBackground(prevBg);

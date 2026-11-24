@@ -35,8 +35,6 @@ namespace
         { "PitLimiter", "BarXFraction", &g_pitLimiterConfig.barXFraction },
         { "PitLimiter", "BarYFraction", &g_pitLimiterConfig.barYFraction },
         { "PitLimiter", "BarScale", &g_pitLimiterConfig.barScale },
-        { "PitLimiter", "EngageWarningXFraction", &g_pitLimiterConfig.engageWarningXFraction },
-        { "PitLimiter", "EngageWarningYFraction", &g_pitLimiterConfig.engageWarningYFraction },
         { "FuelSave", "CenterXFraction", &g_fuelSaveConfig.centerXFraction },
         { "FuelSave", "CenterYFraction", &g_fuelSaveConfig.centerYFraction },
         { "FuelSave", "Scale", &g_fuelSaveConfig.scale },
@@ -49,6 +47,9 @@ namespace
         { "FfbLevel", "CenterXFraction", &g_ffbLevelConfig.centerXFraction },
         { "FfbLevel", "CenterYFraction", &g_ffbLevelConfig.centerYFraction },
         { "FfbLevel", "Scale", &g_ffbLevelConfig.scale },
+        { "Conditions", "CenterXFraction", &g_conditionsConfig.centerXFraction },
+        { "Conditions", "CenterYFraction", &g_conditionsConfig.centerYFraction },
+        { "Conditions", "Scale", &g_conditionsConfig.scale },
         { "LapDelta", "CenterXFraction", &g_lapDeltaConfig.centerXFraction },
         { "LapDelta", "CenterYFraction", &g_lapDeltaConfig.centerYFraction },
         { "LapDelta", "Scale", &g_lapDeltaConfig.scale },
@@ -84,6 +85,9 @@ namespace
         { "RelativeTiming", "PosXFraction", &g_relativeTimingConfig.posXFraction },
         { "RelativeTiming", "PosYFraction", &g_relativeTimingConfig.posYFraction },
         { "RelativeTiming", "Scale", &g_relativeTimingConfig.scale },
+        { "RelativeTiming", "GapBoxPosXFraction", &g_relativeTimingConfig.gapPosXFraction },
+        { "RelativeTiming", "GapBoxPosYFraction", &g_relativeTimingConfig.gapPosYFraction },
+        { "RelativeTiming", "GapBoxScale", &g_relativeTimingConfig.gapScale },
         { "FuelTyrePanel_Fuel", "PosXFraction", &g_fuelTyrePanelConfig.fuelPosXFraction },
         { "FuelTyrePanel_Fuel", "PosYFraction", &g_fuelTyrePanelConfig.fuelPosYFraction },
         { "FuelTyrePanel_Fuel", "Scale", &g_fuelTyrePanelConfig.fuelScale },
@@ -130,12 +134,19 @@ namespace
     bool g_carChanged = false;
 
     // The car whose layout is live, and what was last saved for it (both
-    // under g_lock: Poll runs on the render thread, FlushIfDirty on scoring).
+    // under g_lock: Poll runs on the render thread, FlushIfDirty on the
+    // Persist thread).
     std::string g_currentKey;
     std::vector<float> g_saved;
+    // A car-change worker is running (also under g_lock). FlushIfDirty stays
+    // out of the way meanwhile: the worker saves the car being left itself,
+    // and g_currentKey is about to change.
+    bool g_jobBusy = false;
 
     void LayoutsPath(char* out, size_t outSize)
     {
+        static char s_cached[MAX_PATH] = "";
+        if (s_cached[0]) { strcpy_s(out, outSize, s_cached); return; }
         HMODULE self = nullptr;
         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            reinterpret_cast<LPCSTR>(&LayoutsPath), &self);
@@ -144,6 +155,7 @@ namespace
         char* slash = strrchr(path, '\\');
         if (slash) *(slash + 1) = 0;
         sprintf_s(out, outSize, "%srF2SkrOverlayPublic_Layouts.ini", path);
+        strcpy_s(s_cached, out);
     }
 
     // rF2's root, two folders up from Bin64\Plugins\ where the DLL lives.
@@ -244,45 +256,102 @@ namespace
             sprintf_s(out, outSize, "Shortcuts.%s", Shortcuts::IniKey(static_cast<Shortcuts::Element>(i - kFloatCount - kIntCount)));
     }
 
-    // Writes the values that differ from 'previous' (all of them when it is
-    // empty) into the car's section. Caller holds g_lock.
-    void SaveSection(const std::string& key, const std::vector<float>& now, const std::vector<float>& previous)
+    void ItemNames(std::vector<std::string>& names)
     {
-        char path[MAX_PATH];
-        LayoutsPath(path, sizeof(path));
-        const bool all = previous.size() != now.size();
+        names.resize(kValueCount);
         for (int i = 0; i < kValueCount; ++i)
         {
-            if (!all && previous[i] == now[i])
-                continue;
-            char k[96], v[32];
+            char k[96];
             ItemKey(i, k, sizeof(k));
-            sprintf_s(v, "%.4f", now[i]);
-            WritePrivateProfileStringA(key.c_str(), k, v, path);
+            names[i] = k;
         }
     }
 
-    bool SectionExists(const std::string& key)
+    // Writes a car's whole section in ONE file write (WritePrivateProfile-
+    // Section). It used to be one WritePrivateProfileString per changed
+    // value, each rereading and rewriting the whole layouts file -- ~120 of
+    // them for a new car. That call replaces the section, so every value is
+    // written, and any line already there that this build does not know (a
+    // key from another version) is carried over as it was. Caller holds
+    // g_fileLock; never called with g_lock held.
+    void SaveSection(const std::string& key, const std::vector<float>& now)
     {
+        if (static_cast<int>(now.size()) != kValueCount)
+            return;
         char path[MAX_PATH];
         LayoutsPath(path, sizeof(path));
-        char buf[16];
-        return GetPrivateProfileSectionA(key.c_str(), buf, sizeof(buf), path) > 0;
-    }
+        std::vector<std::string> names;
+        ItemNames(names);
 
-    // Puts the car's saved layout live, and into the main INI so it is also
-    // what loads next time. Values the section lacks are left as they are.
-    void ApplySection(const std::string& key)
-    {
-        char path[MAX_PATH];
-        LayoutsPath(path, sizeof(path));
+        std::string block;
+        block.reserve(static_cast<size_t>(kValueCount) * 48);
         for (int i = 0; i < kValueCount; ++i)
         {
-            char k[96], v[32];
-            ItemKey(i, k, sizeof(k));
-            if (GetPrivateProfileStringA(key.c_str(), k, "", v, sizeof(v), path) == 0)
-                continue;
-            const float value = static_cast<float>(atof(v));
+            char v[32];
+            sprintf_s(v, "%.4f", now[i]);
+            block += names[i];
+            block += '=';
+            block += v;
+            block += '\0';
+        }
+        std::vector<char> old(64 * 1024);
+        if (GetPrivateProfileSectionA(key.c_str(), old.data(), static_cast<DWORD>(old.size()), path) > 0)
+        {
+            for (const char* line = old.data(); *line; line += strlen(line) + 1)
+            {
+                const char* eq = strchr(line, '=');
+                const std::string name = eq ? std::string(line, eq - line) : std::string(line);
+                bool ours = false;
+                for (const std::string& n : names)
+                    if (n == name) { ours = true; break; }
+                if (!ours)
+                {
+                    block += line;
+                    block += '\0';
+                }
+            }
+        }
+        block += '\0';   // the list ends with an empty string
+        if (!WritePrivateProfileSectionA(key.c_str(), block.c_str(), path))
+            Log::Write("CarLayout: could not save [%s] (error %lu)", key.c_str(), GetLastError());
+    }
+
+    // Reads a car's whole section in ONE file read (GetPrivateProfileSection)
+    // and matches it to the value list. It used to be one
+    // GetPrivateProfileString per value -- dozens of re-opens and re-parses
+    // of the file, on the render thread, at every car change.
+    bool ReadSection(const std::string& key, std::vector<float>& vals, std::vector<char>& have)
+    {
+        vals.assign(kValueCount, 0.0f);
+        have.assign(kValueCount, 0);
+        char path[MAX_PATH];
+        LayoutsPath(path, sizeof(path));
+        std::vector<char> buf(64 * 1024);
+        const DWORD got = GetPrivateProfileSectionA(key.c_str(), buf.data(), static_cast<DWORD>(buf.size()), path);
+        if (got == 0)
+            return false;
+        std::vector<std::string> names;
+        ItemNames(names);
+        for (const char* line = buf.data(); *line; line += strlen(line) + 1)
+        {
+            const char* eq = strchr(line, '=');
+            if (!eq) continue;
+            const std::string name(line, eq - line);
+            for (int i = 0; i < kValueCount; ++i)
+                if (names[i] == name) { vals[i] = static_cast<float>(atof(eq + 1)); have[i] = 1; break; }
+        }
+        return true;
+    }
+
+    // Puts a car's saved layout live, and into the main INI so it is also
+    // what loads next time (queued writes). Values the section lacks are left
+    // as they are. Render thread.
+    void ApplyValues(const std::vector<float>& vals, const std::vector<char>& have)
+    {
+        for (int i = 0; i < kValueCount; ++i)
+        {
+            if (!have[i]) continue;
+            const float value = vals[i];
             if (i < kFloatCount)
             {
                 if (*kFloats[i].value != value)
@@ -334,6 +403,48 @@ namespace
     }
 }
 
+namespace
+{
+    // A car change does its file work (reading the player profile, saving
+    // the old car's section, reading the new one) on a worker thread; the
+    // render thread only starts it and applies the result. It used to all
+    // run on the render thread, a hitch of tens of ms per car change.
+    SRWLOCK g_fileLock = SRWLOCK_INIT;   // the layouts file: worker vs FlushIfDirty
+    // Touched only by the render thread (Poll), and by the worker while it
+    // runs; Poll reads the results only once the thread has exited.
+    struct Job
+    {
+        HANDLE thread = nullptr;
+        // in
+        std::string vehicleName, vehicleClass, plr, prevKey;
+        std::vector<float> now, prevSaved;
+        // out
+        std::string key;
+        bool same = false, known = false;
+        std::vector<float> vals;
+        std::vector<char> have;
+    } g_job;
+
+    DWORD WINAPI JobProc(LPVOID)
+    {
+        AcquireSRWLockExclusive(&g_fileLock);
+        g_job.key = ResolveKey(g_job.vehicleClass.c_str(), g_job.plr.c_str());
+        g_job.same = g_job.key == g_job.prevKey;
+        if (!g_job.same)
+        {
+            // The car being left keeps what was on screen for it (unless
+            // nothing changed since it was last saved).
+            if (!g_job.prevKey.empty() && g_job.now != g_job.prevSaved)
+                SaveSection(g_job.prevKey, g_job.now);
+            g_job.known = ReadSection(g_job.key, g_job.vals, g_job.have);
+            if (!g_job.known)
+                SaveSection(g_job.key, g_job.now); // a new car starts from the current layout
+        }
+        ReleaseSRWLockExclusive(&g_fileLock);
+        return 0;
+    }
+}
+
 void CarLayout::OnScoring(const ScoringInfoV01& info)
 {
     if (!info.mVehicle)
@@ -359,38 +470,56 @@ void CarLayout::OnScoring(const ScoringInfoV01& info)
 
 void CarLayout::Poll()
 {
-    char vehicleName[64], vehicleClass[32], plrFileName[64];
-    AcquireSRWLockExclusive(&g_lock);
-    const bool changed = g_carChanged;
-    g_carChanged = false;
-    strcpy_s(vehicleName, g_vehicleName);
-    strcpy_s(vehicleClass, g_vehicleClass);
-    strcpy_s(plrFileName, g_plrFileName);
-    ReleaseSRWLockExclusive(&g_lock);
-    if (!changed || !vehicleClass[0])
-        return;
-
-    const std::string key = ResolveKey(vehicleClass, plrFileName);
-
-    AcquireSRWLockExclusive(&g_lock);
-    if (key == g_currentKey)
+    if (!g_job.thread)
     {
+        char vehicleName[64], vehicleClass[32], plrFileName[64];
+        AcquireSRWLockExclusive(&g_lock);
+        const bool changed = g_carChanged;
+        g_carChanged = false;
+        strcpy_s(vehicleName, g_vehicleName);
+        strcpy_s(vehicleClass, g_vehicleClass);
+        strcpy_s(plrFileName, g_plrFileName);
+        if (changed && vehicleClass[0])
+        {
+            g_job.vehicleName = vehicleName;
+            g_job.vehicleClass = vehicleClass;
+            g_job.plr = plrFileName;
+            g_job.prevKey = g_currentKey;
+            Snapshot(g_job.now);
+            g_job.prevSaved = g_saved;
+            g_job.thread = CreateThread(nullptr, 0, JobProc, nullptr, 0, nullptr);
+            g_jobBusy = g_job.thread != nullptr;
+        }
         ReleaseSRWLockExclusive(&g_lock);
         return;
     }
-    std::vector<float> now;
-    Snapshot(now);
-    // The car being left keeps what was on screen for it.
-    if (!g_currentKey.empty())
-        SaveSection(g_currentKey, now, g_saved);
+    // Polled, never waited for: a thread's exit can sit behind the loader
+    // lock for a while during a session load, and an INFINITE wait here was
+    // the frame waiting with it. The results are used once it has exited.
+    if (WaitForSingleObject(g_job.thread, 0) != WAIT_OBJECT_0)
+        return;                         // still working
+    CloseHandle(g_job.thread);
+    g_job.thread = nullptr;
+    if (g_job.same)
+    {
+        AcquireSRWLockExclusive(&g_lock);
+        g_jobBusy = false;
+        ReleaseSRWLockExclusive(&g_lock);
+        return;
+    }
 
-    const bool known = SectionExists(key);
+    const std::string key = g_job.key;
+    const bool known = g_job.known;
+    const char* vehicleName = g_job.vehicleName.c_str();
+    const char* vehicleClass = g_job.vehicleClass.c_str();
+    AcquireSRWLockExclusive(&g_lock);
+    const bool firstCar = g_currentKey.empty();
+    (void)firstCar;
     if (known)
-        ApplySection(key);
-    else
-        SaveSection(key, now, std::vector<float>()); // a new car starts from the current layout
+        ApplyValues(g_job.vals, g_job.have);
     g_currentKey = key;
     Snapshot(g_saved);
+    g_jobBusy = false;
     ReleaseSRWLockExclusive(&g_lock);
 
     Log::Write("CarLayout: '%s' (%s) -> layout [%s]%s", vehicleName, vehicleClass, key.c_str(),
@@ -402,16 +531,45 @@ void CarLayout::Poll()
 
 void CarLayout::FlushIfDirty()
 {
+    // Persist thread. Copy what to save under g_lock (which Poll takes every
+    // frame), then write with it released -- holding it across the file
+    // write would make that frame wait for the disk.
+    //
+    // g_fileLock is taken first and held to the end: a car-change worker
+    // started after the copy then waits for this write, and its own, newer
+    // copy of the same car lands on top rather than under it. (Lock order is
+    // always g_fileLock, then g_lock; Poll and the worker each take only one.)
+    AcquireSRWLockExclusive(&g_fileLock);
+    std::string key;
+    std::vector<float> now;
     AcquireSRWLockExclusive(&g_lock);
-    if (!g_currentKey.empty())
+    if (!g_currentKey.empty() && !g_jobBusy)
     {
-        std::vector<float> now;
         Snapshot(now);
         if (now != g_saved)
-        {
-            SaveSection(g_currentKey, now, g_saved);
-            g_saved.swap(now);
-        }
+            key = g_currentKey;
     }
     ReleaseSRWLockExclusive(&g_lock);
+    if (key.empty())
+    {
+        ReleaseSRWLockExclusive(&g_fileLock);
+        return;
+    }
+    SaveSection(key, now);
+    ReleaseSRWLockExclusive(&g_fileLock);
+
+    // Only remember it as saved if that car is still the live one and no
+    // car change has started since (which takes over g_saved itself).
+    AcquireSRWLockExclusive(&g_lock);
+    if (!g_jobBusy && g_currentKey == key)
+        g_saved.swap(now);
+    ReleaseSRWLockExclusive(&g_lock);
+}
+
+void CarLayout::Shutdown()
+{
+    // Called after the Present hook is removed, so Poll no longer touches
+    // the handle; the worker saves its own sections, so just let it finish.
+    if (g_job.thread)
+        WaitForSingleObject(g_job.thread, 3000);
 }

@@ -28,7 +28,10 @@ namespace CarLayout
     // saves the old car's layout and applies the new one's.
     void Poll();
 
-    // Out of the car only, with the plugin's other FlushIfDirty() calls:
+    // Persist thread, out of the car only (the "all" pass, Persist.cpp):
     // saves the current car's layout if anything changed.
     void FlushIfDirty();
+    // Plugin shutdown: waits (up to 3 s) for a car-change worker still
+    // running, so the DLL is never unloaded under it.
+    void Shutdown();
 }

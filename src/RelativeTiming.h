@@ -48,11 +48,12 @@ public:
         bool valid = false;
         bool isPlayer = false;
         unsigned char place = 0;
-        // Slot ID, carried so the draw path can look this car up in stores
-        // keyed by ID -- the tyre compound, which lives in telemetry rather
-        // than in anything this row already holds.
+        // Slot ID, carried so this car can be looked up in stores keyed by
+        // ID -- the tyre compound, which lives in telemetry rather than in
+        // anything this row already holds (see Lookups below).
         long carId = -1;
         char driverName[32] = {};
+        char carNumber[8] = {};      // from the entry name's "#19", empty if it has none
         double lastLapTime = -1.0;   // -1 = no completed lap yet
 
         // This car is flagged as in the pit lane while the player is out on
@@ -158,6 +159,22 @@ public:
         // flash.
         int placeChangeSign = 0;
         float placeChangeAlpha = 0.0f;
+
+        // The tyre compound (TyreStore) and laps since the last stop
+        // (PitStint), looked up when the row is published rather than by
+        // Draw() for every row on every frame: both stores sit behind their
+        // own locks, which the render thread then never has to take. The
+        // defaults are what a car neither store knows about shows.
+        struct Lookups
+        {
+            bool haveTyre = false;
+            char tyre[8] = {};       // "S", or "S/M" for a split set
+            float tyreR = 1.0f, tyreG = 1.0f, tyreB = 1.0f;
+            float tyreRearR = 1.0f, tyreRearG = 1.0f, tyreRearB = 1.0f; // a split set's rear letter
+            bool pitLapsKnown = false;
+            int pitLaps = 0;
+        };
+        Lookups lookups;
     };
 
     struct State
@@ -179,7 +196,16 @@ public:
         // Fastest lap of the session by anyone (from every car's best lap),
         // and who set it. fastestLapSeconds <= 0 = none yet.
         double fastestLapSeconds = -1.0;
+        // Your own best lap this session (footer "PB"); <= 0 = none yet.
+        double myBestLapSeconds = -1.0;
         char fastestLapName[32] = {};
+
+        // Gap box: the two cars placed just ahead of the player, the player,
+        // and the one just behind, picked from the whole field by place
+        // (retired cars skipped) -- not from the standings rows above, whose
+        // window can leave those places out.
+        int gapRowCount = 0;
+        Row gapRows[5];
     };
     State Read();
 
@@ -292,6 +318,10 @@ private:
     // cruder distance/current-speed estimate.
     std::vector<std::pair<double, double>> m_currentTrace;
     std::vector<std::pair<double, double>> m_referenceTrace;
+    // Running maximum of m_referenceTrace's distances, index for index --
+    // always in order even where the trace itself steps back, so
+    // InterpolateTraceAt can binary-search it (see there).
+    std::vector<double> m_referenceMaxDist;
     double m_referenceLapTime = -1.0;
     short m_lastTotalLapsForTrace = -1;
     double m_lastLapDistForTrace = -1.0;
@@ -301,6 +331,14 @@ private:
     bool InterpolateTraceAt(double lapDist, double& outTime) const;
 
     TrendTracker& GetTracker(long carId);
+
+    // Each car's row as already worked out this tick, by its index in the
+    // scoring array, and its tracker (see computeRow in OnScoring). Scoring
+    // thread only; a member rather than a local only to keep ~40 KB off
+    // the callback's stack.
+    static const int kMaxRowCache = 128;
+    Row m_rowCache[kMaxRowCache];
+    TrendTracker* m_rowCacheTracker[kMaxRowCache] = {};
 
     // Session-best time for each sector, by anyone (-1 = none yet).
     double m_sessionBestSector[3] = { -1.0, -1.0, -1.0 };
@@ -317,6 +355,10 @@ namespace RelativeTiming
 {
     // Draws into the current frame. Returns false if there is nothing to show.
     bool Draw(Renderer& renderer, int screenWidth, int screenHeight);
+
+    // The gap box: the same table cut down to the two places ahead of you,
+    // you, and the one place behind -- no header or footer.
+    bool DrawGapBox(Renderer& renderer, int screenWidth, int screenHeight);
 
     // Screen Y of the standings panel's own bottom edge as it was LAST
     // DRAWN, padding included. The table's height varies with how many rows
