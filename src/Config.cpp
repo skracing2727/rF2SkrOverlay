@@ -2,8 +2,11 @@
 #include "Log.h"
 #include "Renderer.h"
 #include <Windows.h>
+#include <cmath>
 #include <cstdio>
+#include <share.h>
 #include <cstring>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -32,6 +35,7 @@ FuelTyrePanelConfig g_fuelTyrePanelConfig;
 FuelSaveConfig g_fuelSaveConfig;
 TyreSaveConfig g_tyreSaveConfig;
 EngineTempsConfig g_engineTempsConfig;
+BenchmarkConfig g_benchmarkConfig;
 FfbLevelConfig g_ffbLevelConfig;
 ConditionsConfig g_conditionsConfig;
 BrakeCueConfig g_brakeCueConfig;
@@ -106,6 +110,10 @@ namespace
 "DangerAheadMeters=4.0\n"
 "DangerBehindMeters=5.0\n"
 "DangerLateralMeters=10.0\n"
+"; Side bars only: a car whose speed differs from yours by more than this\n"
+"; (m/s) does not start a new side bar -- it is flashing past, not alongside.\n"
+"; 0 = no limit.\n"
+"SideBarMaxClosingSpeedMps=12.0\n"
 "\n"
 "; A brief, very translucent yellow wash pulsing over the whole radar\n"
 "; whenever any tracked car is in the red danger zone above -- a\n"
@@ -242,6 +250,12 @@ namespace
 "; entirely (slip is meaningless near-stationary).\n"
 "SlipDeadzone=0.06\n"
 "SlipFullScale=0.35\n"
+"; Wheelspin (positive slip) uses its own, higher thresholds.\n"
+"SpinDeadzone=0.10\n"
+"SpinFullScale=0.45\n"
+"; Driven axle for wheelspin: 0 = all four (AWD), 1 = rear, 2 = front (FWD).\n"
+"; The game does not report the drivetrain, so set it for front-drive cars.\n"
+"SpinAxle=1\n"
 "MinSpeedMetersPerSec=2.0\n"
 "; Multiplies the lockup/spin magnitude before display -- both the VU-meter\n"
 "; bar height and its colour intensity scale with it, so the indicators reach\n"
@@ -481,9 +495,9 @@ namespace
 "; Smoothed frames-per-second, from the real Present-to-Present interval.\n"
 "ShowFps=1\n"
 "\n"
-"; Rough total input-to-photon latency estimate (half the average physics\n"
-"; tick period + Display Latency) -- a LOWER BOUND, since it can't see the\n"
-"; physical controller's own USB/HID polling latency.\n"
+"; Rough total input-to-photon latency estimate (half the 400 Hz physics step\n"
+"; + render CPU time + half a frame + Display Latency) -- an estimate; the\n"
+"; wheel's own USB/HID latency is not included.\n"
 "ShowInputLagEstimate=1\n"
 "\n"
 "; Extra diagnostic stats, off by default. Turn on whichever you want to see.\n"
@@ -1090,12 +1104,41 @@ namespace
         char defStr[64];
         sprintf_s(defStr, "%g", def);
         GetPrivateProfileStringA(section, key, defStr, buf, sizeof(buf), s_iniPath);
-        return static_cast<float>(atof(buf));
+        // Review F219/F326: a hand-typed "0,8" or a word used to read as 0.
+        // Accept a decimal comma; anything unparsable or non-finite keeps the default.
+        for (char* c = buf; *c; ++c)
+            if (*c == ',') *c = '.';
+        char* end = nullptr;
+        const double v = strtod(buf, &end);
+        while (end && (*end == ' ' || *end == '\t' || *end == '\r' || *end == 'f' || *end == 'F')) ++end;
+        if (end == buf || (end && *end) || !std::isfinite(v))
+            return def;
+        return static_cast<float>(v);
+    }
+
+    // Review F326/F415: Scale and divisor values clamped at load, not only while dragging.
+    float ReadFloatClamped(const char* section, const char* key, float def, float lo, float hi)
+    {
+        const float v = ReadFloat(section, key, def);
+        return v < lo ? lo : (v > hi ? hi : v);
     }
 
     bool ReadBool(const char* section, const char* key, bool def)
     {
-        return GetPrivateProfileIntA(section, key, def ? 1 : 0, s_iniPath) != 0;
+        // Review F219/F326: accept true/false/yes/no/on/off; anything else keeps the default.
+        char buf[32];
+        GetPrivateProfileStringA(section, key, "", buf, sizeof(buf), s_iniPath);
+        char* s = buf;
+        while (*s == ' ' || *s == '\t') ++s;
+        char* e = s + strlen(s);
+        while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r')) *--e = 0;
+        if (!*s) return def;
+        if (!_stricmp(s, "true") || !_stricmp(s, "yes") || !_stricmp(s, "on")) return true;
+        if (!_stricmp(s, "false") || !_stricmp(s, "no") || !_stricmp(s, "off")) return false;
+        char* end = nullptr;
+        const long n = strtol(s, &end, 10);
+        if (end == s || *end) return def;
+        return n != 0;
     }
 
     int ReadInt(const char* section, const char* key, int def)
@@ -1158,6 +1201,13 @@ namespace
             return def;
         }
 
+        // Review F219: only a single character is a key. "Radar" used to read as 'R'
+        // and "Clock"/"Car" both as 'C', silently sharing one shortcut.
+        if (start[1] != 0)
+        {
+            Log::Write("Config: [%s] %s=%s is not a single key, using default", section, key, start);
+            return def;
+        }
         const char c = start[0];
         if (c >= 'a' && c <= 'z') return c - 'a' + 'A';
         if (c >= 'A' && c <= 'Z') return c;
@@ -1244,6 +1294,7 @@ void Config::Load()
     cost.barHeightPx = ReadFloat("DllCost", "BarHeightPixels", cost.barHeightPx);
     cost.labelMinShare = ReadFloat("DllCost", "LabelMinShare", cost.labelMinShare);
     cost.logSpikes = ReadBool("DllCost", "LogSpikes", cost.logSpikes);
+    cost.showBoxStats = ReadBool("DllCost", "ShowBoxStats", cost.showBoxStats);
 
 
     ShortcutConfig& sc = g_shortcutConfig;
@@ -1271,6 +1322,11 @@ void Config::Load()
     sc.dllCost = ReadKey("Shortcuts", "DllCost", sc.dllCost);
     sc.coverBoxes = ReadKey("Shortcuts", "CoverBoxes", sc.coverBoxes);
     sc.list = ReadKey("Shortcuts", "List", sc.list);
+    sc.rotaryLeftXFraction = ReadFloat("Shortcuts", "RotaryLeftXFraction", sc.rotaryLeftXFraction);
+    sc.rotaryLeftYFraction = ReadFloat("Shortcuts", "RotaryLeftYFraction", sc.rotaryLeftYFraction);
+    sc.rotaryRightXFraction = ReadFloat("Shortcuts", "RotaryRightXFraction", sc.rotaryRightXFraction);
+    sc.rotaryRightYFraction = ReadFloat("Shortcuts", "RotaryRightYFraction", sc.rotaryRightYFraction);
+    sc.rotaryListScale = ReadFloat("Shortcuts", "RotaryListScale", sc.rotaryListScale);
     sc.bestDelta = ReadKey("Shortcuts", "BestDelta", sc.bestDelta);
     sc.resetSessionBest = ReadKey("Shortcuts", "ResetSessionBest", sc.resetSessionBest);
     sc.resetPersonalBest = ReadKey("Shortcuts", "ResetPersonalBest", sc.resetPersonalBest);
@@ -1369,11 +1425,12 @@ void Config::Load()
     r.widthFraction = ReadFloat("Radar", "WidthFraction", r.widthFraction);
     r.centerXFraction = ReadFloat("Radar", "CenterXFraction", r.centerXFraction);
     r.centerYFraction = ReadFloat("Radar", "CenterYFraction", r.centerYFraction);
-    r.scale = ReadFloat("Radar", "Scale", r.scale);
-    r.rangeForwardM = ReadFloat("Radar", "RangeForwardMeters", r.rangeForwardM);
-    r.rangeRearM = ReadFloat("Radar", "RangeRearMeters", r.rangeRearM);
-    r.rangeSideM = ReadFloat("Radar", "RangeSideMeters", r.rangeSideM);
-    r.fadeStartFraction = ReadFloat("Radar", "FadeStartFraction", r.fadeStartFraction);
+    r.scale = ReadFloatClamped("Radar", "Scale", r.scale, 0.5f, 2.5f);
+    // Ranges are divisors in the radar and side bars (review F415).
+    r.rangeForwardM = ReadFloatClamped("Radar", "RangeForwardMeters", r.rangeForwardM, 2.0f, 200.0f);
+    r.rangeRearM = ReadFloatClamped("Radar", "RangeRearMeters", r.rangeRearM, 2.0f, 200.0f);
+    r.rangeSideM = ReadFloatClamped("Radar", "RangeSideMeters", r.rangeSideM, 2.0f, 200.0f);
+    r.fadeStartFraction = ReadFloatClamped("Radar", "FadeStartFraction", r.fadeStartFraction, 0.0f, 0.99f);
     r.carHalfWidthM = ReadFloat("Radar", "CarHalfWidthMeters", r.carHalfWidthM);
     r.carHalfLengthM = ReadFloat("Radar", "CarHalfLengthMeters", r.carHalfLengthM);
     r.carCornerRadiusM = ReadFloat("Radar", "CarCornerRadiusMeters", r.carCornerRadiusM);
@@ -1391,6 +1448,7 @@ void Config::Load()
     r.dangerAheadM = ReadFloat("Radar", "DangerAheadMeters", r.dangerAheadM);
     r.dangerBehindM = ReadFloat("Radar", "DangerBehindMeters", r.dangerBehindM);
     r.dangerLateralM = ReadFloat("Radar", "DangerLateralMeters", r.dangerLateralM);
+    r.sideBarMaxClosingSpeedMps = ReadFloat("Radar", "SideBarMaxClosingSpeedMps", r.sideBarMaxClosingSpeedMps);
     r.dangerFlashEnabled = ReadBool("Radar", "DangerFlashEnabled", r.dangerFlashEnabled);
     r.dangerFlashR = ReadFloat("Radar", "DangerFlashColorR", r.dangerFlashR);
     r.dangerFlashG = ReadFloat("Radar", "DangerFlashColorG", r.dangerFlashG);
@@ -1422,6 +1480,9 @@ void Config::Load()
     r.sideBarTooCloseMetersMax = ReadFloat("Radar", "SideBarTooCloseMetersMax", r.sideBarTooCloseMetersMax);
     r.sideBarTooCloseFlashHz = ReadFloat("Radar", "SideBarTooCloseFlashHz", r.sideBarTooCloseFlashHz);
     r.sideBarTooCloseFlashHzMax = ReadFloat("Radar", "SideBarTooCloseFlashHzMax", r.sideBarTooCloseFlashHzMax);
+    // The layout sliders need a non-empty range (review F405).
+    if (!(r.sideBarTooCloseFlashHzMax >= 1.5f)) r.sideBarTooCloseFlashHzMax = 1.5f;
+    if (!(r.sideBarTooCloseMetersMax >= 0.5f)) r.sideBarTooCloseMetersMax = 0.5f;
     r.sideBarTooCloseFlashR = ReadFloat("Radar", "SideBarTooCloseFlashColorR", r.sideBarTooCloseFlashR);
     r.sideBarTooCloseFlashG = ReadFloat("Radar", "SideBarTooCloseFlashColorG", r.sideBarTooCloseFlashG);
     r.sideBarTooCloseFlashB = ReadFloat("Radar", "SideBarTooCloseFlashColorB", r.sideBarTooCloseFlashB);
@@ -1463,6 +1524,12 @@ void Config::Load()
     p.spinB = ReadFloat("PedalTrace", "SpinB", p.spinB);
     p.slipDeadzone = ReadFloat("PedalTrace", "SlipDeadzone", p.slipDeadzone);
     p.slipFullScale = ReadFloat("PedalTrace", "SlipFullScale", p.slipFullScale);
+    // Review F216: spin settings existed in code but were never read.
+    p.spinDeadzone = ReadFloatClamped("PedalTrace", "SpinDeadzone", p.spinDeadzone, 0.0f, 1.0f);
+    p.spinFullScale = ReadFloatClamped("PedalTrace", "SpinFullScale", p.spinFullScale, 0.01f, 2.0f);
+    if (p.spinFullScale <= p.spinDeadzone) p.spinFullScale = p.spinDeadzone + 0.05f;
+    p.spinAxle = ReadInt("PedalTrace", "SpinAxle", p.spinAxle);
+    if (p.spinAxle < 0 || p.spinAxle > 2) p.spinAxle = 1;
     p.minSpeedForSlipMs = ReadFloat("PedalTrace", "MinSpeedMetersPerSec", p.minSpeedForSlipMs);
     p.slipIntensityMultiplier = ReadFloat("PedalTrace", "SlipIntensityMultiplier", p.slipIntensityMultiplier);
     p.slipBarHeightScale = ReadFloat("PedalTrace", "SlipBarHeightScale", p.slipBarHeightScale);
@@ -1832,8 +1899,6 @@ void Config::Load()
     tm.deltaSectorCount = ReadInt("TrackMap", "DeltaSectorCount", tm.deltaSectorCount);
     if (tm.deltaSectorCount < TrackMapConfig::kMinDeltaSectors) tm.deltaSectorCount = TrackMapConfig::kMinDeltaSectors;
     if (tm.deltaSectorCount > TrackMapConfig::kMaxDeltaSectors) tm.deltaSectorCount = TrackMapConfig::kMaxDeltaSectors;
-    tm.deltaFullSeconds = ReadFloat("TrackMap", "DeltaFullSeconds", tm.deltaFullSeconds);
-    if (tm.deltaFullSeconds < 0.005f) tm.deltaFullSeconds = 0.005f;
     tm.deltaAheadStrength = ReadFloat("TrackMap", "DeltaAheadStrength", tm.deltaAheadStrength);
     tm.showLabels = ReadBool("TrackMap", "ShowLabels", tm.showLabels);
     tm.playerOwnColor = ReadBool("TrackMap", "PlayerOwnColor", tm.playerOwnColor);
@@ -1958,6 +2023,9 @@ void Config::Load()
     rt.lapSlowerG = ReadFloat("RelativeTiming", "LapSlowerColorG", rt.lapSlowerG);
     rt.lapSlowerB = ReadFloat("RelativeTiming", "LapSlowerColorB", rt.lapSlowerB);
     rt.visibleCars = ReadFloat("RelativeTiming", "VisibleCars", rt.visibleCars);
+    // Clamped (review F86): above 20 overran the timing table rows.
+    if (!(rt.visibleCars >= RelativeTimingConfig::kMinVisibleCars)) rt.visibleCars = RelativeTimingConfig::kMinVisibleCars;
+    if (rt.visibleCars > RelativeTimingConfig::kMaxVisibleCars) rt.visibleCars = RelativeTimingConfig::kMaxVisibleCars;
     rt.raceTrackOrder = ReadBool("RelativeTiming", "RaceTrackOrder", rt.raceTrackOrder);
     rt.trendWindowSeconds = ReadFloat("RelativeTiming", "TrendWindowSeconds", rt.trendWindowSeconds);
     rt.trackRelativeThresholdSeconds = ReadFloat("RelativeTiming", "TrackRelativeThresholdSeconds", rt.trackRelativeThresholdSeconds);
@@ -1985,6 +2053,11 @@ void Config::Load()
     FuelSaveConfig& fs = g_fuelSaveConfig;
     fs.enabled = ReadBool("FuelSave", "Enabled", fs.enabled);
     fs.stintMinutes = ReadFloat("FuelSave", "StintMinutes", fs.stintMinutes);
+    fs.boxMode = ReadInt("FuelSave", "FuelBoxMode", fs.boxMode);
+    if (fs.boxMode < 0 || fs.boxMode > 1) fs.boxMode = 1;
+    fs.requiredStops = ReadInt("FuelSave", "RequiredStops", fs.requiredStops);
+    if (fs.requiredStops < 0) fs.requiredStops = 0;
+    if (fs.requiredStops > 9) fs.requiredStops = 9;
     fs.reserveLitres = ReadFloat("FuelSave", "ReserveLitres", fs.reserveLitres);
     fs.barWindowLitres = ReadFloat("FuelSave", "BarWindowLitres", fs.barWindowLitres);
     fs.centerXFraction = ReadFloat("FuelSave", "CenterXFraction", fs.centerXFraction);
@@ -2006,6 +2079,12 @@ void Config::Load()
     et.centerXFraction = ReadFloat("EngineTemps", "CenterXFraction", et.centerXFraction);
     et.centerYFraction = ReadFloat("EngineTemps", "CenterYFraction", et.centerYFraction);
     et.scale = ReadFloat("EngineTemps", "Scale", et.scale);
+    BenchmarkConfig& bm = g_benchmarkConfig;
+    bm.enabled = ReadBool("Benchmark", "Enabled", bm.enabled);
+    bm.gpuBusyWarnPercent = ReadFloat("Benchmark", "GpuBusyWarnPercent", bm.gpuBusyWarnPercent);
+    bm.centerXFraction = ReadFloat("Benchmark", "CenterXFraction", bm.centerXFraction);
+    bm.centerYFraction = ReadFloat("Benchmark", "CenterYFraction", bm.centerYFraction);
+    bm.scale = ReadFloat("Benchmark", "Scale", bm.scale);
 
     FfbLevelConfig& ffl = g_ffbLevelConfig;
     ffl.enabled = ReadBool("FfbLevel", "Enabled", ffl.enabled);
@@ -2111,6 +2190,7 @@ namespace
     // Held for a whole flush, so a second caller can never swap s_inFlight
     // out from under one that is still writing it.
     SRWLOCK s_flushLock = SRWLOCK_INIT;
+    std::atomic<bool> s_saveFailed{ false };   // review F218, read by TakeSaveFailed()
 
     // Upsert by (section, key) -- last write wins, and a key touched several
     // times before the next flush (e.g. nudging a layout position repeatedly)
@@ -2192,8 +2272,11 @@ bool Config::WriteFloat(const char* section, const char* key, float value)
 {
     if (s_iniPath[0] == 0)
         return false;
+    // Review F219: %.4f of a huge value overflowed buf (sprintf_s ends the game).
+    if (!std::isfinite(value))
+        return false;
     char buf[32];
-    sprintf_s(buf, "%.4f", value);
+    sprintf_s(buf, "%.6g", value);
     QueueWrite(section, key, buf);
     return true;
 }
@@ -2251,17 +2334,47 @@ bool Config::FlushPendingWrites()
     // Each one rereads and rewrites the file -- fine here, on the Persist
     // thread, out of the car.
     bool allOk = true;
+    std::vector<PendingWrite> failed;
     for (const PendingWrite& w : s_inFlight)
     {
         if (!WritePrivateProfileStringA(w.section.c_str(), w.key.c_str(), w.value.c_str(), s_iniPath))
+        {
             allOk = false;
+            failed.push_back(w);
+        }
     }
 
+    // Review F218: a failed write used to be dropped. Requeue it (unless a
+    // newer value was queued meanwhile) for the next out-of-car flush, for a
+    // few attempts, and flag it so the caller can tell the driver once.
+    // s_failedFlushes is only touched under s_flushLock.
+    static int s_failedFlushes = 0;
+    s_failedFlushes = allOk ? 0 : s_failedFlushes + 1;
+    if (!allOk)
+        s_saveFailed.store(true);
     AcquireSRWLockExclusive(&s_writeLock);
     s_inFlight.clear();
+    if (s_failedFlushes <= 3)
+    {
+        for (PendingWrite& w : failed)
+        {
+            bool newer = false;
+            for (const PendingWrite& p : s_pendingWrites)
+                if (p.section == w.section && p.key == w.key) { newer = true; break; }
+            if (!newer)
+                s_pendingWrites.push_back(std::move(w));
+        }
+    }
     ReleaseSRWLockExclusive(&s_writeLock);
     ReleaseSRWLockExclusive(&s_flushLock);
+    if (!allOk)
+        Log::Write("Config: %d INI write(s) failed (%s)", static_cast<int>(failed.size()), s_iniPath);
     return allOk;
+}
+
+bool Config::TakeSaveFailed()
+{
+    return s_saveFailed.exchange(false);
 }
 
 namespace
@@ -2347,7 +2460,10 @@ namespace
         strcat_s(path, "\\UserData\\player\\Controller.JSON");
 
         FILE* f = nullptr;
-        if (fopen_s(&f, path, "rb") != 0 || !f)
+        // Shared read: fopen_s denies writers, and the game must never fail
+        // to save its own controller file because we have it open (review F281).
+        f = _fsopen(path, "rb", _SH_DENYNO);
+        if (!f)
             return false;
         fseek(f, 0, SEEK_END);
         const long size = ftell(f);

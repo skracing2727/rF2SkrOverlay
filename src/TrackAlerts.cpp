@@ -38,8 +38,9 @@ namespace
         return (dt > 0.001) ? span / dt : 0.0;
     }
 
-    // rF2 numbers sectors 1, 2, 0 (= sector 3), in mSector and, it appears,
-    // in mSectorFlag too. Returns 1..3.
+    // rF2 numbers sectors 1, 2, 0 (= sector 3) in mSector. Returns 1..3.
+    // Only for mSector: mSectorFlag[] is indexed plainly, [i] = sector i+1,
+    // which is how CrewChief reads it (CrewChief review 2026-11-24).
     int SectorNumber(int rf2Index)
     {
         return rf2Index == 0 ? 3 : rf2Index;
@@ -70,6 +71,28 @@ void TrackAlertStore::Clear()
     ReleaseSRWLockExclusive(&m_lock);
 }
 
+TrackAlertStore::CarTrack* TrackAlertStore::TrackFor(long id, double et)
+{
+    CarTrack* reuse = nullptr;
+    for (CarTrack& t : m_cars)
+    {
+        if (t.id == id)
+        {
+            t.lastSeen = et;
+            return &t;
+        }
+        // Free, not seen for a few seconds, or from before a clock reset.
+        if (!reuse && (t.id == -1 || et - t.lastSeen > 5.0 || et < t.lastSeen))
+            reuse = &t;
+    }
+    if (!reuse)
+        return nullptr;
+    *reuse = CarTrack{};
+    reuse->id = id;
+    reuse->lastSeen = et;
+    return reuse;
+}
+
 void TrackAlertStore::OnScoring(const ScoringInfoV01& info)
 {
     if (!m_ready)
@@ -92,12 +115,31 @@ void TrackAlertStore::OnScoring(const ScoringInfoV01& info)
     out.valid = true;
 
     const double et = info.mCurrentET;
-    const int phase = info.mGamePhase;
-    if (phase == 5 && m_lastGamePhase != 5)
+    // Paused: hold everything as it is, so a STOPPED line is still there on
+    // resume and the after-green hold is not re-armed (review F128).
+    if (info.mGamePhase == 9)
+        return;
+    // FCY "resume" (mYellowFlagState 6) means the race is going green, so it
+    // ends the full-course yellow whatever mGamePhase still says; CrewChief
+    // treats it as green too (CrewChief review 2026-11-24). Seen as phase 5,
+    // the step out of phase 6 re-arms the after-green hold just below, so the
+    // bunched field off the restart is not judged as stopped cars.
+    const int phase = (info.mGamePhase == 6 && info.mYellowFlagState == 6) ? 5 : info.mGamePhase;
+    // Re-arm the after-green hold only on a real start or restart, not when
+    // coming back from session-over/pause.
+    if (phase == 5 && m_lastGamePhase != 5 && m_lastGamePhase != 8 && m_lastGamePhase != 9)
         m_greenSince = et;
     m_lastGamePhase = phase;
-    const bool green = phase == 5;
+    // Session over but you have not taken the flag yet: still racing.
+    const bool green = phase == 5 || (phase == 8 && me->mFinishStatus == 0);
+    if (green && m_greenSince < 0.0)
+        m_greenSince = et;
     out.fullCourseYellow = phase == 6;
+    if (out.fullCourseYellow)
+        out.yellowStage = info.mYellowFlagState;
+    // Blue flag and pending penalties: player's own scoring entry.
+    out.blueFlag = me->mFlag == 6;
+    out.penalties = me->mNumPenalties > 0 ? me->mNumPenalties : 0;
 
     // --- Yellow flag per sector ---
     for (int i = 0; i < 3; ++i)
@@ -108,11 +150,11 @@ void TrackAlertStore::OnScoring(const ScoringInfoV01& info)
             // Logged so the sector numbering can be checked against the
             // game's own flag display the first time it happens.
             if (m_lastSectorFlag[i] != -1)
-                Log::Write("TrackAlerts: mSectorFlag[%d] (sector %d) %d -> %d", i, SectorNumber(i), m_lastSectorFlag[i], f);
+                Log::Write("TrackAlerts: mSectorFlag[%d] (read as sector %d) %d -> %d", i, i + 1, m_lastSectorFlag[i], f);
             m_lastSectorFlag[i] = f;
         }
         if (cfg.showSectorYellow && green && f == 1)
-            out.sectorYellow[SectorNumber(i) - 1] = true;
+            out.sectorYellow[i] = true;   // [i] = sector i+1
     }
 
     // --- Pit request: until the car is in the pit lane ---
@@ -133,17 +175,20 @@ void TrackAlertStore::OnScoring(const ScoringInfoV01& info)
         const VehicleScoringInfoV01& v = info.mVehicle[i];
         if (&v == me)
             continue;
-        CarTrack& t = m_cars[static_cast<unsigned long>(v.mID) % kSlots];
-        if (t.id != v.mID)
-        {
-            t = CarTrack{};
-            t.id = v.mID;
-        }
+        CarTrack* tp = TrackFor(v.mID, et);
+        if (!tp)
+            continue;
+        CarTrack& t = *tp;
 
         // Out of the running for this: the pit lane and garage, cars that
         // have taken the flag (slowing down on the cool-down lap) or been
         // disqualified, and any moment the field as a whole is slow.
-        const bool ignore = !judge || v.mInPits || v.mInGarageStall || v.mFinishStatus == 1 || v.mFinishStatus == 3;
+        // Also cars with no real data yet: a negative lap distance, or
+        // standing exactly still at lap distance 0 -- and the first 30 s of
+        // the session, while cars are still being placed (CrewChief review
+        // 2026-11-24, after CrewChief's GameStateData).
+        const bool noData = v.mLapDist < 0.0 || (SpeedOf(v) == 0.0 && v.mLapDist <= 0.0);
+        const bool ignore = !judge || et < 30.0 || noData || v.mInPits || v.mInGarageStall || v.mFinishStatus == 1 || v.mFinishStatus == 3;
         const double speed = SpeedOf(v);
         bool slowNow = false;
         if (!ignore)

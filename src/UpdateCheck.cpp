@@ -1,4 +1,5 @@
 #include "UpdateCheck.h"
+#include "EcoThread.h"
 #include "Config.h"
 #include "Log.h"
 #include "Version.h"
@@ -56,12 +57,14 @@ namespace
         return ok;
     }
 
-    // The request's handle, borrowed for one call. Closed by Shutdown() at
-    // any time; WinHTTP then fails the call in progress.
+    // The request's handle for the next call, or null once Shutdown() has begun
+    // (review F346: checked between calls so the worker stops at once). Shutdown
+    // may still close it during a call; WinHTTP then fails that call, and the
+    // value cannot be reused because only this thread opens handles.
     HINTERNET Request()
     {
         AcquireSRWLockShared(&g_handleLock);
-        HINTERNET h = g_request;
+        HINTERNET h = g_stopping ? nullptr : g_request;
         ReleaseSRWLockShared(&g_handleLock);
         return h;
     }
@@ -75,30 +78,39 @@ namespace
             return false;
         // Short limits: a slow network must not keep the thread (or a game
         // shutdown waiting for it) around.
-        WinHttpSetTimeouts(g_session, 5000, 5000, 5000, 5000);
-        if (!Keep(g_connect, WinHttpConnect(g_session, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0)))
+        AcquireSRWLockShared(&g_handleLock);
+        HINTERNET session = g_stopping ? nullptr : g_session;
+        ReleaseSRWLockShared(&g_handleLock);
+        if (!session) return false;
+        WinHttpSetTimeouts(session, 5000, 5000, 5000, 5000);
+        if (!Keep(g_connect, WinHttpConnect(session, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0)))
             return false;
-        if (!Keep(g_request, WinHttpOpenRequest(g_connect, L"GET", L"/repos/skracing2727/rF2SkrOverlay/releases/latest",
+        AcquireSRWLockShared(&g_handleLock);
+        HINTERNET connect = g_stopping ? nullptr : g_connect;
+        ReleaseSRWLockShared(&g_handleLock);
+        if (!connect) return false;
+        if (!Keep(g_request, WinHttpOpenRequest(connect, L"GET", L"/repos/skracing2727/rF2SkrOverlay/releases/latest",
                                                 nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                                 WINHTTP_FLAG_SECURE)))
             return false;
         const wchar_t* headers = L"Accept: application/vnd.github+json\r\n";
-        if (!WinHttpSendRequest(Request(), headers, static_cast<DWORD>(-1L), WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
-            || !WinHttpReceiveResponse(Request(), nullptr))
+        HINTERNET req = Request();
+        if (!req || !WinHttpSendRequest(req, headers, static_cast<DWORD>(-1L), WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+            || !(req = Request()) || !WinHttpReceiveResponse(req, nullptr))
             return false;
         DWORD size = sizeof(status);
-        if (!WinHttpQueryHeaders(Request(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        if (!(req = Request()) || !WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                                  WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX))
             return false;
         char buf[4096];
         DWORD got = 0;
         // The release JSON is a few KB; 256 KB is a hard stop.
-        while (body.size() < 256 * 1024 && WinHttpReadData(Request(), buf, sizeof(buf), &got) && got > 0)
+        while (body.size() < 256 * 1024 && (req = Request()) && WinHttpReadData(req, buf, sizeof(buf), &got) && got > 0)
             body.append(buf, got);
         return true;
     }
 
-    DWORD WINAPI ThreadProc(LPVOID)
+    DWORD Run()
     {
         std::string body;
         DWORD status = 0;
@@ -146,6 +158,28 @@ namespace
         }
         return 0;
     }
+
+    // Review F305/F346: WinHTTP (proxy detection, DNS) can outlast Shutdown()'s
+    // 3 s wait. The thread holds its own reference to this DLL so rF2 cannot
+    // unload the code under it; FreeLibraryAndExitThread drops it on the way out.
+    // The reference is taken in Start(), before the thread exists.
+    // An exception must not leave a thread: std::terminate would take the
+    // game down (review F271). The real body is ThreadProcBody below.
+    DWORD ThreadProcBody(LPVOID param);
+    DWORD WINAPI ThreadProc(LPVOID param)
+    {
+        try { return ThreadProcBody(param); }
+        catch (...) { return 0; }
+    }
+
+    DWORD ThreadProcBody(LPVOID param)
+    {
+        HMODULE self = static_cast<HMODULE>(param);
+        const DWORD rc = Run();
+        if (self)
+            FreeLibraryAndExitThread(self, rc);
+        return rc;
+    }
 }
 
 void UpdateCheck::Start()
@@ -157,7 +191,13 @@ void UpdateCheck::Start()
     }
     if (g_thread)
         return;
-    g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                       reinterpret_cast<LPCWSTR>(&ThreadProc), &self);
+    g_thread = CreateThread(nullptr, 0, ThreadProc, self, 0, nullptr);
+    MakeThreadEfficient(g_thread);
+    if (!g_thread && self)
+        FreeLibrary(self);
     if (g_thread)
         SetThreadPriority(g_thread, THREAD_PRIORITY_BELOW_NORMAL);
 }

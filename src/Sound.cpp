@@ -48,7 +48,16 @@ namespace
         PlaySoundA(reinterpret_cast<LPCSTR>(g_silence), nullptr, SND_MEMORY | SND_SYNC | SND_NODEFAULT);
     }
 
-    DWORD WINAPI ThreadProc(LPVOID)
+    // An exception must not leave a thread: std::terminate would take the
+    // game down (review F271). The real body is ThreadProcBody below.
+    DWORD ThreadProcBody(LPVOID param);
+    DWORD WINAPI ThreadProc(LPVOID param)
+    {
+        try { return ThreadProcBody(param); }
+        catch (...) { return 0; }
+    }
+
+    DWORD ThreadProcBody(LPVOID)
     {
         // A beep is only useful on time (the brake cue especially), and this
         // thread sleeps between them, so it may as well be first in line
@@ -136,10 +145,19 @@ void Sound::Shutdown()
         return;
     }
     SetEvent(wake);
+    // Stop any cue now, so a thread inside an async PlaySound returns sooner.
+    PlaySoundA(nullptr, nullptr, 0);
     // Normally immediate. Bounded so a hung audio service cannot hang the
     // game's exit; the handle is closed either way (that does not stop it).
     if (WaitForSingleObject(thread, 2000) != WAIT_OBJECT_0)
-        Log::Write("Sound: sound thread still busy at shutdown");
+    {
+        // The thread may still run our code: pin the DLL so unloading it
+        // cannot pull that code out from under it (review F417).
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(&ThreadProc), &self);
+        Log::Write("Sound: sound thread still busy at shutdown -- DLL pinned");
+    }
     CloseHandle(thread);
     // g_wake is left open on purpose: a PlayMemory that raced this Shutdown
     // may still be about to signal it.

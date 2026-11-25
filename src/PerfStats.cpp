@@ -1,4 +1,5 @@
 #include "PerfStats.h"
+#include "EcoThread.h"
 #include "GpuEngineUsage.h"
 #include "AmdGpuPower.h"
 #include "ReplayInfo.h"
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <new>
 #include <malloc.h>
+#include <intrin.h>
 
 // Counts the bytes this DLL's C++ code holds on the heap, for the "HUD RAM"
 // stat. Replacing the global operator new/delete applies to this DLL only
@@ -113,6 +115,15 @@ namespace
     bool g_haveBeforePresent = false;
     double g_cpuFrameMs = 0.0;
     bool g_haveCpuFrameMs = false;
+    // Raw CPU time of the latest frame, and whether OnFrame measured it this
+    // frame (cleared at the start of each OnFrame so a skipped frame is not
+    // counted twice by the benchmark box).
+    double g_lastCpuMs = 0.0;
+    bool g_lastCpuFresh = false;
+    // Time-decayed sum and count behind g_cpuFrameMs (review F176).
+    double g_cpuDecayedSumMs = 0.0;
+    double g_cpuDecayedCount = 0.0;
+    LARGE_INTEGER g_lastFrameQpc = {};
 
     // QueryThreadCycleTime counts cycles against the CPU's invariant TSC
     // rate, which tracks its nominal/base frequency (not the turbo-boosted
@@ -136,25 +147,28 @@ namespace
         }
         else
         {
-            // Fallback if the registry key is ever missing: measure cycles
-            // burned over a short sleep against wall time. Noisier (this
-            // thread may be scheduled out for part of it), but better than
-            // nothing.
+            // Fallback if the registry key is ever missing: time the TSC
+            // (the counter QueryThreadCycleTime counts in) against QPC over a
+            // short sleep. The TSC runs whether or not this thread does; the
+            // old fallback used the thread's own cycle count, which barely
+            // moves while it sleeps, and got a rate ~1000x too low (review
+            // F184). One-off, at the first device bind.
             LARGE_INTEGER freq, t0, t1;
             QueryPerformanceFrequency(&freq);
-            ULONGLONG c0 = 0, c1 = 0;
-            QueryThreadCycleTime(GetCurrentThread(), &c0);
             QueryPerformanceCounter(&t0);
+            const unsigned long long c0 = __rdtsc();
             Sleep(30);
-            QueryThreadCycleTime(GetCurrentThread(), &c1);
+            const unsigned long long c1 = __rdtsc();
             QueryPerformanceCounter(&t1);
 
             const double elapsedMs = static_cast<double>(t1.QuadPart - t0.QuadPart) / static_cast<double>(freq.QuadPart) * 1000.0;
-            if (elapsedMs > 1.0)
+            if (elapsedMs > 1.0 && c1 > c0)
             {
                 g_cyclesPerMs = static_cast<double>(c1 - c0) / elapsedMs;
-                g_haveCycleCalibration = g_cyclesPerMs > 1.0;
+                // Below 100 MHz is not a real TSC rate.
+                g_haveCycleCalibration = g_cyclesPerMs > 100000.0;
             }
+            Log::Write("PerfStats: no ~MHz in the registry, TSC calibrated at %.0f MHz", g_cyclesPerMs / 1000.0);
         }
     }
 
@@ -304,7 +318,8 @@ namespace
     PDH_HQUERY g_cardQuery = nullptr;
     PDH_HCOUNTER g_cardCounter = nullptr;
     bool g_cardQueryFailed = false;
-    wchar_t g_cardLuid[40] = L"";       // "luid_0x%08X_0x%08X" of rF2's adapter
+    wchar_t g_cardLuid[40] = L"";       // "luid_0x%08X_0x%08X" of rF2's adapter (poller thread)
+    std::atomic<unsigned> g_cardVendorId{ 0 };   // DXGI VendorId of rF2's adapter, 0 until known
     double g_cardTotalMB = 0.0;
     std::vector<BYTE> g_cardBuf;
     std::atomic<double> g_cardUsedMBPub{0.0};
@@ -384,6 +399,7 @@ void PerfStats::Init(IDXGISwapChain* swapChain)
     g_haveVram = false;
     g_haveLastThreadCycles = false;
     g_haveCpuFrameMs = false;
+    g_lastFrameQpc.QuadPart = 0;
     if (!g_haveCycleCalibration)
         CalibrateCyclesPerMs();
 
@@ -436,6 +452,7 @@ void PerfStats::OnFrame()
     // frame boundary, converted via the calibrated cycles/ms above. Called
     // from the Present hook, so this is whichever thread the game calls
     // Present on -- its main/render thread.
+    g_lastCpuFresh = false;
     if (!g_haveCycleCalibration)
         return;
 
@@ -457,17 +474,25 @@ void PerfStats::OnFrame()
         if (deltaMs >= 0.0 && deltaMs < 2000.0)
         {
             PushFrame(deltaMs);
-            if (!g_haveCpuFrameMs)
-            {
-                g_cpuFrameMs = deltaMs;
-                g_haveCpuFrameMs = true;
-            }
-            else
-            {
-                constexpr double kTauMs = 500.0;
-                const double alpha = 1.0 - exp(-deltaMs / kTauMs);
-                g_cpuFrameMs = g_cpuFrameMs * (1.0 - alpha) + deltaMs * alpha;
-            }
+            g_lastCpuMs = deltaMs;
+            g_lastCpuFresh = true;
+            // Mean over a ~500 ms window: decayed sum over decayed count,
+            // the decay driven by the wall-clock frame interval. Using the
+            // CPU time itself as the weight (the old alpha) read high
+            // whenever frame costs vary (review F176).
+            LARGE_INTEGER nowQpc, freq;
+            QueryPerformanceCounter(&nowQpc);
+            QueryPerformanceFrequency(&freq);
+            double wallMs = deltaMs;
+            if (g_lastFrameQpc.QuadPart != 0 && freq.QuadPart != 0)
+                wallMs = static_cast<double>(nowQpc.QuadPart - g_lastFrameQpc.QuadPart) / static_cast<double>(freq.QuadPart) * 1000.0;
+            g_lastFrameQpc = nowQpc;
+            constexpr double kTauMs = 500.0;
+            const double d = g_haveCpuFrameMs ? exp(-(wallMs > 0.0 ? wallMs : 0.0) / kTauMs) : 0.0;
+            g_cpuDecayedSumMs = g_cpuDecayedSumMs * d + deltaMs;
+            g_cpuDecayedCount = g_cpuDecayedCount * d + 1.0;
+            g_cpuFrameMs = g_cpuDecayedSumMs / g_cpuDecayedCount;
+            g_haveCpuFrameMs = true;
             PublishCpuFrameMs();
         }
     }
@@ -515,13 +540,16 @@ void PerfStats::Poll()
                 swprintf_s(g_cardLuid, L"luid_0x%08X_0x%08X",
                            static_cast<unsigned>(desc.AdapterLuid.HighPart), static_cast<unsigned>(desc.AdapterLuid.LowPart));
                 g_cardTotalMB = static_cast<double>(desc.DedicatedVideoMemory) / (1024.0 * 1024.0);
+                g_cardVendorId.store(desc.VendorId, std::memory_order_relaxed);
                 Log::Write("PerfStats: graphics card %ls, %.0f MB dedicated VRAM", desc.Description, g_cardTotalMB);
             }
         }
         adapter->Release();
 
+        // Whole-card VRAM is a PDH query: only while the VRAM stat is on
+        // (review F181).
         double cardUsedMB = 0.0;
-        if (g_cardTotalMB > 0.0 && SampleCardVram(cardUsedMB))
+        if (g_frameLatencyConfig.showVram && g_cardTotalMB > 0.0 && SampleCardVram(cardUsedMB))
         {
             g_cardUsedMBPub.store(cardUsedMB, std::memory_order_relaxed);
             g_cardTotalMBPub.store(g_cardTotalMB, std::memory_order_relaxed);
@@ -532,6 +560,14 @@ void PerfStats::Poll()
             g_haveCardVram.store(false, std::memory_order_release);
         }
     }
+}
+
+bool PerfStats::GetLastCpuFrameMs(double& outMs)
+{
+    if (!g_lastCpuFresh)
+        return false;
+    outMs = g_lastCpuMs;
+    return true;
 }
 
 bool PerfStats::GetCpuFrameTimeMs(double& outMs)
@@ -573,24 +609,50 @@ void PerfStatsSamplePcRam();
 namespace
 {
     HANDLE g_pollThread = nullptr;
-    std::atomic<bool> g_pollStop{ false };
+    HANDLE g_pollStopEvent = nullptr;
+    std::atomic<bool> g_pollerStuck{ false };
 
-    DWORD WINAPI PollThreadProc(LPVOID)
+    // An exception must not leave a thread: std::terminate would take the
+    // game down (review F271). The real body is PollThreadProcBody below.
+    DWORD PollThreadProcBody(LPVOID param);
+    DWORD WINAPI PollThreadProc(LPVOID param)
     {
-        while (!g_pollStop.load())
+        try { return PollThreadProcBody(param); }
+        catch (...) { return 0; }
+    }
+
+    DWORD PollThreadProcBody(LPVOID)
+    {
+        bool gpuWanted = false;
+        for (;;)
         {
+            // The PDH/ADL queries only run while their stat is on: a perf
+            // line showing just FPS should not pay for them (review F181).
+            const FrameLatencyConfig& cfg = g_frameLatencyConfig;
             PerfStats::Poll();
-            PerfStatsSamplePcRam();
-            GpuEngineUsage::Poll();
-            AmdGpuPower::Sample();
+            if (cfg.showPcRam)
+                PerfStatsSamplePcRam();
+            // The benchmark box's GPU warning needs busy % too.
+            const bool gpuOn = cfg.showGpuFrameTime || g_benchmarkConfig.enabled;
+            if (gpuOn)
+            {
+                if (!gpuWanted)
+                    GpuEngineUsage::Rebaseline();   // fresh baseline after a pause
+                else
+                    GpuEngineUsage::Poll();
+            }
+            gpuWanted = gpuOn;
+            if (cfg.showGpuPower)
+                AmdGpuPower::Sample();
             // File-system lookups (player.JSON, the replay folder): here, not
             // on the render thread.
-            if (g_frameLatencyConfig.showReplay)
+            if (cfg.showReplay)
                 ReplayInfo::Poll();
             const float hz = g_perfUpdateConfig.updateHz > 0.1f ? g_perfUpdateConfig.updateHz : 2.0f;
             const DWORD waitMs = static_cast<DWORD>(1000.0f / hz);
-            for (DWORD slept = 0; slept < waitMs && !g_pollStop.load(); slept += 50)
-                Sleep(50);
+            // A stop event instead of Sleep slices: StopPoller wakes it at once.
+            if (WaitForSingleObject(g_pollStopEvent, waitMs) != WAIT_TIMEOUT)
+                break;
         }
         return 0;
     }
@@ -599,17 +661,47 @@ namespace
 void PerfStats::StartPoller()
 {
     if (g_pollThread) return;
-    g_pollStop.store(false);
+    if (!g_pollStopEvent)
+        g_pollStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_pollStopEvent) return;
+    ResetEvent(g_pollStopEvent);
     g_pollThread = CreateThread(nullptr, 0, PollThreadProc, nullptr, 0, nullptr);
+    MakeThreadEfficient(g_pollThread);
 }
 
 void PerfStats::StopPoller()
 {
     if (!g_pollThread) return;
-    g_pollStop.store(true);
-    WaitForSingleObject(g_pollThread, 2000);
+    SetEvent(g_pollStopEvent);
+    if (WaitForSingleObject(g_pollThread, 2000) == WAIT_TIMEOUT)
+    {
+        // Still inside a slow PDH/ADL call. Freeing those, or unloading this
+        // DLL, under it would crash rF2 on exit: the ADL/PDH Shutdowns turn
+        // into no-ops (PollerStuck) and the DLL is pinned until the process
+        // ends (review F231).
+        g_pollerStuck.store(true);
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(&PollThreadProc), &self);
+        Log::Write("PerfStats: stats poller did not stop within 2 s -- PDH/ADL left open, DLL pinned");
+    }
     CloseHandle(g_pollThread);
     g_pollThread = nullptr;
+}
+
+bool PerfStats::PollerStuck()
+{
+    return g_pollerStuck.load();
+}
+
+const wchar_t* PerfStats::GetCardLuid()
+{
+    return g_cardLuid;
+}
+
+unsigned PerfStats::GetCardVendorId()
+{
+    return g_cardVendorId.load(std::memory_order_relaxed);
 }
 
 namespace

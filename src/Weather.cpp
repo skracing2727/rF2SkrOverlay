@@ -1,6 +1,8 @@
 #include "Weather.h"
+#include "EcoThread.h"
 #include "InternalsPlugin.hpp"
 #include "Config.h"
+#include "Log.h"
 #include <Windows.h>
 #include <winhttp.h>
 #include <atomic>
@@ -58,6 +60,7 @@ namespace
     std::thread s_thread;
     std::atomic<bool> s_stop{ false };
     std::atomic<bool> s_started{ false };
+    std::atomic<bool> s_gameRefetch{ true };   // set by Reset: fetch the game forecast again (review F142)
 
     // Inputs from scoring.
     char s_track[64] = {};
@@ -72,8 +75,10 @@ namespace
     // as a plain pointer, nothing is copied or allocated per frame.
     const char* s_gameStatus = "waiting";
 
-    // REAL results: hourly, indexed from the fetch hour.
-    const int kHours = 12;
+    // REAL results: hourly, indexed from the fetch hour. Open-Meteo's rain
+    // fields describe the preceding hour, so one extra hour is fetched and
+    // hour h's rain is read from slot h+1 (review F137).
+    const int kHours = 13;
     float s_realRain[kHours], s_realMm[kHours], s_realTemp[kHours];
     int s_realCount = 0;
     time_t s_realHour0 = 0;    // UTC time of s_real*[0]
@@ -126,7 +131,7 @@ namespace
         return end && end != s.c_str() + pos;
     }
     // Numbers of the JSON array that follows `key`, from `from`.
-    int ArrayAfter(const std::string& s, const char* key, size_t from, float* out, int max)
+    int ArrayAfter(const std::string& s, const char* key, size_t from, double* out, int max)
     {
         size_t p = FindKey(s, key, from);
         if (p == std::string::npos) return 0;
@@ -142,7 +147,7 @@ namespace
             char* end = nullptr;
             const double v = strtod(s.c_str() + p, &end);
             if (!end || end == s.c_str() + p) break;
-            out[n++] = static_cast<float>(v);
+            out[n++] = v;
             p = static_cast<size_t>(end - s.c_str());
         }
         return n;
@@ -167,6 +172,14 @@ namespace
         return std::string::npos;
     }
 
+    // Network values are untrusted: non-finite -> fallback, else clamped to
+    // a physical range so a broken reply cannot overflow a format (review F274).
+    float Clamp(double v, double lo, double hi, double fallback)
+    {
+        if (!std::isfinite(v)) v = fallback;
+        return static_cast<float>(v < lo ? lo : (v > hi ? hi : v));
+    }
+
     void TrackKey(const char* prefix, const char* track, char* out, size_t outSize)
     {
         strcpy_s(out, outSize, prefix);
@@ -177,6 +190,18 @@ namespace
             out[n++] = isalnum(c) ? static_cast<char>(c) : '_';
         }
         out[n] = '\0';
+        // review F420: non-ASCII names all became "___"; add a short hash
+        // of the original so they don't share a key (ASCII names unchanged).
+        bool lossy = false;
+        unsigned int hash = 2166136261u;
+        for (const char* p = track; *p; ++p)
+        {
+            const unsigned char c = static_cast<unsigned char>(*p);
+            hash = (hash ^ c) * 16777619u;
+            if (c >= 0x80 || c < 0x20) lossy = true;
+        }
+        if (lossy && n + 8 <= outSize)
+            sprintf_s(out + n, outSize - n, "_%06x", hash & 0xFFFFFFu);
     }
 
     bool Coords(const char* track, double& lat, double& lon)
@@ -196,18 +221,21 @@ namespace
         return false;
     }
 
-    void FetchGame()
+    // True when the game's forecast was read.
+    bool FetchGame()
     {
         long session;
         { std::lock_guard<std::mutex> lk(s_mx); session = s_session; }
-        const char* name = session >= 10 ? "RACE" : session >= 5 ? "QUALIFY" : "PRACTICE";
+        // Warm-up (9) runs just before the race; the web API has only
+        // PRACTICE / QUALIFY / RACE blocks (review F373).
+        const char* name = session >= 9 ? "RACE" : session >= 5 ? "QUALIFY" : "PRACTICE";
         std::string body;
         if (!HttpGet(L"localhost", 5397, false, L"/rest/sessions/weather", body))
         {
             std::lock_guard<std::mutex> lk(s_mx);
             s_gameValid = false;
             s_gameStatus = "game web API not reachable";
-            return;
+            return false;
         }
         static const char* const kNodes[5] = { "START", "NODE_25", "NODE_50", "NODE_75", "FINISH" };
         static const float kFrac[5] = { 0.0f, 0.2f, 0.4f, 0.6f, 0.8f };
@@ -228,34 +256,43 @@ namespace
               && (p = FindKey(body, "WNV_SKY", n, next)) != std::string::npos && (p = FindKey(body, "currentValue", p, next)) != std::string::npos && NumberAfter(body, p, sky)
               && (p = FindKey(body, "WNV_TEMPERATURE", n, next)) != std::string::npos && (p = FindKey(body, "currentValue", p, next)) != std::string::npos && NumberAfter(body, p, temp)
               && (p = FindKey(body, "WNV_RAIN_CHANCE", n, next)) != std::string::npos && (p = FindKey(body, "currentValue", p, next)) != std::string::npos && NumberAfter(body, p, rain);
-            nodes[i] = { kFrac[i], static_cast<int>(sky), static_cast<float>(temp), static_cast<float>(rain * 0.01) };
+            nodes[i] = { kFrac[i], static_cast<int>(Clamp(sky, 0.0, 10.0, 0.0)), Clamp(temp, -60.0, 60.0, 0.0),
+                         Clamp(rain, 0.0, 100.0, 0.0) * 0.01f };
         }
+        static bool logged = false;
+        if (!logged) { logged = true; Log::Write("Weather: game forecast (%s) %s, %u bytes", name, ok ? "read" : "not understood", static_cast<unsigned>(body.size())); }
         std::lock_guard<std::mutex> lk(s_mx);
         s_gameValid = ok;
         s_gameStatus = ok ? "" : "no forecast from game";
         if (ok) for (int i = 0; i < 5; ++i) s_game[i] = nodes[i];
+        return ok;
     }
 
-    void FetchReal()
+    // True when a forecast was stored (or the track has no coordinates,
+    // which a quick retry would not change).
+    bool FetchReal()
     {
         char track[64];
         { std::lock_guard<std::mutex> lk(s_mx); strcpy_s(track, s_track); }
-        if (!track[0]) return;
+        if (!track[0]) return true;
         double lat, lon;
         if (!Coords(track, lat, lon))
         {
+            static char loggedFor[64] = {};
+            if (strcmp(loggedFor, track)) { strcpy_s(loggedFor, track); Log::Write("Weather: no coordinates for track '%s' (add CoordsLat_/CoordsLon_ under [Conditions])", track); }
             std::lock_guard<std::mutex> lk(s_mx);
             s_realCount = 0;
             s_realStatus = "track not in list (see INI)";
             strcpy_s(s_realTrack, track);
-            return;
+            return true;
         }
         wchar_t path[256];
         swprintf_s(path, L"/v1/forecast?latitude=%.4f&longitude=%.4f&hourly=precipitation_probability,precipitation,temperature_2m&forecast_hours=%d&timezone=GMT&timeformat=unixtime",
                    lat, lon, kHours);
         std::string body;
         const bool got = HttpGet(L"api.open-meteo.com", INTERNET_DEFAULT_HTTPS_PORT, true, path, body);
-        float t0[kHours], rain[kHours], mm[kHours], temp[kHours];
+        // Doubles: unix seconds do not fit a float's 24 bits (review F406).
+        double t0[kHours], rain[kHours], mm[kHours], temp[kHours];
         int n = 0;
         if (got)
         {
@@ -269,41 +306,79 @@ namespace
                 n = nt < nr ? nt : nr;
                 if (nm < n) n = nm;
                 if (nc < n) n = nc;
+                // The first hour must be a real time near now (+/- 2 days).
+                const double nowT = static_cast<double>(time(nullptr));
+                if (n > 0 && !(std::isfinite(t0[0]) && fabs(t0[0] - nowT) < 2.0 * 86400.0)) n = 0;
             }
         }
+        Log::Write("Weather: real forecast for '%s' (%.3f, %.3f): %s, %d hours", track, lat, lon, got ? "ok" : "request failed", n);
         std::lock_guard<std::mutex> lk(s_mx);
+        // A failed fetch for a new track must not leave the previous track's
+        // forecast showing under the new name (review F140).
+        const bool otherTrack = strcmp(s_realTrack, track) != 0;
         strcpy_s(s_realTrack, track);
         if (n > 0)
         {
             s_realCount = n;
             s_realHour0 = static_cast<time_t>(t0[0]);
-            for (int i = 0; i < n; ++i) { s_realRain[i] = rain[i] * 0.01f; s_realMm[i] = mm[i]; s_realTemp[i] = temp[i]; }
+            for (int i = 0; i < n; ++i)
+            {
+                s_realRain[i] = Clamp(rain[i], 0.0, 100.0, 0.0) * 0.01f;
+                s_realMm[i] = Clamp(mm[i], 0.0, 500.0, 0.0);
+                s_realTemp[i] = Clamp(temp[i], -60.0, 60.0, 0.0);
+            }
             s_realStatus = "";
         }
-        else if (s_realCount == 0)
-            s_realStatus = got ? "forecast not understood" : "no internet / service down";
+        else
+        {
+            if (otherTrack) s_realCount = 0;
+            if (s_realCount == 0) s_realStatus = got ? "forecast not understood" : "no internet / service down";
+        }
+        return n > 0;
     }
 
+    void ThreadBody();
+    // An exception must not leave the thread (std::terminate; review F271).
     void ThreadMain()
     {
-        ULONGLONG nextGame = 0, nextReal = 0;
+        try { ThreadBody(); }
+        catch (...) {}
+    }
+
+    void ThreadBody()
+    {
+        const ULONGLONG kQuarter = 15ull * 60ull * 1000ull;
+        ULONGLONG nextGame = 0, nextReal = 0, realRetry = 60000;
         char lastTrack[64] = {};
         while (!s_stop.load())
         {
             const ULONGLONG now = GetTickCount64();
-            if (g_conditionsConfig.enabled && now >= nextGame)
-            {
-                FetchGame();
-                nextGame = now + 30000;    // the game's forecast only changes between sessions; cheap anyway
-            }
             char track[64];
             { std::lock_guard<std::mutex> lk(s_mx); strcpy_s(track, s_track); }
+            // Only while in a session (Reset clears the track), so nothing is
+            // polled in the menus (review F142).
+            if (s_gameRefetch.exchange(false)) nextGame = 0;
+            if (g_conditionsConfig.enabled && track[0] && now >= nextGame)
+            {
+                // Set per session: once read only a slow re-check, until then
+                // a retry every 30 s.
+                nextGame = now + (FetchGame() ? 10ull * 60ull * 1000ull : 30000ull);
+            }
             const bool trackChanged = strcmp(track, lastTrack) != 0;
             if (g_conditionsConfig.enabled && g_conditionsConfig.realWeather && track[0] && (now >= nextReal || trackChanged))
             {
                 strcpy_s(lastTrack, track);
-                FetchReal();
-                nextReal = now + 15ull * 60ull * 1000ull;   // Open-Meteo updates hourly; every 15 min is plenty
+                if (FetchReal())
+                {
+                    realRetry = 60000;
+                    nextReal = now + kQuarter;   // Open-Meteo updates hourly; every 15 min is plenty
+                }
+                else
+                {
+                    // Failed: retry after 1 min, backing off to 15 (review F140).
+                    nextReal = now + realRetry;
+                    realRetry = realRetry * 2 > kQuarter ? kQuarter : realRetry * 2;
+                }
             }
             for (int i = 0; i < 10 && !s_stop.load(); ++i) Sleep(100);
         }
@@ -323,6 +398,7 @@ void Weather::OnScoring(const ScoringInfoV01& info)
     {
         s_stop = false;
         s_thread = std::thread(ThreadMain);
+        MakeThreadEfficient(static_cast<HANDLE>(s_thread.native_handle()));
     }
 }
 
@@ -331,13 +407,31 @@ void Weather::Reset()
     std::lock_guard<std::mutex> lk(s_mx);
     s_gameValid = false;
     s_gameStatus = "waiting";
+    s_track[0] = '\0';   // out of the session: no fetching until scoring sets it again (review F142)
+    s_gameRefetch = true;
 }
 
 void Weather::Shutdown()
 {
     if (!s_started.load()) return;
     s_stop = true;
-    if (s_thread.joinable()) s_thread.join();
+    if (s_thread.joinable())
+    {
+        // At most 3 s (review F170): a request stuck in WinHTTP must not
+        // hold the game's exit. If it is still running, keep the DLL loaded
+        // (pinned) so the thread never runs unmapped code, and let it go.
+        const DWORD w = WaitForSingleObject(static_cast<HANDLE>(s_thread.native_handle()), 3000);
+        if (w == WAIT_OBJECT_0)
+            s_thread.join();
+        else
+        {
+            HMODULE h = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                               reinterpret_cast<LPCWSTR>(&Weather::Shutdown), &h);
+            s_thread.detach();
+            Log::Write("Weather: thread still busy at shutdown -- left running, DLL pinned");
+        }
+    }
     s_started = false;
 }
 
@@ -365,10 +459,13 @@ int Weather::Real(RealPoint* out, int max, const char*& status)
     std::lock_guard<std::mutex> lk(s_mx);
     if (s_realCount == 0 || strcmp(s_realTrack, s_track) != 0) { status = s_realStatus; return 0; }
     const time_t now = time(nullptr);
-    const int skip = static_cast<int>((now - s_realHour0) / 3600);   // hours since the fetch started
+    const long long since = static_cast<long long>(now) - static_cast<long long>(s_realHour0);
+    const int skip = since < 0 ? 0 : static_cast<int>(since / 3600);   // hours since the fetch started
     int n = 0;
-    for (int i = skip < 0 ? 0 : skip; i < s_realCount && n < max; ++i)
-        out[n++] = { i - skip, s_realRain[i], s_realMm[i], s_realTemp[i] };
+    // Slot i's temperature is at its hour start; its rain and mm cover the
+    // hour before, so the hour starting at slot i reads rain from i+1 (review F137).
+    for (int i = skip; i + 1 < s_realCount && n < max; ++i)
+        out[n++] = { i - skip, s_realRain[i + 1], s_realMm[i + 1], s_realTemp[i] };
     status = n ? "" : "forecast out of date";
     return n;
 }

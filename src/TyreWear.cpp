@@ -1,6 +1,7 @@
 #include "TyreWear.h"
 #include "InternalsPlugin.hpp"
 #include "Config.h"
+#include "Persist.h"
 #include <algorithm>
 
 TyreWearStore g_tyreWear;
@@ -22,6 +23,7 @@ void TyreWearStore::Clear()
     m_lastLapNumber = -1;
     m_haveLapStartWear = false;
     m_lastLapTimeSeconds = 0.0;
+    m_cleanLapTimeSeconds = 0.0;
     for (int w = 0; w < 4; ++w)
     {
         m_lapHistoryCount[w] = 0;
@@ -129,13 +131,18 @@ void TyreWearStore::OnTelemetry(const TelemInfoV01& info)
     // already applies for a refuel jump).
     for (int w = 0; w < 4; ++w)
     {
-        if (info.mWheel[w].mWear > m_wearAtLapStart[w] + 0.01)
+        // Any rise past noise is a tyre change, even after <1% wear (review F387).
+        if (info.mWheel[w].mWear > m_wearAtLapStart[w] + 0.0005)
         {
             m_wearAtLapStart[w] = info.mWheel[w].mWear;
             m_lapTouchedPits = true;
         }
     }
     if (m_playerInPits.load(std::memory_order_relaxed))
+        m_lapTouchedPits = true;
+    // A lap partly driven by the AI or a team-mate is not learned from
+    // either (review F167/F252); the readout itself still updates.
+    if (!g_localPlayerDriving.load(std::memory_order_relaxed))
         m_lapTouchedPits = true;
 
     if (info.mLapNumber > m_lastLapNumber && m_haveLapStartWear)
@@ -165,13 +172,14 @@ void TyreWearStore::OnTelemetry(const TelemInfoV01& info)
             // mWear counts DOWN from 1.0 (fresh) toward 0.0 (fully worn) --
             // NOT up from 0 -- so degradation is the DROP since lap start.
             const double degradedPercent = (m_wearAtLapStart[w] - info.mWheel[w].mWear) * 100.0;
-            if (plausibleLap && degradedPercent >= 0.0)
+            // In/out laps and the partial lap after a tyre change stay out of
+            // the life history too, not just the box plot (review F22).
+            if (plausibleLap && degradedPercent >= 0.0 && !m_lapTouchedPits)
             {
                 m_lapHistory[w][m_lapHistoryNext[w]] = degradedPercent;
                 m_lapHistoryNext[w] = (m_lapHistoryNext[w] + 1) % kLapHistorySize;
                 if (m_lapHistoryCount[w] < kLapHistorySize) ++m_lapHistoryCount[w];
 
-                if (!m_lapTouchedPits)
                 {
                     std::vector<float>& laps = m_sessionLaps[w];
                     if (laps.size() >= kMaxSessionLaps)
@@ -183,6 +191,9 @@ void TyreWearStore::OnTelemetry(const TelemInfoV01& info)
             m_wearAtLapStart[w] = info.mWheel[w].mWear;
         }
         if (plausibleLap) m_lastLapTimeSeconds = lapTime;
+        // Projections use a lap without a pit visit only: a stop's standing
+        // time would scale the spike check and time left (review F23).
+        if (plausibleLap && !m_lapTouchedPits) m_cleanLapTimeSeconds = lapTime;
         // The new lap starts clean unless it starts in the pit lane (an out
         // lap, or a pit lane that crosses the line).
         m_lapTouchedPits = m_playerInPits.load(std::memory_order_relaxed);
@@ -223,9 +234,9 @@ void TyreWearStore::OnTelemetry(const TelemInfoV01& info)
         // than the recent average -- only checked once there's a meaningful
         // in-lap baseline and lap history to compare against.
         bool anomaly = false;
-        if (avgHist > 0.001 && timeIntoLap > 5.0 && m_lastLapTimeSeconds > 0.0)
+        if (avgHist > 0.001 && timeIntoLap > 5.0 && m_cleanLapTimeSeconds > 0.0 && !m_lapTouchedPits)
         {
-            const double projected = curDegradedPercent * (m_lastLapTimeSeconds / timeIntoLap);
+            const double projected = curDegradedPercent * (m_cleanLapTimeSeconds / timeIntoLap);
             anomaly = projected > avgHist * 1.5; // 50% hotter than recent normal
         }
         m_state.wheel[w].anomalyHigh = anomaly;
@@ -234,8 +245,8 @@ void TyreWearStore::OnTelemetry(const TelemInfoV01& info)
         {
             const double wearRemainingPercent = info.mWheel[w].mWear * 100.0; // life remaining, 0..100
             m_state.wheel[w].lapsRemaining = wearRemainingPercent / avgHist;
-            m_state.wheel[w].timeLeftSeconds = (m_lastLapTimeSeconds > 0.0)
-                ? m_state.wheel[w].lapsRemaining * m_lastLapTimeSeconds
+            m_state.wheel[w].timeLeftSeconds = (m_cleanLapTimeSeconds > 0.0)
+                ? m_state.wheel[w].lapsRemaining * m_cleanLapTimeSeconds
                 : -1.0;
         }
         else if (curDegradedPercent > 0.0 && timeIntoLap > kMinSecondsForLiveRate)
@@ -256,8 +267,8 @@ void TyreWearStore::OnTelemetry(const TelemInfoV01& info)
             m_state.wheel[w].timeLeftSeconds = wearRemainingPercent / percentPerSecond;
             // Laps still need a lap TIME to convert into, which only exists
             // once one has been completed.
-            m_state.wheel[w].lapsRemaining = (m_lastLapTimeSeconds > 0.0)
-                ? m_state.wheel[w].timeLeftSeconds / m_lastLapTimeSeconds
+            m_state.wheel[w].lapsRemaining = (m_cleanLapTimeSeconds > 0.0)
+                ? m_state.wheel[w].timeLeftSeconds / m_cleanLapTimeSeconds
                 : -1.0;
         }
         else

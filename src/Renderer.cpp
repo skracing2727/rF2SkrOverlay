@@ -123,6 +123,42 @@ namespace
 
 namespace
 {
+    // Game strings (driver/track names) arrive as UTF-8 or Latin-1, but the
+    // atlas only has ASCII 32..126, so accented letters were dropped. Fold
+    // them to plain ASCII, keeping case (review F150). Static table, no
+    // allocation; MeasureText and AddText share it so width and draw agree.
+    // Index = code point - 0xC0 (U+00C0..U+00FF); "" = drop.
+    const char* const kLatin1Fold[64] = {
+        "A","A","A","A","A","A","AE","C", "E","E","E","E","I","I","I","I",
+        "D","N","O","O","O","O","O","x", "O","U","U","U","U","Y","TH","ss",
+        "a","a","a","a","a","a","ae","c", "e","e","e","e","i","i","i","i",
+        "d","n","o","o","o","o","o","",  "o","u","u","u","u","y","th","y" };
+
+    // Reads one character at p, advances p past it, and returns its ASCII
+    // fold ("" if it has none). Valid UTF-8 is decoded first; any other
+    // high byte is taken as Latin-1. Never reads past the terminator.
+    const char* NextFolded(const char*& p, char (&one)[2])
+    {
+        const unsigned char c = static_cast<unsigned char>(*p);
+        if (c < 0x80) { ++p; one[0] = static_cast<char>(c); one[1] = 0; return one; }
+        int len = (c >= 0xC2 && c <= 0xDF) ? 2 : (c >= 0xE0 && c <= 0xEF) ? 3
+                : (c >= 0xF0 && c <= 0xF4) ? 4 : 0;
+        for (int i = 1; i < len; ++i)
+            if ((static_cast<unsigned char>(p[i]) & 0xC0) != 0x80) { len = 0; break; }
+        if (len == 2)
+        {
+            const unsigned cp = ((c & 0x1Fu) << 6) | (static_cast<unsigned char>(p[1]) & 0x3Fu);
+            p += 2;
+            return cp >= 0xC0 ? kLatin1Fold[cp - 0xC0] : "";
+        }
+        if (len > 2) { p += len; return ""; }   // other scripts: no glyph
+        ++p;                                    // lone byte: Latin-1
+        return c >= 0xC0 ? kLatin1Fold[c - 0xC0] : "";
+    }
+}
+
+namespace
+{
     // float -> IEEE half, round to nearest even, with infinities, NaN and
     // subnormals handled (the well-known branch-light conversion; FP16C
     // instructions would need a CPU check). The GPU widens halves back to
@@ -224,6 +260,9 @@ float4 PSMain(PSIn input) : SV_TARGET
 
 bool Renderer::Init(ID3D11Device* device)
 {
+    // A re-Init without Shutdown (after a caught fault) would otherwise leak
+    // every object below and keep stale static batches (review F155).
+    Shutdown();
     m_device = device;
 
     // Borrowed from the process-wide cache (see CompiledShader) -- not released here.
@@ -333,7 +372,31 @@ void Renderer::Shutdown()
     if (m_ps) { m_ps->Release(); m_ps = nullptr; }
     if (m_vs) { m_vs->Release(); m_vs = nullptr; }
     m_device = nullptr;
-    m_context = nullptr;
+    m_context = nullptr;   // not used below: it may belong to a dead device
+    RestoreGameSlots();    // so this only drops the saved references
+    ++m_generation;        // throttle caches don't outlive a rebuild
+}
+
+void Renderer::BeginTopLayer()
+{
+    // Capped so a runaway caller can't grow it; extra calls merge into the top layer.
+    if (m_layers.size() < 32)
+        m_layers.push_back({ m_vertices.size(), m_textVertices.size() });
+}
+
+void Renderer::RestoreGameSlots()
+{
+    if (m_context)
+    {
+        m_context->PSSetShaderResources(0, 1, &m_savedSRV);
+        m_context->PSSetSamplers(0, 1, &m_savedSampler);
+        m_context->HSSetShader(m_savedHS, nullptr, 0);
+        m_context->DSSetShader(m_savedDS, nullptr, 0);
+    }
+    if (m_savedSRV) { m_savedSRV->Release(); m_savedSRV = nullptr; }
+    if (m_savedSampler) { m_savedSampler->Release(); m_savedSampler = nullptr; }
+    if (m_savedHS) { m_savedHS->Release(); m_savedHS = nullptr; }
+    if (m_savedDS) { m_savedDS->Release(); m_savedDS = nullptr; }
 }
 
 void Renderer::BeginFrame(ID3D11DeviceContext* context, ID3D11RenderTargetView* rtv, int screenWidth, int screenHeight)
@@ -349,6 +412,7 @@ void Renderer::BeginFrame(ID3D11DeviceContext* context, ID3D11RenderTargetView* 
         // their widgets rebuild them (into the same GPU buffers) this frame.
         for (StaticBatch* b : m_batches)
             b->valid = false;
+        ++m_generation;   // throttle caches hold old-size positions too (F374)
     }
     m_screenWidth = width;
     m_screenHeight = height;
@@ -357,7 +421,7 @@ void Renderer::BeginFrame(ID3D11DeviceContext* context, ID3D11RenderTargetView* 
     m_vertices.clear();
     m_textVertices.clear();
     m_inserts.clear();
-    m_topShape = m_topText = static_cast<size_t>(-1);
+    m_layers.clear();
 
     // A font change from the menu: rebuild the glyph atlas before anything
     // is drawn with it. Keeps the old atlas if the new one fails.
@@ -366,6 +430,8 @@ void Renderer::BeginFrame(ID3D11DeviceContext* context, ID3D11RenderTargetView* 
         m_fontReloadPending = false;
         if (!BuildFontAtlas())
             Log::Write("Renderer: font change failed, keeping %s", m_activeFace);
+        else
+            ++m_generation;   // cached text holds the old atlas's UVs (F375)
     }
 
     D3D11_VIEWPORT vp = {};
@@ -385,6 +451,22 @@ void Renderer::BeginFrame(ID3D11DeviceContext* context, ID3D11RenderTargetView* 
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context->VSSetShader(m_vs, nullptr, 0);
     context->PSSetShader(m_ps, nullptr, 0);
+
+    // Review F152: the text pass binds PS t0/s0, so keep the game's to put
+    // back in EndFrame; and a leftover hull/domain/geometry shader would make
+    // our draws vanish, so clear them (Overlay's SaveState restores GS).
+    // References left over from a frame that faulted before EndFrame are dropped.
+    if (m_savedSRV) { m_savedSRV->Release(); m_savedSRV = nullptr; }
+    if (m_savedSampler) { m_savedSampler->Release(); m_savedSampler = nullptr; }
+    if (m_savedHS) { m_savedHS->Release(); m_savedHS = nullptr; }
+    if (m_savedDS) { m_savedDS->Release(); m_savedDS = nullptr; }
+    context->PSGetShaderResources(0, 1, &m_savedSRV);
+    context->PSGetSamplers(0, 1, &m_savedSampler);
+    context->HSGetShader(&m_savedHS, nullptr, nullptr);
+    context->DSGetShader(&m_savedDS, nullptr, nullptr);
+    context->GSSetShader(nullptr, nullptr, 0);
+    context->HSSetShader(nullptr, nullptr, 0);
+    context->DSSetShader(nullptr, nullptr, 0);
 }
 
 void Renderer::EndFrame()
@@ -402,8 +484,24 @@ void Renderer::EndFrame()
         }
         m_droppedVertices = 0;
     }
-    if (m_vertices.empty())
+    if (m_droppedText > 0)
+    {
+        static ULONGLONG s_lastTextLog = 0;
+        const ULONGLONG nowMs = GetTickCount64();
+        if (nowMs - s_lastTextLog > 10000)
+        {
+            s_lastTextLog = nowMs;
+            Log::Write("Renderer: text buffer full (%u used) -- %u text vertices dropped this frame",
+                       static_cast<UINT>(m_textVertices.size()), m_droppedText);
+        }
+        m_droppedText = 0;
+    }
+    // Text or static batches alone still draw (review F333).
+    if (m_vertices.empty() && m_textVertices.empty() && m_inserts.empty())
+    {
+        RestoreGameSlots();
         return;
+    }
 
     UINT count = static_cast<UINT>(m_vertices.size());
     if (count > kMaxVertices)
@@ -515,17 +613,24 @@ void Renderer::EndFrame()
         m_context->PSSetSamplers(0, 1, &m_fontSampler);
         m_context->Draw(to - from, textBase + from);
     };
-    // BeginTopLayer: everything before it (shapes, then text), then
-    // everything after it (shapes, then text).
-    const UINT topShape = m_topShape < count ? static_cast<UINT>(m_topShape) : count;
-    const UINT topText = m_topText < textCount ? static_cast<UINT>(m_topText) : textCount;
-    drawShapes(0, topShape, false);
-    drawText(0, topText);
-    if (m_topShape != static_cast<size_t>(-1))
+    // Layers in order, each one's shapes then its text (BeginTopLayer).
+    UINT shapeFrom = 0, textFrom = 0;
+    for (size_t li = 0; li <= m_layers.size(); ++li)
     {
-        drawShapes(topShape, count, true);
-        drawText(topText, textCount);
+        UINT shapeTo = count, textTo = textCount;
+        if (li < m_layers.size())
+        {
+            shapeTo = m_layers[li].shape < count ? static_cast<UINT>(m_layers[li].shape) : count;
+            textTo = m_layers[li].text < textCount ? static_cast<UINT>(m_layers[li].text) : textCount;
+            if (shapeTo < shapeFrom) shapeTo = shapeFrom;
+            if (textTo < textFrom) textTo = textFrom;
+        }
+        drawShapes(shapeFrom, shapeTo, li > 0);
+        drawText(textFrom, textTo);
+        shapeFrom = shapeTo;
+        textFrom = textTo;
     }
+    RestoreGameSlots();
 }
 
 void Renderer::PushTriangle(const Vertex& a, const Vertex& b, const Vertex& c)
@@ -533,6 +638,7 @@ void Renderer::PushTriangle(const Vertex& a, const Vertex& b, const Vertex& c)
     if (m_vertices.size() + 3 > kMaxVertices)
     {
         m_droppedVertices += 3;
+        m_droppedTotal += 3;
         return;
     }
     m_vertices.push_back(a);
@@ -543,6 +649,10 @@ void Renderer::PushTriangle(const Vertex& a, const Vertex& b, const Vertex& c)
 void Renderer::EndStatic(size_t mark, StaticBatch& b)
 {
     if (mark > m_vertices.size() || !m_device || !m_context) { b.valid = false; return; }
+    // Cut short by an overflow: don't keep a batch with gaps for the rest of
+    // the session. Its vertices stay in this frame's stream; the widget
+    // rebuilds it next frame (review F156).
+    if (m_droppedTotal != m_staticDropMark) { b.valid = false; return; }
     const UINT n = static_cast<UINT>(m_vertices.size() - mark);
     if (!b.buf || n > b.capacity)
     {
@@ -584,14 +694,15 @@ void Renderer::DrawStatic(StaticBatch& b)
 
 Renderer::CaptureMark Renderer::BeginCapture() const
 {
-    return { m_vertices.size(), m_textVertices.size() };
+    return { m_vertices.size(), m_textVertices.size(), m_inserts.size() };
 }
 
 void Renderer::EndCapture(const CaptureMark& mark, Cache& outCache) const
 {
     // Defensive against a mark from a stale/mismatched frame (buffers
     // cleared since) rather than assuming the mark is always still valid.
-    if (mark.shapeCount > m_vertices.size() || mark.textCount > m_textVertices.size())
+    if (mark.shapeCount > m_vertices.size() || mark.textCount > m_textVertices.size()
+        || mark.insertCount > m_inserts.size())
     {
         outCache.valid = false;
         return;
@@ -599,25 +710,32 @@ void Renderer::EndCapture(const CaptureMark& mark, Cache& outCache) const
     outCache.shapeVerts.assign(m_vertices.begin() + mark.shapeCount, m_vertices.end());
     outCache.textVerts.assign(m_textVertices.begin() + mark.textCount, m_textVertices.end());
     outCache.inserts.clear();
-    for (const StaticInsert& ins : m_inserts)
-        if (ins.at >= mark.shapeCount)
-            outCache.inserts.push_back({ ins.at - mark.shapeCount, ins.batch });
+    for (size_t i = mark.insertCount; i < m_inserts.size(); ++i)
+        if (m_inserts[i].at >= mark.shapeCount)
+            outCache.inserts.push_back({ m_inserts[i].at - mark.shapeCount, m_inserts[i].batch });
+    outCache.generation = m_generation;
     outCache.valid = true;
 }
 
 void Renderer::Replay(const Cache& cache)
 {
-    if (!cache.valid)
+    if (!CacheCurrent(cache))
         return;
+    // All or nothing (review F407): inserts left behind by dropped shapes
+    // would draw the batch in the middle of a later widget.
+    if (m_vertices.size() + cache.shapeVerts.size() > kMaxVertices
+        || m_textVertices.size() + cache.textVerts.size() > kMaxTextVertices)
+    {
+        m_droppedVertices += static_cast<UINT>(cache.shapeVerts.size());
+        m_droppedTotal += cache.shapeVerts.size();
+        m_droppedText += static_cast<UINT>(cache.textVerts.size());
+        return;
+    }
     const size_t base = m_vertices.size();
     for (const StaticInsert& ins : cache.inserts)
         m_inserts.push_back({ base + ins.at, ins.batch });
-    if (m_vertices.size() + cache.shapeVerts.size() <= kMaxVertices)
-        m_vertices.insert(m_vertices.end(), cache.shapeVerts.begin(), cache.shapeVerts.end());
-    else
-        m_droppedVertices += static_cast<UINT>(cache.shapeVerts.size());
-    if (m_textVertices.size() + cache.textVerts.size() <= kMaxTextVertices)
-        m_textVertices.insert(m_textVertices.end(), cache.textVerts.begin(), cache.textVerts.end());
+    m_vertices.insert(m_vertices.end(), cache.shapeVerts.begin(), cache.shapeVerts.end());
+    m_textVertices.insert(m_textVertices.end(), cache.textVerts.begin(), cache.textVerts.end());
 }
 
 void Renderer::AddFilledCircle(float cx, float cy, float radius, float r, float g, float b, float a, int segments)
@@ -1191,7 +1309,10 @@ void Renderer::ShutdownText()
 void Renderer::PushGlyphQuad(float x, float y, float w, float h, const Glyph& g, UINT64 rgba)
 {
     if (m_textVertices.size() + 6 > kMaxTextVertices)
+    {
+        m_droppedText += 6;
         return;
+    }
 
     float ndcX0, ndcY0, ndcX1, ndcY1;
     PixelToNDC(x, y, ndcX0, ndcY0);
@@ -1210,6 +1331,54 @@ void Renderer::PushGlyphQuad(float x, float y, float w, float h, const Glyph& g,
     m_textVertices.push_back(v2);
 }
 
+// One glyph turned 90 degrees anticlockwise: its point (lx along the text,
+// ly down the glyph) lands at screen (x + ly, yBottom - lx).
+void Renderer::PushGlyphQuadRotated(float x, float yBottom, float along, float w, float h, const Glyph& g, UINT64 rgba)
+{
+    if (m_textVertices.size() + 6 > kMaxTextVertices)
+    {
+        m_droppedText += 6;
+        return;
+    }
+    float ax, ay, bx, by, cx, cy, dx, dy;
+    PixelToNDC(x,     yBottom - along,       ax, ay);   // glyph top-left
+    PixelToNDC(x,     yBottom - along - w,   bx, by);   // top-right
+    PixelToNDC(x + h, yBottom - along,       cx, cy);   // bottom-left
+    PixelToNDC(x + h, yBottom - along - w,   dx, dy);   // bottom-right
+    TextVertex v0{ ax, ay, g.u0, g.v0, rgba };
+    TextVertex v1{ bx, by, g.u1, g.v0, rgba };
+    TextVertex v2{ cx, cy, g.u0, g.v1, rgba };
+    TextVertex v3{ dx, dy, g.u1, g.v1, rgba };
+    m_textVertices.push_back(v0);
+    m_textVertices.push_back(v1);
+    m_textVertices.push_back(v2);
+    m_textVertices.push_back(v1);
+    m_textVertices.push_back(v3);
+    m_textVertices.push_back(v2);
+}
+
+void Renderer::AddTextRotated(float x, float y, const char* text, float pixelHeight, float r, float g, float b, float a)
+{
+    if (!text || !m_fontSRV) return;
+    const int set = SetFor(pixelHeight);
+    const float scale = pixelHeight / m_setHeight[set];
+    const UINT64 rgba = PackColor(r, g, b, a);
+    float along = 0.0f;
+    char one[2];
+    for (const char* p = text; *p; )
+    for (const char* q = NextFolded(p, one); *q; ++q)
+    {
+        const int idx = static_cast<int>(*q) - kGlyphFirst;
+        if (idx < 0 || idx >= kGlyphCount)
+            continue;
+        const Glyph& gl = m_glyphs[set][idx];
+        const float adv = gl.advancePx * scale;
+        if (*q != ' ')
+            PushGlyphQuadRotated(x, y, along, adv, pixelHeight, gl, rgba);
+        along += adv;
+    }
+}
+
 // The smallest glyph set at least as tall as the text, so it is shrunk by
 // at most ~2.5x and never enlarged (past the large set's 160px).
 int Renderer::SetFor(float pixelHeight) const
@@ -1225,9 +1394,11 @@ float Renderer::MeasureText(const char* text, float pixelHeight) const
     const int set = SetFor(pixelHeight);
     const float scale = pixelHeight / m_setHeight[set];
     float width = 0.0f;
-    for (const char* p = text; *p; ++p)
+    char one[2];
+    for (const char* p = text; *p; )
+    for (const char* q = NextFolded(p, one); *q; ++q)
     {
-        const int idx = static_cast<int>(*p) - kGlyphFirst;
+        const int idx = static_cast<int>(*q) - kGlyphFirst;
         if (idx < 0 || idx >= kGlyphCount) continue;
         width += m_glyphs[set][idx].advancePx * scale;
     }
@@ -1382,13 +1553,21 @@ void Renderer::AddText(float x, float y, const char* text, float pixelHeight, fl
     const UINT64 rgba = PackColor(r, g, b, a);
 
     float cursor = startX;
-    for (const char* p = text; *p; ++p)
+    char one[2];
+    for (const char* p = text; *p; )
+    for (const char* q = NextFolded(p, one); *q; ++q)   // review F150
     {
-        const int idx = static_cast<int>(*p) - kGlyphFirst;
+        const int idx = static_cast<int>(*q) - kGlyphFirst;
         if (idx < 0 || idx >= kGlyphCount)
             continue;
 
         const Glyph& gl = m_glyphs[set][idx];
+        // A space has no ink: advance only, no quad (review F149).
+        if (*q == ' ')
+        {
+            cursor += gl.advancePx * scale;
+            continue;
+        }
         // Quad width from advancePx directly (same formula as the cursor
         // step below and as MeasureText), NOT from the UV rect's aspect
         // ratio: (u1-u0)/(v1-v0) is a ratio of two deltas each normalized by

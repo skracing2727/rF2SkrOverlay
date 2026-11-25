@@ -130,16 +130,38 @@ void MiniSectorStore::FinishLap()
 
 void MiniSectorStore::OnScoring(const ScoringInfoV01& info)
 {
-    if (!m_ready || info.mVehicle == nullptr)
+    if (!m_ready)
         return;
 
-    const VehicleScoringInfoV01* player = nullptr;
-    for (long i = 0; i < info.mNumVehicles; ++i)
+    // A reference invalidation from the hotkey (render thread), carried out
+    // here on the thread that owns the reference (review F111). No snapshot
+    // on this tick: LapDelta may not have applied its own reset yet, so the
+    // next tick re-snapshots from its updated trace.
+    bool skipSnapshot = false;
+    if (m_invalidateRequested.exchange(false))
     {
-        if (info.mVehicle[i].mIsPlayer) { player = &info.mVehicle[i]; break; }
+        m_hasReference = false;
+        m_refSegmentCount = 0;
+        m_lastScoringLaps = -1;
+        m_refGeneration.fetch_add(1);
+        skipSnapshot = true;
     }
+
+    const VehicleScoringInfoV01* player = nullptr;
+    if (info.mVehicle != nullptr)
+    {
+        for (long i = 0; i < info.mNumVehicles; ++i)
+        {
+            if (info.mVehicle[i].mIsPlayer) { player = &info.mVehicle[i]; break; }
+        }
+    }
+    // Ride-along / spectating: telemetry must stop timing against a frozen
+    // distance (review F110).
+    m_playerFound.store(player != nullptr);
     if (!player)
         return;
+    // Pit lane / garage: no segment filling (review F109).
+    m_inPitsOrGarage.store(player->mInPits || player->mInGarageStall);
 
     m_trackLength = info.mLapDist; // session-level: total track length
 
@@ -152,7 +174,7 @@ void MiniSectorStore::OnScoring(const ScoringInfoV01& info)
 
     // Re-snapshot the reference once per lap: a new best lap replaces
     // LapDelta's trace, and this is where that gets picked up.
-    if (m_lastScoringLaps < 0 || player->mTotalLaps != m_lastScoringLaps || !m_hasReference)
+    if (!skipSnapshot && (m_lastScoringLaps < 0 || player->mTotalLaps != m_lastScoringLaps || !m_hasReference))
     {
         m_lastScoringLaps = player->mTotalLaps;
         SnapshotReference();
@@ -193,6 +215,16 @@ void MiniSectorStore::OnTelemetry(const TelemInfoV01& info)
     }
     m_lastTelemET = info.mElapsedTime;
 
+    // No player car (ride-along) or in the pits/garage: nothing to time.
+    // Drop the anchor so timing restarts cleanly, as partial (F110, F109).
+    if (!m_playerFound.load() || m_inPitsOrGarage.load())
+    {
+        m_currentSegment = -1;
+        m_segmentAccumTime = 0.0;
+        m_lapChangePending = false;
+        return;
+    }
+
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     double dt = 0.0;
@@ -219,6 +251,20 @@ void MiniSectorStore::OnTelemetry(const TelemInfoV01& info)
         m_currentSegment = -1;
     }
 
+    // Reference invalidated (hotkey): drop both rows here, on the thread
+    // that owns them (review F111).
+    const unsigned gen = m_refGeneration.load();
+    if (gen != m_telemGeneration)
+    {
+        m_telemGeneration = gen;
+        m_currentRow = Row{};
+        m_currentRow.segmentCount = n;
+        m_previousRow = Row{};
+        m_currentSegment = -1;
+        m_hasLastSegment = false;
+        PublishState();
+    }
+
     // Lap boundary, straight from telemetry (higher rate than scoring, so the
     // strip flips over promptly rather than up to 200ms late).
     if (m_lastLapNumber < 0)
@@ -231,8 +277,19 @@ void MiniSectorStore::OnTelemetry(const TelemInfoV01& info)
     else if (info.mLapNumber != m_lastLapNumber)
     {
         m_lastLapNumber = info.mLapNumber;
-        FinishLap();
-        PublishState();
+        // Telemetry's lap number and scoring's distance do not change on the
+        // same tick (review F108). If the distance wrap already rolled the
+        // row, don't roll it again; if we are still in the last segments,
+        // let the wrap that follows close the last one and roll the row.
+        if (m_wrapFinishedLap)
+            m_wrapFinishedLap = false;
+        else if (m_currentSegment >= n - kBackwardResetSegments)
+            m_lapChangePending = true;
+        else
+        {
+            FinishLap();
+            PublishState();
+        }
     }
 
     int seg = static_cast<int>((dist / m_trackLength) * n);
@@ -241,23 +298,16 @@ void MiniSectorStore::OnTelemetry(const TelemInfoV01& info)
 
     // Braking flag: checked on every sample rather than only at a segment
     // crossing, since a whole braking application typically happens well
-    // inside one segment. Published immediately on the FIRST sample that
-    // flags a segment (not on every braking sample, which would publish at
-    // physics rate) rather than waiting for the next segment-timing publish
-    // below, which sits on the far side of an early return -- the line
-    // should extend the instant you brake, not once you cross into the next
-    // mini-sector.
+    // inside one segment.
     // Both pedals are tested against their own low thresholds rather than
     // one being inferred from the other -- see Row::accelerating.
     const MiniSectorConfig& msCfg = g_miniSectorConfig;
     const bool braking = info.mUnfilteredBrake > msCfg.accelLineBrakeThreshold;
     const bool accelerating = info.mUnfilteredThrottle > msCfg.accelLineThrottleThreshold;
-    if ((braking && !m_currentRow.braking[seg]) || (accelerating && !m_currentRow.accelerating[seg]))
-    {
-        if (braking) m_currentRow.braking[seg] = true;
-        if (accelerating) m_currentRow.accelerating[seg] = true;
-        PublishState();
-    }
+    // Only recorded here; the line draws a segment once it is filled, so
+    // publishing now had no visible effect (review F113).
+    if (braking) m_currentRow.braking[seg] = true;
+    if (accelerating) m_currentRow.accelerating[seg] = true;
 
     if (m_currentSegment < 0)
     {
@@ -266,6 +316,7 @@ void MiniSectorStore::OnTelemetry(const TelemInfoV01& info)
         // boundary.
         m_currentSegment = seg;
         m_segmentAccumTime = 0.0;
+        m_segmentPartial = true; // entered part-way (review F108)
         return;
     }
 
@@ -292,15 +343,64 @@ void MiniSectorStore::OnTelemetry(const TelemInfoV01& info)
         if (backward < kBackwardResetSegments)
             return;
 
+        // Crossing the start/finish line: a FORWARD move from the last
+        // segments into the first ones. Close the last segment(s) and roll
+        // the row here, so the last mini-sector gets filled (review F108).
+        if (m_currentSegment >= n - kBackwardResetSegments && seg < kBackwardResetSegments)
+        {
+            FillCrossed(m_currentSegment, n - m_currentSegment, n, m_segmentAccumTime, dist, tickDt);
+            if (!m_lapChangePending)
+                m_wrapFinishedLap = true; // the lap number has not changed yet
+            m_lapChangePending = false;
+            FinishLap();
+            PublishState();
+            // Segments 0..seg-1 passed within this one tick are not timed.
+            m_currentSegment = seg;
+            m_segmentAccumTime = 0.0;
+            m_segmentPartial = (seg != 0);
+            return;
+        }
+
         // A genuine backward move (spin, reset to pits, teleport) -- the
         // banked time no longer belongs to any segment driven cleanly.
+        if (m_lapChangePending)
+        {
+            m_lapChangePending = false;
+            FinishLap();
+            PublishState();
+        }
         m_currentSegment = seg;
         m_segmentAccumTime = 0.0;
+        m_segmentPartial = true;
         return;
     }
 
-    const double elapsed = m_segmentAccumTime;
-    const int crossed = seg - m_currentSegment;
+    if (m_currentSegment > n / 2)
+        m_wrapFinishedLap = false; // stale: no lap change came after the wrap
+
+    FillCrossed(m_currentSegment, seg - m_currentSegment, n, m_segmentAccumTime, dist, tickDt);
+    m_currentSegment = seg;
+    m_segmentAccumTime = 0.0;
+}
+
+void MiniSectorStore::FillCrossed(int from, int crossed, int n, double elapsed, double dist, double tickDt)
+{
+    // Telemetry thread. Fills segments from..from+crossed-1 with the time
+    // banked since entering 'from'. Clears the partial flag either way.
+    const bool partial = m_segmentPartial;
+    m_segmentPartial = false;
+    if (crossed <= 0)
+        return;
+
+    // A jump much further than the car could have driven (return to
+    // garage, teleport) is not driving: don't fill (review F109).
+    const double segLen = m_trackLength / n;
+    if (crossed * segLen > m_forwardSpeed * elapsed + 100.0 + segLen)
+    {
+        m_segmentPartial = true;
+        return;
+    }
+
     if (elapsed > 0.0 && elapsed < 60.0 && m_hasReference && m_refSegmentCount == n)
     {
         // Normally exactly one segment per crossing; if several were covered
@@ -341,7 +441,7 @@ void MiniSectorStore::OnTelemetry(const TelemInfoV01& info)
                 s_lastAnomalyLog = nowQpc;
                 Log::Write("MiniSector: seg %d->%d crossed=%d elapsed=%.4fs perSeg=%.4fs "
                            "you=%.0fkph | dist=%.1f lastKnownDist=%.1f speed=%.2fm/s tickDt=%.4fs",
-                           m_currentSegment, seg, crossed, elapsed, perSegment, yourKmh,
+                           from, from + crossed, crossed, elapsed, perSegment, yourKmh,
                            dist, m_lastKnownDist, m_forwardSpeed, tickDt);
             }
         }
@@ -351,8 +451,9 @@ void MiniSectorStore::OnTelemetry(const TelemInfoV01& info)
 
         for (int k = 0; k < crossed; ++k)
         {
-            const int idx = m_currentSegment + k;
+            const int idx = from + k;
             if (idx < 0 || idx >= n) continue;
+            if (k == 0 && partial) continue; // entered part-way: not a full segment's time (F108)
             const double refTime = m_refBoundaryTime[idx + 1] - m_refBoundaryTime[idx];
             if (refTime <= 0.0) continue; // malformed reference sample -- skip rather than divide by it
 
@@ -371,9 +472,6 @@ void MiniSectorStore::OnTelemetry(const TelemInfoV01& info)
         }
         PublishState();
     }
-
-    m_currentSegment = seg;
-    m_segmentAccumTime = 0.0;
 }
 
 void MiniSectorStore::InvalidateReference()
@@ -383,14 +481,10 @@ void MiniSectorStore::InvalidateReference()
     // reference exists. m_lastScoringLaps is reset too so OnScoring's
     // once-per-lap guard re-snapshots on the very next tick rather than
     // waiting for the next lap boundary.
-    m_hasReference = false;
-    m_refSegmentCount = 0;
-    m_lastScoringLaps = -1;
-    m_currentRow = Row{};
-    m_previousRow = Row{};
-    m_currentRow.segmentCount = SegmentCount();
-    m_hasLastSegment = false;
-    PublishState();
+    //
+    // Render thread (hotkey): only a request. The scoring thread drops the
+    // reference and the telemetry thread the rows (review F111).
+    m_invalidateRequested.store(true);
 }
 
 void MiniSectorStore::Clear()
@@ -407,6 +501,11 @@ void MiniSectorStore::Clear()
     m_lastScoringLaps = -1;
     m_currentSegment = -1;
     m_segmentAccumTime = 0.0;
+    m_segmentPartial = true;
+    m_lapChangePending = false;
+    m_wrapFinishedLap = false;
+    m_playerFound.store(false);
+    m_inPitsOrGarage.store(false);
     m_lastTelemET = -1.0;
     m_hasLastSegment = false;
     m_lastSegmentIndex = -1;
@@ -636,7 +735,9 @@ bool MiniSector::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     // Always stacked directly above the delta bar's own top edge, by a fixed
     // gap -- no independent Y any more, so the two bars cannot drift apart.
     const float deltaBarCenterY = screenHeight * g_lapDeltaConfig.centerYFraction;
-    const float deltaBarHalfH = g_lapDeltaConfig.barHeightPx * uiScale * 0.5f;
+    // Same width-based height the delta bar itself uses, so the stacking
+    // holds on non-16:9 screens too (review F107).
+    const float deltaBarHalfH = barHeightPx * 0.5f;
     const float stackBottomY = deltaBarCenterY - deltaBarHalfH - gapAbovePx;
 
     // ONE strip: the lap being driven right now. The previous lap's strip was

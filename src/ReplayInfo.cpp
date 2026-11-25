@@ -2,6 +2,7 @@
 #include "Log.h"
 #include <Windows.h>
 #include <cstdio>
+#include <share.h>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -77,8 +78,10 @@ namespace
             return;
         if (g_jsonRead && CompareFileTime(&fa.ftLastWriteTime, &g_jsonWrite) == 0)
             return;                     // unchanged since the last read
-        FILE* f = nullptr;
-        if (fopen_s(&f, path, "rb") != 0 || !f)
+        // Shared open: fopen_s blocked rF2 from saving its own profile while
+        // we read it (review F281).
+        FILE* f = _fsopen(path, "rb", _SH_DENYNO);
+        if (!f)
             return;
         std::string text;
         char buf[16384];
@@ -86,9 +89,12 @@ namespace
         while ((got = fread(buf, 1, sizeof(buf), f)) > 0)
             text.append(buf, got);
         fclose(f);
+        std::string v;
+        // Caught mid-save (key missing): keep the old values, read again next poll.
+        if (!FindValue(text, "Record Replays", v))
+            return;
         g_jsonWrite = fa.ftLastWriteTime;
         g_jsonRead = true;
-        std::string v;
         g_recording = FindValue(text, "Record Replays", v) && Truthy(v);
         g_toMemory = FindValue(text, "Record To Memory", v) && Truthy(v);
         g_fidelity = FindValue(text, "Replay Base Fidelity", v) ? atoi(v.c_str()) : -1;

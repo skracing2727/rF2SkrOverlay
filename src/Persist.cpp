@@ -20,6 +20,7 @@
 //
 // The pass itself lives in Plugin.cpp; this file only decides when it runs.
 #include "Persist.h"
+#include "EcoThread.h"
 #include "Log.h"
 #include <Windows.h>
 #include <atomic>
@@ -27,6 +28,7 @@
 namespace
 {
     void (*s_pass)(bool all) = nullptr;
+    void (*s_loadPass)() = nullptr;
     HANDLE s_thread = nullptr;
     // Created once and never closed: any thread may still call a Request*()
     // during or after Stop(), and signalling a closed (or reused) handle
@@ -34,7 +36,7 @@ namespace
     HANDLE s_wake = nullptr;       // auto-reset: something was requested
     HANDLE s_allDone = nullptr;    // auto-reset: an "all" pass just finished
     std::atomic<DWORD> s_threadId{ 0 };
-    std::atomic<bool> s_wantLearned{ false }, s_wantAll{ false };
+    std::atomic<bool> s_wantLearned{ false }, s_wantAll{ false }, s_wantLoad{ false };
     std::atomic<bool> s_stop{ false };
     std::atomic<bool> s_inAllPass{ false };
     // FlushAllNow tickets: each call takes the next number; s_flushCovered is
@@ -87,7 +89,7 @@ namespace
         ULONGLONG lastPass = 0;
         for (;;)
         {
-            if (!s_wantLearned.load() && !s_wantAll.load() && !Urgent())
+            if (!s_wantLearned.load() && !s_wantAll.load() && !s_wantLoad.load() && !Urgent())
                 WaitForSingleObject(s_wake, INFINITE);
 
             if (!Urgent())
@@ -105,15 +107,25 @@ namespace
             const bool forced = covers > s_flushCovered.load();
             bool all = s_wantAll.exchange(false) || forced;
             const bool learned = s_wantLearned.exchange(false);
+            const bool load = s_wantLoad.exchange(false);
             if (stopping)
                 all = true;   // the last pass there will be: catches what was logged after FlushAllNow
 
             if ((all || learned) && s_pass)
             {
                 s_inAllPass.store(all);
-                s_pass(all);
+                // An exception must not leave the thread (std::terminate
+                // would take the game down); skip this pass instead (review F271).
+                try { s_pass(all); }
+                catch (...) { Log::Write("Persist: the save pass threw an exception -- skipped"); }
                 s_inAllPass.store(false);
                 lastPass = GetTickCount64();
+            }
+            else if (load && s_loadPass)
+            {
+                // Reads only; a full or learned pass above does its loads itself.
+                try { s_loadPass(); }
+                catch (...) { Log::Write("Persist: the load pass threw an exception -- skipped"); }
             }
             if (all)
             {
@@ -134,11 +146,12 @@ namespace
     }
 }
 
-void Persist::Start(void (*pass)(bool all))
+void Persist::Start(void (*pass)(bool all), void (*loadPass)())
 {
     if (s_thread)
         return;
     s_pass = pass;
+    s_loadPass = loadPass;
     if (!s_wake) s_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!s_allDone) s_allDone = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!s_wake || !s_allDone)
@@ -152,6 +165,7 @@ void Persist::Start(void (*pass)(bool all))
     // thread also takes, and a below-normal thread preempted while holding
     // one would make the frame wait for it.
     s_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, &tid);
+    MakeThreadEfficient(s_thread);
     if (s_thread)
         s_threadId.store(tid);
     else
@@ -180,6 +194,12 @@ void Persist::Stop()
 void Persist::RequestLearned()
 {
     if (!s_wantLearned.exchange(true))
+        Wake();
+}
+
+void Persist::RequestLoad()
+{
+    if (!s_wantLoad.exchange(true))
         Wake();
 }
 

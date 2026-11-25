@@ -116,6 +116,15 @@ private:
     double m_ffbSignEvidence = 0.0;
     float m_ffbSign = 1.0f;
     bool m_ffbSignLogged = false;
+    // Brake 'actual' from wheel brake pressure (mFilteredBrake is not lowered
+    // by ABS -- review F66). Largest pressure-sum / pedal ratio seen without
+    // ABS cutting in; 0 until learned. Reset per car in Clear().
+    double m_brakePresScale = 0.0;
+    // Driven axle learned from tyre drive force under throttle (review F68):
+    // -1 = not yet known (use g_pedalConfig.spinAxle), else 0 all, 1 rear, 2 front.
+    double m_driveForceFront = 0.0, m_driveForceRear = 0.0;
+    int m_driveSamples = 0;
+    int m_learnedSpinAxle = -1;
     int m_accCount = 0;
 
     // Diagnostic only: measures the real telemetry callback rate so the

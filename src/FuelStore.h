@@ -4,8 +4,8 @@
 #include <string>
 
 // Fuel time-left: current fuel load divided by a learned per-lap
-// consumption rate, converted into a time estimate via the most recently
-// completed lap's time. Consumption is learned from laps completed THIS
+// consumption rate, converted into a time estimate via the clean-lap pace
+// (median of this session's recent laps without pit-lane time). Consumption is learned from laps completed THIS
 // session (EMA-smoothed so one odd lap doesn't swing it), and persisted per
 // car+track so a fresh session still starts with a sane estimate before the
 // driver has completed a lap in it.
@@ -41,13 +41,35 @@ public:
         // to be counted here, since there is no "laps since pit exit" field.
         int sessionLaps = 0;
         int stintLaps = 0;
-        double stintTimeSeconds = -1.0; // elapsed since the current stint started (pit exit, or session start)
+        // Elapsed since the current stint started: pit exit after a real stop
+        // (not a drive-through), the green flag in a race, or session start.
+        double stintTimeSeconds = -1.0;
         double fuelAtLapStart = 0.0;     // litres at the start of the current telemetry lap
-        double lastLapTimeSeconds = 0.0; // last completed lap, 0 = none yet
+        double fuelCapacity = 0.0;       // tank capacity in litres (TelemInfoV01::mFuelCapacity), 0 = unknown
+        // Lap time to plan with: the clean-lap pace (paceLapSeconds below).
+        // Kept under this name because FuelSave/TyreSave read it; it used to
+        // be the raw last lap, in-laps and the lap with the stop included
+        // (review F1). 0 = none yet.
+        double lastLapTimeSeconds = 0.0;
+        // Clean-lap pace: median of the last 5 laps that counted, had no
+        // pit-lane time and were not a race's start lap; before there are
+        // any, the pace saved last session for this car+track, else the raw
+        // last lap. 0 = none yet.
+        double paceLapSeconds = 0.0;
+        double rawLastLapSeconds = 0.0;  // the last completed lap as driven (any lap), 0 = none
+        double sessionBestLapSeconds = -1.0; // your fastest lap this session (mBestLapTime), -1 = none
+        bool playerFinished = false;     // you have taken the flag (mFinishStatus != 0)
         long telemLapNumber = -1;
         bool inPits = false;
         char profilePath[MAX_PATH] = ""; // per car+track fuel-use profile file (FuelSave)
-        double fuelPerLap = 0.0;        // liters/lap, learned
+        // The same car+track under the old per-class key ("" = same file):
+        // FuelSave/TyreSave read it once when profilePath does not exist yet.
+        char legacyProfilePath[MAX_PATH] = "";
+        // Litres/lap, learned: median of the last 10 laps that counted, had
+        // no pit-lane time (so no in-laps, out-laps or stops), no refuel
+        // and were near this session's pace. Seeded from the saved rate
+        // until the first such lap. 0 = nothing yet.
+        double fuelPerLap = 0.0;
         double timeLeftSeconds = -1.0;  // -1 = not enough data yet
 
         // True only for an actual race session (mSession 10-13) -- practice/
@@ -55,22 +77,25 @@ public:
         // time limit), which is not a race duration and shouldn't be treated
         // as one.
         bool isRaceSession = false;
+        // The player's pit stops so far this session (mNumPitstops).
+        int pitStopsDone = 0;
 
-        // Race remaining, whichever applies to this session -- rF2 signals
-        // a lap-limited race via a real mMaxLaps, and a time-limited one via
-        // a real (finite, still in the future) mEndET. At most one of these
-        // is meaningful at once.
+        // Race remaining, whichever limit ends this session -- rF2 signals
+        // a lap limit via a real mMaxLaps and a time limit via a real mEndET.
+        // With both, whichever the leader reaches first is used. A timed
+        // session stays timed after 0:00 (raceMinutesLeft 0) until the flag.
+        // At most one of the two flags is set.
         bool isLapRace = false;
-        double lapsLeft = -1.0;
+        double lapsLeft = -1.0;          // lap limit minus your completed laps
         bool isTimedRace = false;
         double raceMinutesLeft = -1.0;
+        // Session time left whenever there is a time limit (even in a lap
+        // race with a time limit too), never below 0. -1 = no time limit.
+        double raceSecondsLeft = -1.0;
 
-        // Total laps the race will run, race sessions only -- exact
-        // (mMaxLaps) for a lap race; for a timed race, a live estimate from
-        // the race's total duration divided by the LEADER's own average lap
-        // time (not the player's -- a timed race's actual lap count is
-        // decided by whoever's out front, not by your own pace), updated
-        // continuously as the leader completes more laps. -1 = not
+        // Total laps YOU will run in the race, race sessions only: laps done
+        // + this lap's part + raceLapsRemainingEstimate. Exact (mMaxLaps) in
+        // a lap race when not lapped; otherwise an estimate. -1 = not
         // applicable/not enough data yet.
         double raceTotalLaps = -1.0;
         bool raceTotalLapsIsEstimate = false;
@@ -81,15 +106,15 @@ public:
         // with raceTotalLaps above for a "lap X / Y" progress readout.
         double currentLapFractional = 0.0;
 
-        // Race laps remaining, unified into one number regardless of
-        // whether this is a lap-limited or time-limited session (a timed
-        // race's remaining minutes converted via the last lap time) -- lets
-        // other widgets (e.g. tyre life) compare against "laps left" without
-        // caring which kind of session this is. -1 = not enough data yet.
+        // Laps (with the fraction of the current one) YOU still have to
+        // drive to the flag, whichever kind of session: a lap race counts to
+        // when the leader finishes (lapped cars run fewer); a timed race
+        // counts to your first crossing after the leader takes the flag
+        // after 0:00, at your own pace. 0 once you have finished. -1 = not
+        // enough data yet.
         double raceLapsRemainingEstimate = -1.0;
 
-        // Fuel that would be needed to cover the SESSION's remaining
-        // laps/time at the current learned consumption rate -- compare
+        // Fuel needed to finish: raceLapsRemainingEstimate x fuelPerLap -- compare
         // directly against fuelLoad to see whether a stop is actually
         // needed, rather than just how long what's already in the tank
         // lasts. -1 = not enough data yet (no learned rate, or session type
@@ -106,11 +131,17 @@ public:
 private:
     // Pit / stint tracking. mInPits is edge-detected here rather than in each
     // consumer, so "the stint" means one thing across the whole plugin.
+    // Scoring thread, under m_lock.
     bool m_wasInPits = false;
-    bool m_inStint = true;
     short m_stintStartLaps = -1;
     double m_stintStartFuel = -1.0;
     double m_stintStartET = -1.0; // ScoringInfoV01::mCurrentET at stint start
+    // This pit visit: did the car really stop (review F3)?
+    bool m_pitStopped = false;
+    double m_pitStillSeconds = 0.0;
+    short m_pitStopsAtEntry = 0;
+    double m_pitFuelAtEntry = 0.0;
+    double m_lastScoringET = -1.0;
 
     CRITICAL_SECTION m_lock;
     bool m_ready = false;
@@ -128,29 +159,45 @@ private:
     long m_lastLapNumber = -1;
     double m_fuelAtLapStart = 0.0;
     bool m_haveLapStartFuel = false;
-    double m_lastLapTimeSeconds = 0.0;
+    double m_lastLapTimeSeconds = 0.0; // raw last lap (any lap)
+    // Clean-lap pace history (scoring thread, under m_lock) -- see
+    // State::paceLapSeconds. Saved as the file's lap time.
+    static const int kPaceHistorySize = 5;
+    double m_paceHistory[kPaceHistorySize] = {};
+    int m_paceCount = 0;
+    int m_paceNext = 0;
+    double m_savedPaceSeconds = 0.0;
+    double PaceLocked() const;
+    // Fastest clean lap this session (-1 = none yet). Used for the laps
+    // still to run in a timed race, so the estimate errs a lap high rather
+    // than low (CrewChief review 2026-11-24).
+    double m_bestCleanLapSeconds = -1.0;
+    // Set if any tick of the player's current lap was under full-course
+    // yellow / safety car; such a lap is not clean (CrewChief review
+    // 2026-11-24). Scoring thread, reset at each line crossing.
+    bool m_lapUnderYellow = false;
     double m_prevElapsedTime = 0.0;
     double m_prevLapStartET = 0.0;
 
-    // The race's TOTAL laps/duration -- exact and refreshed every tick for a
-    // lap race (mMaxLaps), or a running maximum of remaining time for a timed
-    // one (see the OnScoring implementation for why a max rather than a
-    // single captured sample). Used for fuelRequiredForRace, as opposed to
-    // lapsLeft/raceMinutesLeft above
-    // which are the REMAINING distance from right now.
-    bool m_haveRaceTotal = false;
-    double m_raceTotalLaps = -1.0;
-    double m_raceTotalSeconds = -1.0;
+    // Race with both a lap and a time limit: which one ends it (with
+    // hysteresis). Scoring thread, under m_lock.
+    bool m_haveEndChoice = false;
+    bool m_timeEndsFirst = false;
 
     // Rolling average of the race LEADER's completed-lap times (not the
-    // player's own), used only to turn a timed race's total duration into an
-    // estimated total lap count -- see State::raceTotalLaps.
+    // player's own), without its pit laps or the start lap, used only to
+    // estimate when it takes the flag in a timed race.
+    bool m_leaderLapTainted = false;
     long m_leaderLastTotalLaps = -1;
     static const int kLeaderLapHistorySize = 5;
     double m_leaderLapHistory[kLeaderLapHistorySize] = {};
     int m_leaderLapHistoryCount = 0;
     int m_leaderLapHistoryNext = 0;
     double m_leaderAvgLapTime = -1.0;
+    // Leader's fastest clean lap and its per-lap full-course-yellow latch
+    // (CrewChief review 2026-11-24), same rules as the player's.
+    double m_leaderBestLapTime = -1.0;
+    bool m_leaderLapUnderYellow = false;
 
     // Moving average of the last kFuelHistorySize completed laps' fuel
     // consumption. Persisted (as the resulting average) per car+track, and
@@ -178,24 +225,27 @@ private:
     };
     SaveSnapshot m_stash;
     SaveSnapshot SnapshotForSaveLocked() const;
-    static void WriteFuelStats(const SaveSnapshot& s);
+    static bool WriteFuelStats(const SaveSnapshot& s); // false = failed, keep it for the next pass
 
     // Fuel-learning validity gate: a completed lap is only folded into the
-    // learned average if it is BOTH a lap that counts for time (rF2's own
-    // mCountLapFlag) AND within this many seconds of the personal best for
-    // the car+track -- an out-lap, a spin, or an off-line cruise lap would
-    // otherwise drag the estimate away from real racing consumption.
+    // learned average if it counts for time (rF2's own mCountLapFlag), had
+    // no pit-lane time, and is within this many seconds of THIS session's
+    // clean-lap pace (not the all-time PB -- review F4) -- an out-lap, a
+    // spin, or an off-line cruise lap would otherwise drag the estimate
+    // away from real racing consumption.
     //
     // Fuel is only ever measurable on the telemetry thread (TelemInfoV01::
     // mFuel has no scoring-side equivalent) while lap validity is only ever
     // known on the scoring thread (VehicleScoringInfoV01::mCountLapFlag has
     // no telemetry-side equivalent) -- see LapDeltaStore's own latch for the
-    // same reasoning. Telemetry fires far more often than scoring, so
-    // whichever side notices the lap boundary first hands its half off in
-    // a single pending slot for the other side to complete; all of it is
+    // same reasoning. Each side posts one item per line crossing, tagged
+    // with the session time of the crossing; the second side to see the
+    // line pairs with the pending item only if the times match within
+    // kPairWindowSeconds, else replaces it (review F5). All of it is
     // guarded by m_lock like everything else shared between the two.
-    static constexpr double kPbToleranceSeconds = 5.0;
-    static constexpr double kPbToleranceFraction = 0.05; // whichever of the two is larger
+    static constexpr double kPaceToleranceSeconds = 5.0;
+    static constexpr double kPaceToleranceFraction = 0.05; // whichever of the two is larger
+    static constexpr double kPairWindowSeconds = 2.0;
 
     // True while the window still only holds the persisted (previous
     // session) value. The first real lap this session REPLACES it outright
@@ -226,9 +276,18 @@ private:
 
     bool m_haveConsumedSample = false;  // a telemetry-side fuel sample is waiting on a verdict
     double m_pendingConsumed = 0.0;
+    double m_pendingConsumedET = 0.0;   // session time of its crossing
 
     bool m_haveScoringVerdict = false;  // a scoring-side verdict is waiting on a sample
     bool m_pendingVerdictUsable = false;
+    double m_pendingVerdictET = 0.0;    // session time of its crossing
+
+    // Outlier rejections in a row on one side (review F385): enough of them
+    // that agree restart the history from them.
+    static const int kRejectRestart = 3;
+    double m_rejected[kRejectRestart] = {};
+    int m_rejectCount = 0;
+    bool m_rejectHigh = false;
 
     // Folds one lap's consumption into the learned history. Caller must
     // already hold m_lock.

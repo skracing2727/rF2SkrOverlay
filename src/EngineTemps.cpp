@@ -4,6 +4,7 @@
 #include "Config.h"
 #include "Layout.h"
 #include "RenderThrottle.h"
+#include "Log.h"
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -38,6 +39,8 @@ void EngineTemps::OnTelemetry(const TelemInfoV01& info)
     s_oil = o;
     s_overheating = info.mOverheating;
     s_valid = w > 1.0f || o > 1.0f;
+    static bool logged = false;
+    if (!logged) { logged = true; Log::Write("EngineTemps: first telemetry water %.1f oil %.1f", w, o); }
 
     const double v = sqrt(info.mLocalVel.x * info.mLocalVel.x + info.mLocalVel.z * info.mLocalVel.z);
     const float dt = static_cast<float>(info.mDeltaTime);
@@ -50,8 +53,13 @@ void EngineTemps::OnTelemetry(const TelemInfoV01& info)
             // Faster at first so the normal settles in the first minutes.
             const float tau = n < kLearnMinSeconds ? (n + 10.0f) : kTau;
             const float k = dt / tau;
-            s_waterNorm = s_waterNorm.load() + (w - s_waterNorm.load()) * k;
-            s_oilNorm = s_oilNorm.load() + (o - s_oilNorm.load()) * k;
+            // Once learned, a reading more than half the amber margin above
+            // normal no longer pulls the normal up, so a slow creep still
+            // reaches amber and amber does not fade by itself (review F138).
+            const bool learned = n >= kLearnMinSeconds;
+            const float wn = s_waterNorm.load(), on = s_oilNorm.load();
+            if (!learned || w < wn + 0.5f * g_engineTempsConfig.waterAmberMargin) s_waterNorm = wn + (w - wn) * k;
+            if (!learned || o < on + 0.5f * g_engineTempsConfig.oilAmberMargin) s_oilNorm = on + (o - on) * k;
         }
         s_learnSeconds = n + dt;
     }
@@ -62,6 +70,9 @@ bool EngineTemps::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     EngineTempsConfig& cfg = g_engineTempsConfig;
     if (!cfg.enabled) return false;
     const bool placeholder = Layout::Preview();
+    static int lastWhy = -1;
+    const int why = s_valid ? 1 : 0;
+    if (why != lastWhy) { lastWhy = why; Log::Write("EngineTemps: drawing %s", why ? "yes" : "no (no temperature data)"); }
     // Drawn even with no data ("--"), so the box can always be found and a
     // car that reports no temperatures shows as such instead of vanishing.
 

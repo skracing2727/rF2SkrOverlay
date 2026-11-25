@@ -95,6 +95,8 @@ namespace Shortcuts
     // alerts. Replaces whatever message is currently showing, same as every
     // other popup here.
     void ShowMessage(const char* text, double holdSeconds);
+    // A message, toast or warning is on screen now (render thread).
+    bool MessageShowing();
 
     // Called when the player starts actually driving, which arms the one-off
     // "press Ctrl+Shift+I for shortcuts" hint. Safe to call every frame --

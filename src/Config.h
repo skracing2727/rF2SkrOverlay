@@ -84,6 +84,9 @@ struct DllCostConfig
     // Diagnostic: every 10 s of driving, log the render-thread frames that
     // cost the DLL the most and which modules were in them (rF2SkrOverlay.log).
     bool logSpikes = false;
+    // Each box shows its rebuild rate and its cost per frame (ms) in its
+    // top-right corner (user, 2026-11-24). Shortcut-list row toggles it.
+    bool showBoxStats = false;
 };
 extern DllCostConfig g_dllCostConfig;
 
@@ -93,6 +96,15 @@ extern DllCostConfig g_dllCostConfig;
 // is briefly advertised when you start driving.
 struct ShortcutConfig
 {
+    // The rotary lists (left knob's on the left; right knob's and the on/off
+    // list on the right): edge anchor x (left list: its left edge; right:
+    // its right edge) and centre y, and one size for all of them. Dragged /
+    // resized in layout mode (user, 2026-11-25).
+    float rotaryLeftXFraction = 0.012f;
+    float rotaryLeftYFraction = 0.45f;
+    float rotaryRightXFraction = 0.988f;
+    float rotaryRightYFraction = 0.45f;
+    float rotaryListScale = 1.0f;
     bool enabled = true;
 
     // All bindings are Ctrl+Shift+<key>, stored as VIRTUAL-KEY CODES and
@@ -331,6 +343,13 @@ struct RadarConfig
     // thing worth showing, and the bar ramps green -> yellow -> red as it
     // closes from here.
     float dangerLateralM = 10.0f;
+
+    // Side bars only: a car closing on (or dropping away from) you faster
+    // than this, in m/s of speed difference, does not START a new side bar --
+    // it is flashing past, not running alongside. One already lit stays.
+    // Default is CrewChief's max_closing_speed_for_spotter (CrewChief review
+    // 2026-11-24). 0 = no limit.
+    float sideBarMaxClosingSpeedMps = 12.0f;
 
     // A brief, very translucent yellow wash pulsing over the whole radar
     // whenever any tracked car is in the red "danger" zone above -- a
@@ -581,9 +600,9 @@ struct FrameLatencyConfig
     // Smoothed frames-per-second, from the real Present-to-Present interval.
     bool showFps = true;
 
-    // Rough total input-to-photon latency estimate (half the average physics
-    // tick period + Display Latency above) -- a LOWER BOUND, since it can't
-    // see the physical controller's own USB/HID polling latency. See
+    // Rough total input-to-photon latency estimate (half the 400 Hz physics
+    // step + render CPU time + half a frame + Display Latency above) -- an
+    // estimate; the wheel's own USB/HID latency is not included. See
     // InputLagEstimate.h for the full method and caveats.
     bool showInputLagEstimate = false;
     // Frame time in ms (1000/FPS), shown next to FPS when ShowFps is on.
@@ -1710,20 +1729,19 @@ struct TrackMapConfig
     // personal best (1), your own session best (2) or the session's fastest
     // lap by anyone in your class (3); 0 = plain. The lap is cut into
     // deltaSectorCount equal mini-sectors (a slider in the options list),
-    // each coloured by the time gained (green) or lost (red) over it, full
-    // colour at deltaFullSeconds -- or purple when it matches or beats the
+    // each coloured by the time gained (green) or lost (red) over it
+    // -- or purple when it matches or beats the
     // session's fastest time through that mini-sector by anyone in your
     // class (from every valid lap). The lap being driven colours as you go; the
     // stretch still ahead shows the last lap, fainter. Wheel buttons step
     // through the modes: deltaPrevButton back, deltaNextButton on, wrapping
     // through off (0 = no button).
     int   deltaColourMode = 0;   // 0 off, 1 PB, 2 SB, 3 session fastest
-    int   deltaPrevButton = 30;
-    int   deltaNextButton = 31;
+    int   deltaPrevButton = 0;   // review F299: unbound by default, like every other public button
+    int   deltaNextButton = 0;
     int   deltaSectorCount = 80;
     static constexpr int kMinDeltaSectors = 10;
     static constexpr int kMaxDeltaSectors = 200;
-    float deltaFullSeconds = 0.05f;
     float gainR = 0.15f, gainG = 0.85f, gainB = 0.25f;
     float purpleR = 0.62f, purpleG = 0.22f, purpleB = 0.95f;
     float lossR = 0.95f, lossG = 0.18f, lossB = 0.12f;
@@ -1808,6 +1826,8 @@ struct FuelSaveConfig
 {
     bool enabled = true;
     float stintMinutes = 0.0f;      // target stint length; 0 = bar off
+    int boxMode = 1;                // FuelBoxMode: 0 = simple (start/now table, no bar), 1 = advanced (bar + full table)
+    int requiredStops = 0;          // RequiredStops: stops the race rules require (0-9); advanced box splits the fuel over them
     float reserveLitres = 0.5f;     // left in the tank at the stint's end
     float barWindowLitres = 0.10f;  // delta that fills half the bar
     float centerXFraction = 0.5f;
@@ -1837,6 +1857,16 @@ struct EngineTempsConfig
     float scale = 1.0f;
 };
 extern EngineTempsConfig g_engineTempsConfig;
+// Benchmark box (FPS-per-lap graph + frame-time histogram) -- see Benchmark.h.
+struct BenchmarkConfig
+{
+    bool enabled = false;              // off by default: a diagnostic, not a driving aid
+    float gpuBusyWarnPercent = 95.0f;  // below this GPU busy %, warn that GPU time includes idle
+    float centerXFraction = 0.50f;
+    float centerYFraction = 0.55f;
+    float scale = 1.0f;
+};
+extern BenchmarkConfig g_benchmarkConfig;
 // FFB strength box -- see FfbLevel.h.
 struct FfbLevelConfig
 {
@@ -1904,6 +1934,9 @@ namespace Config
     // false if any single write failed, so the caller can surface ONE
     // warning for the whole batch rather than one per key.
     bool FlushPendingWrites();
+    // True once (then cleared) if an INI write failed since the last call --
+    // for a one-off "settings not saved" toast out of the car (review F218).
+    bool TakeSaveFailed();
 
     // Reads one float from the live INI, for keys whose NAME is not
     // known until runtime and so cannot be part of the normal Load(). The

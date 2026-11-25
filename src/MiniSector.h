@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <Windows.h>
 
 // Two horizontal strips sitting above the lap-delta bar, each representing one
@@ -165,7 +166,27 @@ private:
 
     State m_state; // guarded by m_lock
 
+    // Cross-thread flags (review F110, F109, F111). Scoring publishes
+    // whether the player car exists and is in the pits/garage; the render
+    // thread only requests an invalidation, scoring carries it out and bumps
+    // the generation, and telemetry clears its rows on a new generation.
+    std::atomic<bool> m_playerFound{ false };
+    std::atomic<bool> m_inPitsOrGarage{ false };
+    std::atomic<bool> m_invalidateRequested{ false };
+    std::atomic<unsigned> m_refGeneration{ 0 };
+    unsigned m_telemGeneration = 0;          // telemetry thread
+    // Telemetry thread (review F108): the segment being driven was entered
+    // part-way (anchor/reset), so its time is not a full segment's.
+    bool m_segmentPartial = true;
+    // Lap number changed while still in the last segments: the distance
+    // wrap that follows closes the last segment and rolls the row.
+    bool m_lapChangePending = false;
+    // The distance wrap already rolled the row; the lap-number change that
+    // follows must not roll it a second time.
+    bool m_wrapFinishedLap = false;
+
     int SegmentCount() const;
+    void FillCrossed(int from, int crossed, int n, double elapsed, double dist, double tickDt);
     void SnapshotReference();
     void PublishState();
     void FinishLap();

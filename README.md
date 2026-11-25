@@ -50,7 +50,8 @@ GPL-3, see [LICENSE.html](LICENSE.html). The built-in DejaVu Sans Mono font is u
 [FONT-LICENSE.html](FONT-LICENSE.html). `InternalsPlugin.hpp` and `PluginObjects.hpp` are Image Space
 Incorporated's rFactor 2 plugin SDK headers and remain under ISI's terms.
 
-Thanks to [TinyPedal](https://github.com/TinyPedal/TinyPedal) for help with the code, and to the SRGP community for
-testing.
+Thanks to [TinyPedal](https://github.com/TinyPedal/TinyPedal) and [CrewChief](https://gitlab.com/mr_belowski/CrewChiefV4),
+both open source (GPL-3 and MIT), whose source code was consulted, and to the SRGP community
+for testing.
 
 By Paul Kiernan, Shamrock Kiernan Racing (SKR).

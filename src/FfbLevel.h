@@ -9,5 +9,8 @@ class Renderer;
 namespace FfbLevel
 {
     void OnForce(double value);   // FFB thread, ~400 Hz
+    // Session end: forget the lap figures. Applied by OnForce on its next
+    // sample, so only the FFB thread writes them (review F143).
+    void Reset();
     bool Draw(Renderer& renderer, int screenWidth, int screenHeight);
 }

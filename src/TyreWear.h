@@ -81,6 +81,7 @@ private:
     double m_wearAtLapStart[4] = {};
     bool m_haveLapStartWear = false;
     double m_lastLapTimeSeconds = 0.0;
+    double m_cleanLapTimeSeconds = 0.0; // last lap with no pit visit (review F23)
     double m_prevElapsedTime = 0.0;
     double m_prevLapStartET = 0.0;
 
@@ -101,6 +102,10 @@ private:
     bool m_lapTouchedPits = false;
     // Written by OnScoring, read by OnTelemetry.
     std::atomic<bool> m_playerInPits{ false };
+public:
+    // Any thread: the player's car is in the pit lane (scoring, ~5 Hz).
+    bool PlayerInPits() const { return m_playerInPits.load(std::memory_order_relaxed); }
+private:
     void RebuildDistribution(int wheel);
     int m_dotStep[4] = { -1, -1, -1, -1 };
     long m_dotLap = -1;

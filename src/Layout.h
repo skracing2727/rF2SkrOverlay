@@ -118,6 +118,10 @@ namespace Layout
     // DXGI_SWAP_CHAIN_DESC::OutputWindow; the backbuffer size is passed
     // separately because it need not match the window's client size.
     void Poll(HWND hwnd, int backbufferWidth, int backbufferHeight);
+    // A panel's own control (a slider, a button) took this mouse press:
+    // Poll must not also start a drag under it. Called before Poll, any
+    // frame of the press; cleared once the button is up (review F124/F132).
+    void ClaimPress();
 
     // True while layout mode is on, for panels that fade themselves out when
     // idle. A panel you cannot see is a panel you cannot grab, so they hold
@@ -156,4 +160,17 @@ namespace Layout
     // the same way a drag is. Used by the keyboard nudge hotkeys. Returns
     // false if the INI write failed, so the caller can warn.
     bool NudgeFraction(float* fraction, const char* section, const char* key, float delta);
+
+    // Read-only view of the remembered panel boxes, for the shortcut list's
+    // screen map. Box centre and half-size in backbuffer pixels; 'seenThisFrame'
+    // false means the panel is not drawing now (its last known box). Returns
+    // false for an index out of range or a box measured at another resolution.
+    // Box-stats labels: panels registered while an owner tag is set are
+    // stamped with it, so the overlay knows which rectangles belong to which
+    // drawn box. -1 = none.
+    void SetOwnerTag(int tag);
+    int OwnerTagOf(int index);
+    int RegisteredCount();
+    bool GetRegistered(int index, const char** name, float* centerX, float* centerY,
+                       float* halfW, float* halfH, bool* seenThisFrame);
 }

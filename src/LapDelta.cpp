@@ -43,15 +43,7 @@ namespace
     // of the struct.
     std::string Sanitize(const char* s, size_t maxLen)
     {
-        std::string out;
-        for (size_t i = 0; i < maxLen && s[i]; ++i)
-        {
-            const char c = s[i];
-            const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
-            out.push_back(ok ? c : '_');
-        }
-        if (out.empty()) out = "unknown";
-        return out;
+        return StoreFile::SafeName(s, maxLen); // shared rule, review F420
     }
 
     // Whether a trace is in non-decreasing lap distance, so InterpolateAt can
@@ -66,6 +58,25 @@ namespace
         return true;
     }
 
+    // A lap trace that was actually driven in one go (review F97): no
+    // distance jump over 150 m between samples, time never going backwards,
+    // no implied speed over 100 m/s, and the last sample close to the lap
+    // time. Catches laps patched together across a garage return/teleport.
+    bool TraceConsistent(const std::vector<std::pair<double, double>>& trace, double lapTime)
+    {
+        if (trace.empty()) return false;
+        for (size_t i = 1; i < trace.size(); ++i)
+        {
+            const double dd = trace[i].first - trace[i - 1].first;
+            const double dt = trace[i].second - trace[i - 1].second;
+            if (dd > 150.0 || dt < 0.0) return false;
+            if (dt > 0.0 && dd / dt > 100.0) return false;
+            if (dt <= 0.0 && dd > 25.0) return false;
+        }
+        const double tail = lapTime - trace.back().second;
+        return tail >= -0.05 && tail <= 1.0;
+    }
+
     void BestLapPath(const std::string& key, char* path, size_t pathSize)
     {
         char dir[MAX_PATH];
@@ -74,7 +85,7 @@ namespace
     }
 
     // Save thread only (see LapDeltaStore::FlushIfDirty).
-    void WriteBestLapFile(const std::string& key, double lapTimeSeconds,
+    bool WriteBestLapFile(const std::string& key, double lapTimeSeconds,
                           const std::vector<std::pair<double, double>>& trace)
     {
         char dir[MAX_PATH];
@@ -89,7 +100,7 @@ namespace
         if (!f)
         {
             Log::Write("LapDelta: failed to save best lap to %s", path);
-            return;
+            return false;
         }
         fprintf(f, "%.6f\n", lapTimeSeconds);
         for (const auto& sample : trace)
@@ -97,9 +108,10 @@ namespace
         if (!StoreFile::Commit(f, tmp, path))
         {
             Log::Write("LapDelta: failed to save best lap to %s", path);
-            return;
+            return false;
         }
         Log::Write("LapDelta: saved new best lap %.3fs to %s", lapTimeSeconds, path);
+        return true;
     }
 }
 
@@ -201,11 +213,20 @@ void LapDeltaStore::Clear()
     // dropped here.
     EnterCriticalSection(&m_lock);
     m_currentTrace.clear();
+    if (!m_currentKey.empty())
+        m_lastKey = m_currentKey; // m_best still belongs to it (review F101)
     m_currentKey.clear();
     m_lastTotalLaps = -1;
     m_lastLapDist = -1.0;
+    m_lapValidityLatch = 2;  // a 0 from the in-lap must not carry over (F101)
+    m_lapTainted = false;
+    m_lastET = -1.0;
     m_session = Reference{}; // session-best forgotten; "best" (persisted) is untouched
-    m_state = State{};
+    {
+        const unsigned epoch = m_state.refEpoch + 1;
+        m_state = State{};
+        m_state.refEpoch = epoch;
+    }
     LeaveCriticalSection(&m_lock);
 }
 
@@ -244,13 +265,58 @@ void LapDeltaStore::FlushIfDirty()
         char path[MAX_PATH];
         BestLapPath(deleteKey, path, sizeof(path));
         const bool removed = DeleteFileA(path) != 0;
-        Log::Write("LapDelta: personal best file %s %s", path, removed ? "deleted" : "-- not present");
+        const DWORD err = removed ? 0 : GetLastError();
+        if (removed || err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+        {
+            Log::Write("LapDelta: personal best file %s %s", path, removed ? "deleted" : "-- not present");
+            // A "cleared" marker in its place, so a car without a PB of its
+            // own is not seeded again from the old per-class file -- the PB
+            // the driver just threw away (per-car keys, 2026-11-24).
+            char tmp[StoreFile::kTmpPathSize];
+            if (FILE* mf = StoreFile::Begin(path, tmp, sizeof(tmp), "w"))
+            {
+                fputs("cleared\n", mf);
+                StoreFile::Commit(mf, tmp, path);
+            }
+        }
+        else
+        {
+            // Locked or read-only: tried again next pass, unless a newer
+            // delete or save has been queued meanwhile (review F278).
+            Log::Write("LapDelta: could not delete personal best file %s (error %lu)", path, err);
+            static int s_deleteFailures = 0;
+            AcquireSRWLockExclusive(&m_saveLock);
+            if (!m_deletePending && !m_bestLapDirty && !doSave && ++s_deleteFailures <= 3)
+            {
+                m_deleteKey = deleteKey;
+                m_deletePending = true;
+            }
+            ReleaseSRWLockExclusive(&m_saveLock);
+        }
     }
+    // A failed write is queued again (review F278), a few tries only, and
+    // only if no newer best has replaced it.
+    static int s_saveFailures = 0;
     if (doSave)
-        WriteBestLapFile(saveKey, lapTime, trace);
+    {
+        if (WriteBestLapFile(saveKey, lapTime, trace))
+            s_saveFailures = 0;
+        else if (++s_saveFailures <= 3)
+        {
+            AcquireSRWLockExclusive(&m_saveLock);
+            if (!m_bestLapDirty)
+            {
+                m_saveKey = saveKey;
+                m_saveTrace.swap(trace);
+                m_saveLapTime = lapTime;
+                m_bestLapDirty = true;
+            }
+            ReleaseSRWLockExclusive(&m_saveLock);
+        }
+    }
 }
 
-void LapDeltaStore::LoadBestLap(const char* vehicleName, const char* trackName)
+void LapDeltaStore::LoadBestLap(const char* vehicleName, const char* trackName, double trackLength)
 {
     // Scoring thread, on a car/track change. m_best is this thread's own, so
     // the file is simply read into it; no lock is involved.
@@ -259,6 +325,19 @@ void LapDeltaStore::LoadBestLap(const char* vehicleName, const char* trackName)
 
     char path[MAX_PATH];
     BestLapPath(m_currentKey, path, sizeof(path));
+
+    // A car with no file yet starts from its old per-class file (read
+    // only; the old file stays). Its next PB is saved under the car key.
+    if (!StoreFile::Exists(path) && !m_legacyKey.empty() && m_legacyKey != m_currentKey)
+    {
+        char legacy[MAX_PATH];
+        BestLapPath(m_legacyKey, legacy, sizeof(legacy));
+        if (StoreFile::Exists(legacy))
+        {
+            strcpy_s(path, legacy);
+            Log::Write("LapDelta: no best lap yet for %s -- seeding from old class file %s", m_currentKey.c_str(), m_legacyKey.c_str());
+        }
+    }
 
     FILE* f = nullptr;
     if (fopen_s(&f, path, "r") != 0 || !f)
@@ -272,7 +351,19 @@ void LapDeltaStore::LoadBestLap(const char* vehicleName, const char* trackName)
 
     char line[128];
     if (fgets(line, sizeof(line), f))
+    {
+        // Left by a PB reset (see FlushIfDirty): no PB, and no seeding.
+        if (strncmp(line, "cleared", 7) == 0)
+        {
+            fclose(f);
+            m_best.trace.clear();
+            m_best.lapTimeSeconds = -1.0;
+            m_best.sorted = true;
+            Log::Write("LapDelta: personal best for %s / %s was cleared -- none yet", vehicleName, trackName);
+            return;
+        }
         lapTime = atof(line);
+    }
 
     while (fgets(line, sizeof(line), f))
     {
@@ -281,6 +372,30 @@ void LapDeltaStore::LoadBestLap(const char* vehicleName, const char* trackName)
             trace.emplace_back(dist, t);
     }
     fclose(f);
+
+    // Sanity-check the file before trusting it (review F102): a bad header
+    // used to give a 0.0 PB that no lap could ever beat.
+    const char* bad = nullptr;
+    if (!(lapTime > 5.0 && lapTime < 100000.0)) bad = "lap time out of range";
+    else if (trace.size() < 20) bad = "too few points";
+    else
+    {
+        for (size_t i = 1; i < trace.size() && !bad; ++i)
+            if (trace[i].first < trace[i - 1].first || trace[i].second < trace[i - 1].second)
+                bad = "distance/time goes backwards";
+        if (!bad && fabs(trace.back().second - lapTime) > 0.5)
+            bad = "end time does not match lap time";
+        if (!bad && trackLength > 1.0 && fabs(trace.back().first - trackLength) > trackLength * 0.01)
+            bad = "end distance does not match track length";
+    }
+    if (bad)
+    {
+        Log::Write("LapDelta: ignoring saved best lap for %s / %s (%s)", vehicleName, trackName, bad);
+        m_best.trace.clear();
+        m_best.lapTimeSeconds = -1.0;
+        m_best.sorted = true;
+        return;
+    }
 
     m_best.sorted = SortedByDistance(trace);
     m_best.trace.swap(trace);
@@ -300,6 +415,7 @@ void LapDeltaStore::ResetSessionBest()
     EnterCriticalSection(&m_lock);
     m_state.session = DeltaState{};
     m_state.haveLineFreeze = false;
+    ++m_state.refEpoch;
     LeaveCriticalSection(&m_lock);
     Log::Write("LapDelta: session best cleared by hotkey");
 }
@@ -318,6 +434,7 @@ void LapDeltaStore::ResetPersonalBest()
     EnterCriticalSection(&m_lock);
     m_state.best = DeltaState{};
     m_state.haveLineFreeze = false;
+    ++m_state.refEpoch;
     LeaveCriticalSection(&m_lock);
 }
 
@@ -329,9 +446,12 @@ void LapDeltaStore::ApplyPersonalBestReset()
     // this reset -- the save recreating the just-deleted file from it.
     m_bestLapDirty = false;
     m_saveTrace.clear();
-    if (!m_currentKey.empty())
+    // After Clear() the key is empty but m_best still holds the last car's
+    // PB, so fall back to that key -- otherwise the file stays (F101).
+    const std::string resetKey = m_currentKey.empty() ? m_lastKey : m_currentKey;
+    if (!resetKey.empty())
     {
-        m_deleteKey = m_currentKey;
+        m_deleteKey = resetKey;
         m_deletePending = true;
     }
     ReleaseSRWLockExclusive(&m_saveLock);
@@ -340,10 +460,13 @@ void LapDeltaStore::ApplyPersonalBestReset()
     m_best = Reference{};
     m_state.best = DeltaState{};
     m_state.haveLineFreeze = false;
+    ++m_state.refEpoch;
     LeaveCriticalSection(&m_lock);
 
-    Log::Write("LapDelta: personal best cleared by hotkey (%s)", m_currentKey.c_str());
-    Persist::RequestLearned();
+    // No Persist::RequestLearned() here: that ran a full learned save pass
+    // mid-lap (review F275). The delete waits for the next normal save pass
+    // (line crossing or leaving the car).
+    Log::Write("LapDelta: personal best cleared by hotkey (%s)", resetKey.c_str());
 }
 
 void LapDeltaStore::DescribePersonalBest(char* out, size_t outSize) const
@@ -382,46 +505,67 @@ void LapDeltaStore::OnScoring(const ScoringInfoV01& info)
         EnterCriticalSection(&m_lock);
         m_session = Reference{};
         m_state.session = DeltaState{};
+        ++m_state.refEpoch;
         LeaveCriticalSection(&m_lock);
     }
 
-    if (info.mVehicle == nullptr)
-        return;
-
     const VehicleScoringInfoV01* player = nullptr;
-    for (long i = 0; i < info.mNumVehicles; ++i)
+    if (info.mVehicle != nullptr)
     {
-        if (info.mVehicle[i].mIsPlayer) { player = &info.mVehicle[i]; break; }
+        for (long i = 0; i < info.mNumVehicles; ++i)
+        {
+            if (info.mVehicle[i].mIsPlayer) { player = &info.mVehicle[i]; break; }
+        }
     }
     if (!player)
+    {
+        // No player car (ride-along after a driver swap, spectating): hide
+        // the rows instead of freezing the last reading on screen (F99).
+        // Traces and references are left alone.
+        EnterCriticalSection(&m_lock);
+        m_state.best.valid = false;
+        m_state.session.valid = false;
+        m_state.haveLineFreeze = false;
+        LeaveCriticalSection(&m_lock);
+        m_lapTainted = true; // the lap in progress was not seen whole
         return;
+    }
 
-    // Keyed on the vehicle CLASS, not the per-entry name: mods set the entry
-    // name per car number or per driver, which used to give every livery of
-    // the same car its own separate best lap. Published here (this is the
-    // only place with the scoring struct in hand) for the telemetry-driven
-    // stores to reuse.
+    // Keyed on the CAR model (review F261; see RealtimeState.h), not the
+    // class or the per-entry name. Published here (this is the only place
+    // with the scoring struct in hand) for the telemetry-driven stores to
+    // reuse. The class key is kept to seed a car's first file.
     VehicleKey::SetFromScoring(player->mVehicleClass, player->mVehicleName);
-    char vehKey[64];
+    char vehKey[64], classKey[64];
     VehicleKey::Get(vehKey, sizeof(vehKey));
-    const std::string key = Sanitize(vehKey, sizeof(vehKey)) + "__" + Sanitize(info.mTrackName, sizeof(info.mTrackName));
+    VehicleKey::GetClass(classKey, sizeof(classKey));
+    const std::string trackKey = Sanitize(info.mTrackName, sizeof(info.mTrackName));
+    const std::string key = Sanitize(vehKey, sizeof(vehKey)) + "__" + trackKey;
     if (key != m_currentKey)
     {
         m_currentKey = key;
-        LoadBestLap(vehKey, info.mTrackName);
+        m_legacyKey = Sanitize(classKey, sizeof(classKey)) + "__" + trackKey;
+        LoadBestLap(vehKey, info.mTrackName, info.mLapDist);
         m_currentTrace.clear();
         m_lastTotalLaps = player->mTotalLaps;
         m_lastLapDist = player->mLapDist;
+        m_lapValidityLatch = 2; // review F101
+        m_lapTainted = true;    // joined mid-lap
+        EnterCriticalSection(&m_lock);
+        ++m_state.refEpoch;
+        LeaveCriticalSection(&m_lock);
     }
 
     const double timeIntoLap = info.mCurrentET - player->mLapStartET;
 
-    // Latch the minimum mCountLapFlag seen during the lap: the flag is a
-    // transient property of the lap IN PROGRESS that resets before being read
-    // at lap completion. Latching the minimum catches the valid moment, even
-    // if it later resets.
-    if (player->mCountLapFlag < m_lapValidityLatch)
-        m_lapValidityLatch = player->mCountLapFlag;
+    // Session clock went backwards (restart, rewind): the trace so far is
+    // from another timeline (review F97).
+    if (m_lastET >= 0.0 && info.mCurrentET < m_lastET - 0.5)
+    {
+        m_currentTrace.clear();
+        m_lapTainted = true;
+    }
+    m_lastET = info.mCurrentET;
 
     // Lap just completed -- check both references before starting a fresh
     // trace for the lap now underway.
@@ -430,12 +574,20 @@ void LapDeltaStore::OnScoring(const ScoringInfoV01& info)
         // Snapshot the delta as it stood at the line, BEFORE anything below
         // recomputes it against the new lap. m_state still holds the previous
         // tick's values, which is exactly the reading wanted.
+        // The held number is the lap's real result (last lap minus the
+        // reference lap time, as the timing screen shows it), not the last
+        // sample before the line (review F100). The references are still the
+        // pre-update ones here. No reference = no hold.
         if (g_lapDeltaConfig.freezeAfterLineSeconds > 0.0f)
         {
+            const double ll = player->mLastLapTime;
+            const bool llOk = ll > 5.0 && ll < 100000.0;
+            const bool bestOk = llOk && m_best.lapTimeSeconds > 0.0 && !m_resetPbRequested.load();
+            const bool sessOk = llOk && m_session.lapTimeSeconds > 0.0;
             EnterCriticalSection(&m_lock);
-            m_state.haveLineFreeze = m_state.best.valid || m_state.session.valid;
-            m_state.bestAtLine = m_state.best.deltaSeconds;
-            m_state.sessionAtLine = m_state.session.deltaSeconds;
+            m_state.haveLineFreeze = (bestOk && m_state.best.valid) || (sessOk && m_state.session.valid);
+            m_state.bestAtLine = bestOk ? ll - m_best.lapTimeSeconds : m_state.best.deltaSeconds;
+            m_state.sessionAtLine = sessOk ? ll - m_session.lapTimeSeconds : m_state.session.deltaSeconds;
             QueryPerformanceCounter(&m_state.lineCrossedAt);
             LeaveCriticalSection(&m_lock);
         }
@@ -468,6 +620,16 @@ void LapDeltaStore::OnScoring(const ScoringInfoV01& info)
         // >= 2 and look at spansLap/plausible instead -- those two already
         // catch most of what made a flag-1 lap actually unusable.
         const bool countsForTime = m_lapValidityLatch >= 1;
+        // The SAVED personal best (the file that outlives the session) is
+        // stricter: only flag 2, as CrewChief does (CrewChief review
+        // 2026-11-24). Flag 1 is usually a track-limits cut; letting it into
+        // the session reference keeps the online flag-1 case above working,
+        // but a cut lap written to disk would be the target in every later
+        // session at this track.
+        const bool countsForSavedPb = m_lapValidityLatch >= 2;
+        // Not driven by the player in realtime the whole way, a pit / garage /
+        // clock-jump moment during it, or a gap in the trace (F252, F97).
+        const bool clean = !m_lapTainted && TraceConsistent(m_currentTrace, lastLap);
 
         // The trace must actually SPAN the lap, not merely contain points --
         // same requirement RelativeTiming.cpp's own reference trace enforces
@@ -495,11 +657,12 @@ void LapDeltaStore::OnScoring(const ScoringInfoV01& info)
         // and the delta from lap 2, where practice needs one lap more.
         // Logged so that if it ever behaves otherwise, the flag responsible
         // is visible rather than guessed at.
-        Log::Write("LapDelta: lap %d complete, %.3fs, countLapFlag=%d -> %s",
+        Log::Write("LapDelta: lap %d complete, %.3fs, countLapFlag=%d%s -> %s",
                    static_cast<int>(player->mTotalLaps), lastLap, static_cast<int>(m_lapValidityLatch),
-                   (plausible && countsForTime && spansLap) ? "recorded as reference" : "not counted");
+                   clean ? "" : " (tainted: AI/pit/garage/gap)",
+                   (plausible && countsForTime && spansLap && clean) ? "recorded as reference" : "not counted");
 
-        if (plausible && countsForTime && spansLap)
+        if (plausible && countsForTime && spansLap && clean)
         {
             // Close the trace off AT the finish line, with the lap's real
             // time. Samples only arrive at ~5Hz, so the last real one sits up
@@ -528,7 +691,11 @@ void LapDeltaStore::OnScoring(const ScoringInfoV01& info)
                 m_currentTrace.insert(m_currentTrace.begin(), std::make_pair(0.0, 0.0));
 
             const bool traceSorted = SortedByDistance(m_currentTrace);
-            if (m_best.lapTimeSeconds < 0.0 || lastLap < m_best.lapTimeSeconds)
+            // The saved PB only from a lap you drove all the way (review
+            // F167/F252); the session best still takes it.
+            if (countsForSavedPb
+                && g_localPlayerLapClean.load(std::memory_order_relaxed)
+                && (m_best.lapTimeSeconds < 0.0 || lastLap < m_best.lapTimeSeconds))
             {
                 m_best.trace = m_currentTrace;
                 m_best.lapTimeSeconds = lastLap;
@@ -555,11 +722,26 @@ void LapDeltaStore::OnScoring(const ScoringInfoV01& info)
         }
         m_currentTrace.clear();
         m_lapValidityLatch = 2; // reset for next lap
+        m_lapTainted = false;
+        EnterCriticalSection(&m_lock);
+        ++m_state.refEpoch;
+        LeaveCriticalSection(&m_lock);
     }
     m_lastTotalLaps = player->mTotalLaps;
 
+    // Folded in AFTER the lap-completion check: the line tick's flag and
+    // state belong to the lap just starting, not the one just judged (F101).
+    if (player->mCountLapFlag < m_lapValidityLatch)
+        m_lapValidityLatch = player->mCountLapFlag;
+    if (player->mControl != 0 || !info.mInRealtime || player->mInPits || player->mInGarageStall)
+        m_lapTainted = true;
+
+    // A trace only starts near the line, so a lap picked up mid-track (or
+    // after a distance glitch) is never recorded (review F100/F97).
+    const double startLimit = (std::min)(200.0, info.mLapDist > 1.0 ? info.mLapDist * 0.1 : 200.0);
     if (timeIntoLap >= 0.0 && timeIntoLap < 100000.0
-        && (m_currentTrace.empty() || player->mLapDist > m_lastLapDist + 0.5))
+        && ((m_currentTrace.empty() && player->mLapDist >= 0.0 && player->mLapDist <= startLimit)
+            || (!m_currentTrace.empty() && player->mLapDist > m_lastLapDist + 0.5)))
     {
         m_currentTrace.emplace_back(player->mLapDist, timeIntoLap);
     }
@@ -741,7 +923,7 @@ namespace
     // growing, you are losing more"; on the left, a growing bar means the
     // delta is going more negative, i.e. gaining more, and correctly reads
     // green. One rule covers both sides.
-    void BarTrendColor(double displayedDelta, const LapDeltaConfig& cfg,
+    void BarTrendColor(double displayedDelta, unsigned epoch, bool frozen, const LapDeltaConfig& cfg,
                        float& r, float& g, float& b)
     {
         // Render-thread only, and there is exactly one bar, so plain statics
@@ -752,6 +934,19 @@ namespace
         static int s_count = 0;
         static int s_next = 0;
         static bool s_lastWasLosing = false;  // held through the deadband
+
+        // The value jumped for a non-driving reason (lap done, reference
+        // changed, line hold started/ended): drop the history so the jump
+        // is not read as time lost or gained (review F104).
+        static unsigned s_epoch = 0;
+        static bool s_frozen = false;
+        if (epoch != s_epoch || frozen != s_frozen)
+        {
+            s_epoch = epoch;
+            s_frozen = frozen;
+            s_count = 0;
+            s_next = 0;
+        }
 
         LARGE_INTEGER freq, now;
         QueryPerformanceFrequency(&freq);
@@ -947,14 +1142,6 @@ bool LapDelta::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     const float rowGapPx = cfg.rowGapPx * uiScale;
     const float bgPaddingPx = cfg.bgPaddingPx * uiScale;
     const float bgCornerRadiusPx = cfg.bgCornerRadiusPx * uiScale;
-    // The DRS box sits apart from the delta bar and is sized apart from it
-    // too -- uiScale already carries LapDeltaConfig::scale, so its own
-    // multiplier is folded in on top for just this widget.
-    const float drsScale = uiScale * cfg.drsScale;
-    const float drsIndicatorTextHeightPx = cfg.drsIndicatorTextHeightPx * drsScale;
-    const float drsIndicatorPaddingPx = cfg.drsIndicatorPaddingPx * drsScale;
-    const float drsIndicatorGapPx = cfg.drsIndicatorGapPx * drsScale;
-    const float drsIndicatorBgCornerRadiusPx = cfg.drsIndicatorBgCornerRadiusPx * drsScale;
 
     // Always dead centre horizontally -- the delta bar
     // (and the delta-speed strip, which takes its X straight from this one)
@@ -1016,7 +1203,7 @@ bool LapDelta::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         const double displayDelta = freezeActive ? state.sessionAtLine : extrapolate(state.session);
 
         float barR, barG, barB;
-        BarTrendColor(displayDelta, cfg, barR, barG, barB);
+        BarTrendColor(displayDelta, state.refEpoch, freezeActive, cfg, barR, barG, barB);
 
         char buf[24];
         sprintf_s(buf, "SB %+.3f", displayDelta);
@@ -1080,15 +1267,22 @@ bool LapDelta::Draw(Renderer& renderer, int screenWidth, int screenHeight)
 
     // Best row: no bar at all -- just a plain number below the session row,
     // coloured green when ahead of the all-time best, red when behind.
-    if (showBestRow && state.best.valid)
+    // In layout mode a placeholder is drawn with no PB yet, so the row can
+    // be placed before it first appears (review F105).
+    if (showBestRow && (state.best.valid || Layout::Preview()))
     {
-        const double displayDelta = freezeActive ? state.bestAtLine : extrapolate(state.best);
+        const double displayDelta = !state.best.valid ? 0.0
+                                  : (freezeActive ? state.bestAtLine : extrapolate(state.best));
 
-        float numR, numG, numB;
-        FadedDeltaColor(displayDelta, cfg, numR, numG, numB);
-
+        float numR = 0.7f, numG = 0.7f, numB = 0.7f;
         char buf[24];
-        sprintf_s(buf, "PB %+.3f", displayDelta);
+        if (state.best.valid)
+        {
+            FadedDeltaColor(displayDelta, cfg, numR, numG, numB);
+            sprintf_s(buf, "PB %+.3f", displayDelta);
+        }
+        else
+            strcpy_s(buf, "PB --.---");
 
         // Same text size as the SB number on the bar above -- both just use
         // uiScale (which already carries LapDeltaConfig::scale), with no
@@ -1174,54 +1368,76 @@ bool LapDelta::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         drewAny = true;
     }
 
-    if (cfg.drsIndicatorEnabled && Shortcuts::Visible(Shortcuts::Drs))
-    {
-        const DrsCueStore::State drs = g_drsCue.Read();
-        // Normally gated on real DRS availability -- but that means the box
-        // never registers at all on a car/track with no DRS, so it could
-        // never be dragged or resized in layout mode either. Force it
-        // visible (with its default "OPEN DRS" text) while arranging the
-        // HUD, same as every other conditionally-shown panel.
-        if (drs.showIndicator || Layout::Preview())
-        {
-            const char* text = drs.drsOpen ? "DRS ENGAGED" : "OPEN DRS";
-            const float textW = renderer.MeasureText(text, drsIndicatorTextHeightPx);
-            const float halfW = textW * 0.5f + drsIndicatorPaddingPx;
-            const float halfH = drsIndicatorTextHeightPx * 0.5f + drsIndicatorPaddingPx;
-            // Same sentinel treatment as the PB row: resolved once from the
-            // position it used to inherit (just under whatever drew above
-            // it), then free-standing.
-            if (cfg.drsCenterYFraction < 0.0f || cfg.drsCenterXFraction < 0.0f)
-            {
-                g_lapDeltaConfig.drsCenterXFraction = centerX / screenWidth;
-                g_lapDeltaConfig.drsCenterYFraction = (rowY + drsIndicatorGapPx + halfH) / screenHeight;
-            }
-            const float boxCenterX = screenWidth * cfg.drsCenterXFraction;
-            const float boxCenterY = screenHeight * cfg.drsCenterYFraction;
-
-            Layout::Register("DRS", "LapDelta", "DrsCenterXFraction", "DrsCenterYFraction",
-                             &g_lapDeltaConfig.drsCenterXFraction, &g_lapDeltaConfig.drsCenterYFraction,
-                             boxCenterX, boxCenterY, halfW, halfH,
-                             &g_lapDeltaConfig.drsScale, "DrsScale");
-
-            // Flash while it's legal to open but not yet engaged, to draw
-            // the eye and prompt actually pressing the button -- once
-            // engaged it holds solid, since it's confirming state rather
-            // than asking for action.
-            float fade = 1.0f;
-            if (!drs.drsOpen)
-            {
-                const float phase = TickBlink(cfg.drsIndicatorFlashPeriodSeconds);
-                fade = (phase < 0.5f) ? 1.0f : 0.15f;
-            }
-
-            renderer.AddFilledRoundedRect(boxCenterX, boxCenterY, halfW, halfH, drsIndicatorBgCornerRadiusPx, 0.0f,
-                                          cfg.drsIndicatorBgR, cfg.drsIndicatorBgG, cfg.drsIndicatorBgB, cfg.drsIndicatorBgA * fade);
-            renderer.AddText(boxCenterX, boxCenterY - drsIndicatorTextHeightPx * 0.5f, text, drsIndicatorTextHeightPx,
-                             cfg.drsIndicatorTextR, cfg.drsIndicatorTextG, cfg.drsIndicatorTextB, fade, Renderer::HAlign::Center);
-            drewAny = true;
-        }
-    }
+    // The DRS sign is its own panel now: LapDelta::DrawDrs (review F51).
 
     return drewAny;
+}
+
+// The DRS sign as its own panel (review F51): drawn whenever DRS is relevant,
+// whether or not the delta bars are on, enabled or hidden. Own position and
+// own scale (DrsScale, no longer multiplied by the delta bar's Scale).
+bool LapDelta::DrawDrs(Renderer& renderer, int screenWidth, int screenHeight)
+{
+    const LapDeltaConfig& cfg = g_lapDeltaConfig;
+    if (!cfg.drsIndicatorEnabled)
+        return false;
+    const DrsCueStore::State drs = g_drsCue.Read();
+    // Normally gated on real DRS availability -- but then the box would
+    // never register on a car/track with no DRS, so it could never be
+    // dragged or resized in layout mode. Forced visible (with its default
+    // "OPEN DRS" text) while arranging the HUD.
+    if (!drs.showIndicator && !Layout::Preview())
+        return false;
+    // 10 Hz rebuild, replayed in between (2026-11-24 throttle pass).
+    static RenderThrottle s_drsThrottle(0.1);
+    if (!Layout::Active() && s_drsThrottle.TryReplay(renderer))
+        return true;
+    RenderThrottle::Capture throttleCapture(s_drsThrottle, renderer);
+
+    struct TextBgGuard
+    {
+        Renderer& r; bool prev;
+        explicit TextBgGuard(Renderer& rr) : r(rr), prev(rr.TextBackgroundEnabled()) { r.SetTextBackground(false); }
+        ~TextBgGuard() { r.SetTextBackground(prev); }
+    } textBgGuard(renderer);
+
+    const float drsScale = static_cast<float>(screenHeight) / 2160.0f * cfg.drsScale;
+    const float textPx = cfg.drsIndicatorTextHeightPx * drsScale;
+    const float paddingPx = cfg.drsIndicatorPaddingPx * drsScale;
+    const float cornerPx = cfg.drsIndicatorBgCornerRadiusPx * drsScale;
+
+    const char* text = drs.drsOpen ? "DRS ENGAGED" : "OPEN DRS";
+    const float textW = renderer.MeasureText(text, textPx);
+    const float halfW = textW * 0.5f + paddingPx;
+    const float halfH = textPx * 0.5f + paddingPx;
+    // Never placed yet: just under where the delta bar sits, centred.
+    if (cfg.drsCenterYFraction < 0.0f || cfg.drsCenterXFraction < 0.0f)
+    {
+        const float barHalfH = screenWidth * cfg.barWidthFraction * cfg.scale * BarAspectRatio() * 0.5f;
+        g_lapDeltaConfig.drsCenterXFraction = 0.5f;
+        g_lapDeltaConfig.drsCenterYFraction = (screenHeight * cfg.centerYFraction + barHalfH
+                                               + cfg.drsIndicatorGapPx * drsScale + halfH) / screenHeight;
+    }
+    const float boxCenterX = screenWidth * cfg.drsCenterXFraction;
+    const float boxCenterY = screenHeight * cfg.drsCenterYFraction;
+
+    Layout::Register("DRS", "LapDelta", "DrsCenterXFraction", "DrsCenterYFraction",
+                     &g_lapDeltaConfig.drsCenterXFraction, &g_lapDeltaConfig.drsCenterYFraction,
+                     boxCenterX, boxCenterY, halfW, halfH,
+                     &g_lapDeltaConfig.drsScale, "DrsScale");
+
+    // Flash while it's legal to open but not yet engaged, to prompt pressing
+    // the button; solid once engaged, since it is confirming state.
+    float fade = 1.0f;
+    if (!drs.drsOpen)
+    {
+        const float phase = TickBlink(cfg.drsIndicatorFlashPeriodSeconds);
+        fade = (phase < 0.5f) ? 1.0f : 0.15f;
+    }
+
+    renderer.AddFilledRoundedRect(boxCenterX, boxCenterY, halfW, halfH, cornerPx, 0.0f,
+                                  cfg.drsIndicatorBgR, cfg.drsIndicatorBgG, cfg.drsIndicatorBgB, cfg.drsIndicatorBgA * fade);
+    renderer.AddText(boxCenterX, boxCenterY - textPx * 0.5f, text, textPx,
+                     cfg.drsIndicatorTextR, cfg.drsIndicatorTextG, cfg.drsIndicatorTextB, fade, Renderer::HAlign::Center);
+    return true;
 }

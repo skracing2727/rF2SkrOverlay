@@ -45,6 +45,17 @@ public:
         // Yellow flag per sector, S1..S3, and full course.
         bool sectorYellow[3] = {};
         bool fullCourseYellow = false;
+        // Full-course yellow stage, ScoringInfoV01::mYellowFlagState while
+        // fullCourseYellow: 1 FCY called, SC not out yet (pending), 2 pits
+        // closed in the SDK's naming but treated by CrewChief as pits open
+        // under standard rules, 3 pits open for the lead lap, 4 pits open,
+        // 5 last lap, 7 race halt. 6 (resume) never shows here: it ends the
+        // full-course yellow (CrewChief review 2026-11-24).
+        int yellowStage = 0;
+        // The player is being shown the blue flag (mFlag == 6).
+        bool blueFlag = false;
+        // Outstanding penalties (mNumPenalties). rF2 does not say which kind.
+        int penalties = 0;
         // A pit stop is requested and the car is not in the pit lane yet.
         bool pitRequested = false;
     };
@@ -67,7 +78,11 @@ private:
         double fastSince = -1.0;   // sim time it got back up to speed while flagged
         bool flagged = false;      // has been slow for the dwell
         bool announced = false;    // logged for this episode
+        double lastSeen = -1.0;    // sim time this id was last in scoring
     };
+    // Looked up by the real mID, not mID % kSlots: two ids 256 apart used to
+    // share a slot and reset each other every tick (review F370).
+    CarTrack* TrackFor(long id, double et);
     static const int kSlots = 256;
     CarTrack m_cars[kSlots];
     int m_lastGamePhase = -1;

@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -13,10 +14,16 @@ namespace
     // Scoring thread only -- no lock needed.
     struct Car
     {
+        long id = -1;             // slot ID
         char name[64] = {};       // vehicle (entry) name, as in VehicleScoringInfoV01::mVehicleName
-        int exitLaps = -1;        // completed laps when it last left the pits; -1 = unknown
+        int exitLaps = -1;        // completed laps when it last left the pits after a stop; -1 = unknown
         bool inPits = false;
         bool seen = false;
+        // The current pit visit (review F6): only a real stop resets the count.
+        double visitStartET = 0.0;
+        double stillSeconds = 0.0;
+        short stopsAtEntry = 0;
+        bool stopped = false;
     };
     std::vector<Car> s_cars;                 // every car seen this session, by name
     char s_sessionKey[160] = {};             // track|session|length
@@ -32,13 +39,17 @@ namespace
     SRWLOCK s_lock = SRWLOCK_INIT;
     std::vector<std::pair<long, int>> s_lapsById;
 
-    // mVehicleName is 64 chars and need not be terminated.
-    Car& FindCar(const char* name)
+    // Keyed by slot ID + name (review F6): the name alone let two cars with
+    // the same default livery share a record; the ID alone can be re-used
+    // by someone else after a driver leaves. mVehicleName is 64 chars and
+    // need not be terminated.
+    Car& FindCar(long id, const char* name)
     {
         for (Car& c : s_cars)
-            if (strncmp(c.name, name, sizeof(c.name)) == 0)
+            if (c.id == id && strncmp(c.name, name, sizeof(c.name)) == 0)
                 return c;
         s_cars.emplace_back();
+        s_cars.back().id = id;
         memcpy(s_cars.back().name, name, sizeof(s_cars.back().name));
         return s_cars.back();
     }
@@ -55,23 +66,51 @@ void PitStint::OnScoring(const ScoringInfoV01& info)
     {
         strcpy_s(s_sessionKey, key);
         s_cars.clear();
+        s_lastET = -1.0;
     }
+    const double dt = (s_lastET >= 0.0) ? (std::min)((std::max)(info.mCurrentET - s_lastET, 0.0), 1.0) : 0.0;
     s_lastET = info.mCurrentET;
 
     s_build.clear();
     for (long i = 0; info.mVehicle && i < info.mNumVehicles; ++i)
     {
         const VehicleScoringInfoV01& v = info.mVehicle[i];
-        Car& c = FindCar(v.mVehicleName);
-        const bool inPits = v.mInPits != 0;
+        Car& c = FindCar(v.mID, v.mVehicleName);
+        // The garage stall counts as the pit lane (CrewChief review
+        // 2026-11-24; its RF2GameStateMapper does the same).
+        const bool inPits = v.mInPits || v.mInGarageStall;
         if (!c.seen)
         {
             c.seen = true;
-            c.inPits = inPits;
+            c.inPits = false;   // so a car first seen in the pits opens a visit below
             if (c.exitLaps < 0 && v.mNumPitstops == 0) c.exitLaps = 0;   // no stop yet: count from the start
         }
-        if (c.inPits && !inPits)
-            c.exitLaps = v.mTotalLaps;
+        if (inPits && !c.inPits)
+        {
+            c.visitStartET = info.mCurrentET;
+            c.stillSeconds = 0.0;
+            c.stopsAtEntry = v.mNumPitstops;
+            c.stopped = false;
+        }
+        if (inPits)
+        {
+            // A real stop: stationary for over a second, rF2's "stopped"
+            // pit state, or the stop counter going up (as TinyPedal judges).
+            const double speed = sqrt(v.mLocalVel.x * v.mLocalVel.x + v.mLocalVel.y * v.mLocalVel.y
+                                      + v.mLocalVel.z * v.mLocalVel.z);
+            if (speed < 0.5)
+                c.stillSeconds += dt;
+            if (c.stillSeconds > 1.0 || v.mPitState == 3 || v.mNumPitstops > c.stopsAtEntry)
+                c.stopped = true;
+        }
+        else if (c.inPits)
+        {
+            // Left the lane: a pass under 2 s is mInPits flicker, and a
+            // drive-through has no stop -- neither resets the count.
+            const bool longEnough = info.mCurrentET - c.visitStartET > 2.0;
+            if (longEnough && (c.stopped || v.mNumPitstops > c.stopsAtEntry))
+                c.exitLaps = v.mTotalLaps;
+        }
         c.inPits = inPits;
         int laps = -1;
         if (c.exitLaps >= 0)

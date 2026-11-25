@@ -16,10 +16,22 @@
 // would be visible.
 //
 // One instance per widget, held as a function-local static in its Draw().
+//
+// Staggered (2026-11-24): each instance starts its schedule at a different
+// fraction of its interval (golden-ratio steps), so throttles on the same
+// rate do not all rebuild on the same frame.
+//
+// ReplayCount(): replays so far, all throttles together -- the box-stats
+// labels compare it around a panel's draw to tell a rebuild from a replay.
+inline unsigned& RenderThrottleReplayCount() { static unsigned s_count = 0; return s_count; }
+
 class RenderThrottle
 {
 public:
     explicit RenderThrottle(double intervalSeconds) : m_intervalSeconds(intervalSeconds) {}
+    // The next TryReplay rebuilds regardless of the schedule (e.g. after a
+    // click that changes what the box shows).
+    void ForceNext() { m_force = true; }
 
     // Call first, before anything else in Draw(). Returns true if this frame
     // is not due for a real update -- the last captured geometry has already
@@ -31,9 +43,18 @@ public:
     // TextBgGuard pattern for multi-return functions).
     bool TryReplay(Renderer& renderer)
     {
+        // A cache from before a resize or font change is stale: redraw now
+        // instead of replaying it (review F374/F375).
+        if (!renderer.CacheCurrent(m_cache))
+        {
+            IsDue();   // keep the schedule ticking
+            return false;
+        }
+        if (m_force) { m_force = false; IsDue(); return false; }
         if (IsDue())
             return false;
         renderer.Replay(m_cache);
+        ++RenderThrottleReplayCount();
         return true;
     }
 
@@ -61,18 +82,32 @@ private:
 
         if (s_freq.QuadPart == 0 || m_lastUpdate.QuadPart == 0)
         {
-            m_lastUpdate = now;
+            // First call: due now, but the next deadline is moved by this
+            // instance's own fraction of the interval (stagger).
+            static double s_phase = 0.0;
+            s_phase += 0.6180339887;
+            s_phase -= static_cast<double>(static_cast<int>(s_phase));
+            m_lastUpdate.QuadPart = now.QuadPart - static_cast<LONGLONG>(s_phase * m_intervalSeconds * static_cast<double>(s_freq.QuadPart));
             return true;
         }
         const double elapsed = static_cast<double>(now.QuadPart - m_lastUpdate.QuadPart)
                              / static_cast<double>(s_freq.QuadPart);
-        if (elapsed < m_intervalSeconds)
+        // Review F153: accept a frame up to 2 ms early, and advance the
+        // deadline by the interval rather than resetting it to now, so frame
+        // jitter doesn't alternate N and N+1 frames. Resync if far behind.
+        const double kSlack = 0.002;
+        if (elapsed + kSlack < m_intervalSeconds)
             return false;
-        m_lastUpdate = now;
+        const LONGLONG step = static_cast<LONGLONG>(m_intervalSeconds * static_cast<double>(s_freq.QuadPart));
+        if (elapsed >= 2.0 * m_intervalSeconds || step <= 0)
+            m_lastUpdate = now;
+        else
+            m_lastUpdate.QuadPart += step;
         return true;
     }
 
     double m_intervalSeconds;
     LARGE_INTEGER m_lastUpdate = {};
+    bool m_force = false;
     Renderer::Cache m_cache;
 };

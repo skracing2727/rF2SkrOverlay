@@ -73,6 +73,10 @@ private:
         float fade = 0.0f;         // 0 = fully hidden, 1 = fully shown
         double lateralM = 0.0;     // drives the base opacity
         double forwardM = 0.0;     // drives the top/bottom fade AND taper
+        // QPC time (s) the car last passed the alongside test: the bar is
+        // held lit for a short moment after that, so one noisy frame does not
+        // clear it (CrewChief review 2026-11-24).
+        double lastSeenS = -1.0;
     };
 
     // Comfortably past the handful of cars that can physically fit inside the

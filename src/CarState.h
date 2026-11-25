@@ -32,6 +32,15 @@ struct CarPos
     // class or name actually changes -- it used to be up to 28 case-
     // insensitive substring scans per car per frame in the radar's draw.
     int footprint;
+    // Pit lane / garage stall flags and ground speed (m/s) from scoring, so the
+    // radar and side bars can mute cars behind the pit wall (review F129).
+    bool inPits;
+    bool inGarage;
+    float speedMps;
+    // Lap distance (m) from scoring. Negative means the game has no real
+    // position for the car yet, so the radar and side bars skip it
+    // (CrewChief review 2026-11-24).
+    double lapDist;
 };
 
 // Typical real footprint for a handful of recognisable categories, matched
@@ -62,6 +71,11 @@ public:
     // NOTE: must be 'struct' -- ScoringInfoV01 is declared as a struct in the SDK,
     // and class/struct mismatch changes MSVC name mangling (link error).
     void Update(const struct ScoringInfoV01& info);
+    // Every car's telemetry (scope 2), ~50 Hz: a fresher position/heading/
+    // speed than the ~5 Hz interpolated scoring path, which is ~0.2 s behind.
+    // Read() uses it for a car while it is under 0.5 s old, else falls back
+    // to scoring. Scoring still owns the car list, identity and pit flags.
+    void OnTelemetry(const struct TelemInfoV01& info);
     // Copies the latest snapshot out, interpolated to 'now'.
     int Read(CarPos* out, int maxCars, double& outPlayerHeading, bool& outHasPlayer);
     void Read(CarSnapshot& out) { out.count = Read(out.cars, CarSnapshot::kMaxCars, out.playerHeading, out.hasPlayer); }
@@ -84,6 +98,10 @@ private:
         // every Read.
         int prevIndex = -1;
         int footprint = -1;
+        bool inPits = false;
+        bool inGarage = false;
+        float speedMps = 0.0f;
+        double lapDist = 0.0;
         // Kept only to notice a class/name change (and so redo 'footprint').
         char vehicleClass[32];
         char vehicleName[64];
@@ -104,9 +122,19 @@ private:
     LARGE_INTEGER m_curTime = {};
     int m_prevCount = 0;
     LARGE_INTEGER m_prevTime = {};
+    // Sim time (mCurrentET) of each sample: the real spacing between them,
+    // unlike QPC arrival times which bunch after a hitch (review F130).
+    double m_curET = -1.0;
+    double m_prevET = -1.0;
 
     bool m_hasPlayer = false;
     LARGE_INTEGER m_freq = {};
+
+    // Latest telemetry per car, keyed by mID; written by OnTelemetry and
+    // read by Read(), both under m_lock (copy of a few fields only).
+    struct TelemEntry { long id; double x, z, heading; float speedMps; LONGLONG t; };
+    TelemEntry m_telem[kMaxCars] = {};
+    int m_telemCount = 0;
 };
 
 extern CarStateStore g_carState;

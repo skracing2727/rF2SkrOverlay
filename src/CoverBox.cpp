@@ -1,4 +1,5 @@
 #include "CoverBox.h"
+#include "RenderThrottle.h"
 #include "Renderer.h"
 #include "Config.h"
 #include "Layout.h"
@@ -17,6 +18,12 @@ namespace
 void CoverBox::Draw(Renderer& renderer, int screenWidth, int screenHeight)
 {
     CoverBoxConfig& cfg = g_coverBoxConfig;
+    // 1 Hz rebuild, replayed in between (2026-11-24 throttle pass): they
+    // only change in layout mode, which bypasses the throttle.
+    static RenderThrottle s_throttle(1.0);
+    if (!Layout::Active() && s_throttle.TryReplay(renderer))
+        return;
+    RenderThrottle::Capture throttleCapture(s_throttle, renderer);
     // Sizes are kept at 2160p, like every other panel's pixel values.
     const float px = static_cast<float>(screenHeight) / 2160.0f;
     for (int i = 0; i < cfg.count && i < CoverBoxConfig::kMaxBoxes; ++i)

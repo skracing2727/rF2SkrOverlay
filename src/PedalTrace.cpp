@@ -65,7 +65,36 @@ void PedalTraceStore::Update(const TelemInfoV01& info)
     const double spinDeadzone = g_pedalConfig.spinDeadzone;
     const double spinFullScale = g_pedalConfig.spinFullScale;
     const double minSpeedForSlip = g_pedalConfig.minSpeedForSlipMs;
-    const int spinAxle = g_pedalConfig.spinAxle;
+    // Driven axle: learned per car from tyre force under throttle so FWD and
+    // AWD cars get spin detection too (review F68); INI/default until known.
+    if (m_learnedSpinAxle < 0 && info.mUnfilteredThrottle > 0.5 && info.mUnfilteredBrake < 0.05
+        && fabs(info.mLocalVel.z) > 5.0)
+    {
+        for (int w = 0; w < 4; ++w)
+        {
+            if (info.mWheel[w].mFlat || info.mWheel[w].mDetached) continue;
+            const double f = fabs(info.mWheel[w].mLongitudinalForce);
+            if (w < 2) m_driveForceFront += f; else m_driveForceRear += f;
+        }
+        if (++m_driveSamples >= 1000)
+        {
+            const double total = m_driveForceFront + m_driveForceRear;
+            if (total > 1.0)
+            {
+                const double frontShare = m_driveForceFront / total;
+                m_learnedSpinAxle = (frontShare < 0.2) ? 1 : (frontShare > 0.8) ? 2 : 0;
+                Log::Write("PedalTrace: driven axle worked out as %s (front share of drive force %.2f)",
+                           m_learnedSpinAxle == 1 ? "rear" : m_learnedSpinAxle == 2 ? "front" : "all",
+                           frontShare);
+            }
+            else
+            {
+                m_driveForceFront = m_driveForceRear = 0.0;
+                m_driveSamples = 0;
+            }
+        }
+    }
+    const int spinAxle = (m_learnedSpinAxle >= 0) ? m_learnedSpinAxle : g_pedalConfig.spinAxle;
 
     // Worst-wheel lockup and spin for THIS callback.
     double worstLock = 0.0;
@@ -81,6 +110,11 @@ void PedalTraceStore::Update(const TelemInfoV01& info)
     for (int w = 0; w < 4; ++w)
     {
         const TelemWheelV01& wheel = info.mWheel[w];
+
+        // A flat or detached wheel's rotation says nothing about grip; it
+        // would hold spin/lock (and the lockup sound) on until the pits (review F69).
+        if (wheel.mFlat || wheel.mDetached)
+            continue;
 
         const double radius = static_cast<double>(wheel.mStaticUndeflectedRadius) * 0.01; // cm -> m
         if (radius <= 0.0)
@@ -176,7 +210,29 @@ void PedalTraceStore::Update(const TelemInfoV01& info)
     m_accThrottleRaw += info.mUnfilteredThrottle;
     m_accThrottleActual += info.mFilteredThrottle;
     m_accBrakeRaw += info.mUnfilteredBrake;
-    m_accBrakeActual += info.mFilteredBrake;
+    {
+        // Brake after ABS: summed wheel brake pressure scaled to pedal units
+        // by the largest pressure/pedal ratio seen (review F66). mFilteredBrake
+        // is not lowered by ABS, so the gap never showed. Falls back to it
+        // until a ratio is learned or if a mod reports no pressure.
+        const double raw = info.mUnfilteredBrake;
+        double pres = 0.0;
+        for (int w = 0; w < 4; ++w) pres += info.mWheel[w].mBrakePressure;
+        double actual = info.mFilteredBrake;
+        if (raw > 0.3 && pres > 0.0)
+        {
+            const double ratio = pres / raw;
+            if (ratio > m_brakePresScale) m_brakePresScale = ratio;
+        }
+        if (m_brakePresScale > 0.0)
+        {
+            actual = pres / m_brakePresScale;
+            if (actual > 1.0) actual = 1.0;
+            // Small non-linearity is not ABS: draw it on the raw line.
+            if (fabs(actual - raw) < 0.01) actual = raw;
+        }
+        m_accBrakeActual += actual;
+    }
     if (worstLock > m_accLockupPeak) m_accLockupPeak = worstLock;
     if (worstSpin > m_accSpinPeak) m_accSpinPeak = worstSpin;
     {
@@ -187,6 +243,10 @@ void PedalTraceStore::Update(const TelemInfoV01& info)
         if (fabs(steer) > 0.01 && fabs(ffb) > 0.05)
         {
             m_ffbSignEvidence += steer * ffb;
+            // Clamped so a later car or FFB setting with the other sign can
+            // overturn it within seconds, not hours (review F360).
+            if (m_ffbSignEvidence > 200.0) m_ffbSignEvidence = 200.0;
+            if (m_ffbSignEvidence < -200.0) m_ffbSignEvidence = -200.0;
             // Adopted only once the evidence is clear -- near zero it flips
             // sample to sample, which flipped the trace with it.
             if (fabs(m_ffbSignEvidence) > 50.0)
@@ -306,6 +366,12 @@ void PedalTraceStore::Clear()
     EnterCriticalSection(&m_lock);
     m_head = 0;
     m_count = 0;
+    // Per-car learning starts again (car may change across sessions).
+    m_ffbSignEvidence = 0.0;
+    m_brakePresScale = 0.0;
+    m_driveForceFront = m_driveForceRear = 0.0;
+    m_driveSamples = 0;
+    m_learnedSpinAxle = -1;
     LeaveCriticalSection(&m_lock);
 }
 
@@ -586,11 +652,16 @@ bool PedalTrace::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         for (int k = 1; k < keepCount[rawCh]; ++k)
             next[s_keep[rawCh][k - 1]] = s_keep[rawCh][k];
     }
+    // Main line = the driver's own pedal (mUnfiltered*); the faint line under
+    // it = what TC (mFilteredThrottle) or ABS (wheel brake pressure) let
+    // through, drawn in the pedal's own colour at 40% so it reads as the
+    // same pedal's shadow rather than a separate channel.
+    const float kResultAlpha = 0.4f;
     DrawTrace(renderer, samples, xs, s_keep[1], keepCount[1], yBottom, plotH, thickness,
-              cfg.throttleActR, cfg.throttleActG, cfg.throttleActB, s_displayAlpha, 1,
+              cfg.throttleRawR, cfg.throttleRawG, cfg.throttleRawB, s_displayAlpha * kResultAlpha, 1,
               opaque ? s_coverNext[0] : nullptr, 0);
     DrawTrace(renderer, samples, xs, s_keep[3], keepCount[3], yBottom, plotH, thickness,
-              cfg.brakeActR, cfg.brakeActG, cfg.brakeActB, s_displayAlpha, 3,
+              cfg.brakeRawR, cfg.brakeRawG, cfg.brakeRawB, s_displayAlpha * kResultAlpha, 3,
               opaque ? s_coverNext[1] : nullptr, 2);
     DrawTrace(renderer, samples, xs, s_keep[0], keepCount[0], yBottom, plotH, thickness,
               cfg.throttleRawR, cfg.throttleRawG, cfg.throttleRawB, s_displayAlpha, 0);

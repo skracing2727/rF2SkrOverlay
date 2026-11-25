@@ -97,4 +97,8 @@ namespace DriverAbbrev
     int Snapshot(CarInfo* out, int maxCars);
 
     void Clear();
+
+    // The name folded to printable ASCII with its case kept ("Kimi Raikkonen"),
+    // for tables that show the full name. Pure function, any thread.
+    void FoldToAscii(const char* src, char* out, size_t outSize);
 }

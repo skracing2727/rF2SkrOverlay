@@ -1,6 +1,7 @@
 #include <atomic>
 #include "AmdGpuPower.h"
 #include "Log.h"
+#include "PerfStats.h"
 #include <windows.h>
 #include <cstdlib>
 #include <initializer_list>
@@ -103,8 +104,12 @@ bool AmdGpuPower::Init()
         return false;
     }
 
-    // Find the first active adapter and check which power sensor it
-    // actually reports (varies by GPU generation/driver).
+    // Pick the active adapter with the best power sensor (ASIC/board over
+    // GFX over SOC), not just the first one found: on a Ryzen-iGPU + Radeon
+    // desktop the first may be the APU (review F183). Which power sensor a
+    // GPU reports varies by generation/driver.
+    const unsigned short kCandidates[] = { kPmLogAsicPower, kPmLogBoardPower, kPmLogGfxPower, kPmLogSocPower };
+    int bestRank = 99;
     for (int i = 0; i < numAdapters; ++i)
     {
         int status = 0;
@@ -116,25 +121,21 @@ bool AmdGpuPower::Init()
         if (g_QueryPMLog(g_context, i, &data) != kAdlOk)
             continue;
 
-        unsigned short found = 0;
-        for (unsigned short candidate : { kPmLogAsicPower, kPmLogBoardPower, kPmLogGfxPower, kPmLogSocPower })
+        for (int rank = 0; rank < 4 && rank < bestRank; ++rank)
         {
+            const unsigned short candidate = kCandidates[rank];
             if (candidate < kAdlPmLogMaxSensors && data.sensors[candidate].supported)
             {
-                found = candidate;
+                bestRank = rank;
+                g_activeAdapterIndex = i;
+                g_powerSensorId = candidate;
+                g_haveSensor = true;
                 break;
             }
         }
-
-        if (found != 0)
-        {
-            g_activeAdapterIndex = i;
-            g_powerSensorId = found;
-            g_haveSensor = true;
-            Log::Write("AmdGpuPower::Init: adapter %d, power sensor id %u", i, found);
-            break;
-        }
     }
+    if (g_haveSensor)
+        Log::Write("AmdGpuPower::Init: adapter %d, power sensor id %u", g_activeAdapterIndex, g_powerSensorId);
 
     if (!g_haveSensor)
     {
@@ -148,6 +149,10 @@ bool AmdGpuPower::Init()
 
 void AmdGpuPower::Shutdown()
 {
+    // The poller did not stop in time and may still be inside ADL: keep the
+    // library loaded (review F231, see PerfStats::StopPoller).
+    if (PerfStats::PollerStuck())
+        return;
     if (g_context && g_Destroy)
         g_Destroy(g_context);
     g_context = nullptr;
@@ -175,7 +180,10 @@ static bool QueryPowerWatts(double& outWatts);
 void AmdGpuPower::Sample()
 {
     double w = 0.0;
-    const bool ok = QueryPowerWatts(w);
+    // Only when rF2 renders on an AMD card: on a Ryzen laptop with an NVIDIA
+    // dGPU the ADL sensor is the APU's, not the card's (review F183).
+    const unsigned vendor = PerfStats::GetCardVendorId();   // 0 until known
+    const bool ok = vendor == 0x1002 && QueryPowerWatts(w);
     if (ok) g_cachedWatts.store(w, std::memory_order_relaxed);
     g_haveCachedWatts.store(ok, std::memory_order_relaxed);
 }

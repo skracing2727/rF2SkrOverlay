@@ -1,4 +1,5 @@
 #include "Shortcuts.h"
+#include "EcoThread.h"
 #include "SetupInfo.h"
 #include "UpdateCheck.h"
 #include "Renderer.h"
@@ -140,13 +141,13 @@ namespace
         -3, Shortcuts::FuelPanel, 1019, Shortcuts::TyresPanel, 1020, Shortcuts::TyreTemps, Shortcuts::BrakeBiasPanel,
         -4, 1021, 1022, Shortcuts::FfbGraph,
         -5, Shortcuts::TrackMap, 1023, 1024,
-        -6, Shortcuts::Clock, Shortcuts::CoverBoxes, Shortcuts::Perf, Shortcuts::DllCost, 1029,
+        -6, Shortcuts::Clock, Shortcuts::CoverBoxes, Shortcuts::Perf, 1030, Shortcuts::DllCost, 1029,
     };
     const int kListOrderCount = static_cast<int>(sizeof(kListOrder) / sizeof(kListOrder[0]));
     const int kResetTowerCode = 1026;
     const int kUpdateCheckCode = 1029;
     // Rotary position: an index into kListOrder, always on an entry (never a heading).
-    int g_elemIndex = 1;
+    int g_elemIndex = 2;  // kListOrder[2] = Radar: [0] is Escape, [1] a heading (2026-11-24 review F196)
 
     // A 10-line window over a wrapping list for the rotary boxes: the
     // highlight moves, the window stays put until the highlight reaches the
@@ -202,12 +203,22 @@ namespace
     // leftSide: the box's left edge is at edgeX (else its right edge).
     // label(i, name, value, r, g, b) fills item i's name (128) and value (64,
     // may be empty) and its colour.
+    // Public build: wheel buttons ship unbound (every wheel numbers them
+    // differently), so the lists and the knob box say where to set them.
+    const char* const kNoWheelHint = "Bind keys in the INI [Shortcuts] -- rotary encoders on your rig work best";
+    bool AnyWheelButtonBound(const ShortcutConfig& w)
+    {
+        return w.centreKnobPrevButton > 0 || w.centreKnobNextButton > 0 || w.elementToggleButton > 0
+            || w.leftKnobPrevButton > 0 || w.leftKnobNextButton > 0 || w.rightKnobPrevButton > 0 || w.rightKnobNextButton > 0
+            || w.leftSettingUpButton > 0 || w.leftSettingDownButton > 0 || w.rightSettingUpButton > 0 || w.rightSettingDownButton > 0;
+    }
+
     // A row's icon: (renderer, item, centre x, centre y, half-size, r, g, b, alpha).
     typedef void (*RowIconFn)(Renderer&, int, float, float, float, float, float, float, float);
     template <typename LabelFn>
     void DrawScrollList(Renderer& renderer, ScrollWin& win, int count, int sel, bool leftSide, float edgeX,
                         float centerY, float textPx, float s, float alpha, LabelFn label, const char* caption = nullptr,
-                        RowIconFn icon = nullptr)
+                        RowIconFn icon = nullptr, float* outRect = nullptr)   // outRect: cx, cy, halfW, halfH
     {
         const float iconW = icon ? textPx * 1.4f : 0.0f;
         win.Update(sel, count);
@@ -230,6 +241,7 @@ namespace
         const float halfH = contentH * 0.5f + padding;
         const float left = leftSide ? edgeX : edgeX - boxW;
         const float cx = left + boxW * 0.5f;
+        if (outRect) { outRect[0] = cx; outRect[1] = centerY; outRect[2] = boxW * 0.5f; outRect[3] = halfH; }
         renderer.AddFilledRoundedRect(cx, centerY, boxW * 0.5f, halfH, 10.0f * s, 0.0f, 0.08f, 0.08f, 0.08f, 0.6f * alpha);
         if (caption && caption[0])
         {
@@ -294,7 +306,7 @@ namespace
     // race strategy, HUD, cover boxes, driving position, lights.
     enum { kKnobAbs, kKnobBias, kKnobFrontArb, kKnobRearArb,
            kKnobTcLevel, kKnobTcCut, kKnobTcSlip, kKnobMixture, kKnobShiftTarget,
-           kKnobFuelStint, kKnobTyreWear, kKnobTyreTime,
+           kKnobFuelStint, kKnobFuelBox, kKnobRequiredStops, kKnobTyreWear, kKnobTyreTime,
            kKnobPitLimit, kKnobMapColour,
            kKnobCoverOpacity, kKnobCoverShade,
            kKnobFov, kKnobSeatX, kKnobSeatY,
@@ -302,7 +314,7 @@ namespace
     const char* const kKnobSettingName[kKnobSettingCount] = {
         "ABS", "Brake bias", "Front anti-roll bar", "Rear anti-roll bar",
         "Traction control", "TC power cut", "TC slip", "Engine mixture", "Shift point",
-        "Fuel stint length", "Tyre max wear", "Tyre target time",
+        "Fuel stint length", "Fuel box", "Required stops", "Tyre max wear", "Tyre target time",
         "Pit lane limit", "Track map colour",
         "Cover box opacity", "Cover box shade",
         "Field of view", "Seat fore/aft", "Seat height",
@@ -311,7 +323,7 @@ namespace
     const int kKnobGroup[kKnobSettingCount] = {
         kGroupChassis, kGroupChassis, kGroupChassis, kGroupChassis,
         kGroupEngine, kGroupEngine, kGroupEngine, kGroupEngine, kGroupEngine,
-        kGroupStrategy, kGroupStrategy, kGroupStrategy,
+        kGroupStrategy, kGroupStrategy, kGroupStrategy, kGroupStrategy,
         kGroupHud, kGroupHud,
         kGroupCover, kGroupCover,
         kGroupSeat, kGroupSeat, kGroupSeat,
@@ -331,7 +343,7 @@ namespace
     // drawn in the lists and the knob box (2026-11-24). (cx, cy) centre,
     // h half-size. Shapes only -- no image files.
     enum KnobIcon { IcAbs, IcBias, IcArbFront, IcArbRear, IcTc, IcTcCut, IcTcSlip, IcMixture, IcShift,
-                    IcFuel, IcTyreWear, IcTyreTime, IcPitLimit, IcWarning, IcRedFrom, IcMap,
+                    IcFuel, IcFuelBox, IcTyreWear, IcTyreTime, IcPitLimit, IcWarning, IcRedFrom, IcMap,
                     IcCoverOpacity, IcCoverShade, IcFov, IcSeatX, IcSeatY, IcLights };
     int KnobIconFor(int k)
     {
@@ -347,6 +359,8 @@ namespace
         case kKnobMixture: return IcMixture;
         case kKnobShiftTarget: return IcShift;
         case kKnobFuelStint: return IcFuel;
+        case kKnobFuelBox: return IcFuelBox;
+        case kKnobRequiredStops: return IcFuel;
         case kKnobTyreWear: return IcTyreWear;
         case kKnobTyreTime: return IcTyreTime;
         case kKnobPitLimit: return IcPitLimit;
@@ -419,6 +433,9 @@ namespace
         }
         case IcFuel:         frame(-0.15f, 0.1f, 0.5f, 0.75f); box(-0.15f, 0.35f, 0.5f, 0.5f, 0.45f);
                              line(0.35f, -0.35f, 0.8f, -0.1f); line(0.8f, -0.1f, 0.8f, 0.6f); break;
+        case IcFuelBox:      // a panel with a table's rows: simple / advanced fuel box
+                             frame(0, 0, 0.9f, 0.75f); line(-0.6f, -0.3f, 0.6f, -0.3f); line(-0.6f, 0.05f, 0.6f, 0.05f);
+                             box(-0.25f, 0.45f, 0.35f, 0.12f, 1.0f); break;
         case IcTyreWear:     tyre(0, -0.15f, 0.7f); box(0, 0.8f, 0.85f, 0.08f, 1.0f); break;
         case IcTyreTime:     ring(0, 0, 0.9f); line(0, 0, 0, -0.6f); line(0, 0, 0.45f, 0.15f); break;
         case IcPitLimit:     ring(0, 0, 0.95f); label("P", 1.15f); break;
@@ -439,6 +456,144 @@ namespace
         default:             dot(-0.45f, 0, 0.45f); line(0.15f, -0.5f, 0.95f, -0.65f); line(0.15f, 0.0f, 0.95f, 0.0f); line(0.15f, 0.5f, 0.95f, 0.65f); break;
         }
     }
+    // --- Shortcut list look-up aids (2026-11-24): a colour per group, a
+    // small icon per row and the screen map of where the hovered panel sits.
+    // Same order as kGroupName.
+    const float kListGroupCol[6][3] = {
+        { 0.35f, 0.6f, 1.0f }, { 0.7f, 0.45f, 1.0f }, { 1.0f, 0.75f, 0.2f },
+        { 1.0f, 0.5f, 0.2f }, { 0.25f, 0.8f, 0.75f }, { 0.65f, 0.65f, 0.7f } };
+    // What a list row IS, independent of how each tree numbers its entries
+    // (picks the icon and the Layout box name).
+    enum ListKind { LkRadar, LkSideBar, LkGear, LkShift, LkLockup, LkDrs, LkBrakeCue, LkPedal,
+                    LkDelta, LkBestDelta, LkStrip, LkTiming, LkGapBox, LkCarNum, LkPitLaps, LkResetTower,
+                    LkFuel, LkFuelSave, LkTyres, LkTyreWear, LkTyreTemps, LkBias, LkEngineTemps,
+                    LkFfbLevel, LkFfbGraph, LkTrackMap, LkConditions, LkWeather, LkClock, LkCover,
+                    LkPerf, LkBenchmark, LkDllCost, LkUpdate, LkOther };
+
+    int ListKindFor(int code)
+    {
+        switch (code)
+        {
+        case Shortcuts::Radar: return LkRadar;         case Shortcuts::SideBar: return LkSideBar;
+        case Shortcuts::Gear: return LkGear;           case Shortcuts::ShiftStats: return LkShift;
+        case Shortcuts::TyreLockup: return LkLockup;   case Shortcuts::Drs: return LkDrs;
+        case Shortcuts::BrakeCue: return LkBrakeCue;   case Shortcuts::PedalTrace: return LkPedal;
+        case Shortcuts::LapDelta: return LkDelta;      case Shortcuts::BestDelta: return LkBestDelta;
+        case Shortcuts::MiniSector: return LkStrip;    case Shortcuts::RelativeTiming: return LkTiming;
+        case Shortcuts::FuelPanel: return LkFuel;      case Shortcuts::TyresPanel: return LkTyres;
+        case Shortcuts::TyreTemps: return LkTyreTemps; case Shortcuts::BrakeBiasPanel: return LkBias;
+        case Shortcuts::FfbGraph: return LkFfbGraph;   case Shortcuts::TrackMap: return LkTrackMap;
+        case Shortcuts::Clock: return LkClock;         case Shortcuts::CoverBoxes: return LkCover;
+        case Shortcuts::Perf: return LkPerf;           case Shortcuts::DllCost: return LkDllCost;
+        case 1019: return LkFuelSave;   case 1020: return LkTyreWear;   case 1021: return LkEngineTemps;
+        case 1022: return LkFfbLevel;   case 1023: return LkConditions; case 1024: return LkWeather;
+        case 1025: return LkPitLaps;    case 1026: return LkResetTower; case 1027: return LkCarNum;
+        case 1028: return LkGapBox;     case 1030: return LkBenchmark;  case kUpdateCheckCode: return LkUpdate;
+        default: return LkOther;
+        }
+    }
+    // The Layout::Register name of the panel a row shows (see each module's
+    // Register call). Several rows share one box (the standings options, the
+    // side bars inside the radar, the strip under the delta bar). 'prefix':
+    // match every box starting with the name (the numbered cover boxes).
+    const char* ListKindBox(int kind, bool& prefix)
+    {
+        prefix = false;
+        switch (kind)
+        {
+        case LkRadar: case LkSideBar: return "Radar";
+        case LkGear: return "Gear / speed";
+        case LkShift: return "Shift stats";
+        case LkLockup: return "Tyre lockup";
+        case LkDrs: return "DRS";
+        case LkBrakeCue: return "Brake reaction";
+        case LkPedal: return "Pedal trace";
+        case LkDelta: case LkStrip: return "Delta bar";
+        case LkBestDelta: return "PB delta";
+        case LkTiming: case LkCarNum: case LkPitLaps: case LkResetTower: return "Standings";
+        case LkGapBox: return "Gap box";
+        case LkFuel: return "Fuel";
+        case LkFuelSave: return "Fuel save";
+        case LkTyres: return "Tyres";
+        case LkTyreWear: return "Tyre wear target";
+        case LkTyreTemps: return "Tyre temps";
+        case LkBias: return "Brake bias";
+        case LkEngineTemps: return "Engine temps";
+        case LkFfbLevel: return "FFB strength";
+        case LkFfbGraph: return "FFB spectrum";
+        case LkTrackMap: return "Track map";
+        case LkConditions: case LkWeather: return "Track conditions";
+        case LkClock: return "Clock";
+        case LkCover: prefix = true; return "Cover box ";
+        case LkPerf: return "Perf stats";
+        case LkBenchmark: return "Benchmark";
+        case LkDllCost: return "DLL cost";
+        default: return nullptr;   // no box of its own (update check)
+        }
+    }
+    // Row icon, same conventions as DrawKnobIcon (which it reuses where a
+    // knob icon already fits): (cx, cy) centre, h half-size.
+    void DrawListIcon(Renderer& rd, int kind, float cx, float cy, float h, float r, float g, float b, float a)
+    {
+        const float th = (std::max)(1.5f, h * 0.16f);
+        auto line = [&](float x1, float y1, float x2, float y2)
+        { rd.AddLineSmooth(cx + x1 * h, cy + y1 * h, cx + x2 * h, cy + y2 * h, th, r, g, b, a); };
+        auto ring = [&](float x, float y, float rad)
+        { rd.AddRing(cx + x * h, cy + y * h, rad * h - th, rad * h, r, g, b, a, 20); };
+        auto dot = [&](float x, float y, float rad)
+        { rd.AddFilledCircle(cx + x * h, cy + y * h, rad * h, r, g, b, a, 12); };
+        auto box = [&](float x, float y, float hw, float hh, float alpha)
+        { rd.AddFilledRect(cx + x * h, cy + y * h, hw * h, hh * h, 0.0f, r, g, b, a * alpha); };
+        auto frame = [&](float x, float y, float hw, float hh)
+        { rd.AddRectOutline(cx + x * h, cy + y * h, hw * h, hh * h, th, r, g, b, a); };
+        auto poly = [&](const float* pts, int cnt)
+        {
+            float xy[32];
+            for (int i = 0; i < cnt && i < 16; ++i) { xy[i * 2] = cx + pts[i * 2] * h; xy[i * 2 + 1] = cy + pts[i * 2 + 1] * h; }
+            rd.AddPolylineSmooth(xy, cnt, false, th, r, g, b, a);
+        };
+        auto thermo = [&]() { line(0, -0.85f, 0, 0.35f); dot(0, 0.55f, 0.32f); };
+        auto cloud = [&]() { dot(-0.4f, 0.05f, 0.38f); dot(0.1f, -0.15f, 0.48f); dot(0.5f, 0.1f, 0.35f); box(0.05f, 0.3f, 0.8f, 0.15f, 1.0f); };
+        auto bars = [&]() { box(-0.6f, 0.45f, 0.18f, 0.4f, 1.0f); box(0, 0.15f, 0.18f, 0.7f, 1.0f); box(0.6f, 0.3f, 0.18f, 0.55f, 1.0f); };
+        auto rows = [&]() { line(-0.85f, -0.6f, 0.85f, -0.6f); line(-0.85f, 0, 0.85f, 0); line(-0.85f, 0.6f, 0.85f, 0.6f); };
+        switch (kind)
+        {
+        case LkRadar:      ring(0, 0, 0.9f); ring(0, 0, 0.5f); dot(0, 0, 0.16f); break;
+        case LkSideBar:    box(-0.6f, 0, 0.16f, 0.85f, 1.0f); box(0.6f, 0, 0.16f, 0.85f, 1.0f); break;
+        case LkGear:       frame(0, 0, 0.7f, 0.9f); line(-0.3f, -0.45f, 0.3f, -0.45f); line(0.3f, -0.45f, -0.05f, 0.5f); break;
+        case LkShift:      line(0, 0.85f, 0, -0.8f); line(0, -0.85f, -0.5f, -0.3f); line(0, -0.85f, 0.5f, -0.3f); break;
+        case LkLockup:     DrawKnobIcon(rd, kKnobTcCut, cx, cy, h, r, g, b, a); break;   // tyre ring + slash
+        case LkDrs:        line(-0.9f, -0.35f, 0.9f, -0.35f); line(-0.9f, 0.15f, 0.9f, 0.0f);
+                           line(-0.9f, -0.7f, -0.9f, 0.5f); line(0.9f, -0.7f, 0.9f, 0.5f); break;
+        case LkBrakeCue:   { const float t[] = { -0.6f, 0.45f, -0.55f, -0.2f, -0.3f, -0.6f, 0.0f, -0.7f, 0.3f, -0.6f, 0.55f, -0.2f, 0.6f, 0.45f }; poly(t, 7); }
+                           line(-0.8f, 0.45f, 0.8f, 0.45f); dot(0, 0.7f, 0.15f); break;   // bell
+        case LkPedal:      { const float t[] = { -0.9f, 0.4f, -0.55f, -0.5f, -0.2f, 0.4f, 0.15f, -0.5f, 0.5f, 0.4f, 0.9f, -0.3f }; poly(t, 6); } break;
+        case LkDelta:      frame(0, 0, 0.95f, 0.35f); line(0, -0.7f, 0, 0.7f); break;
+        case LkBestDelta:  frame(0, 0, 0.95f, 0.35f); box(0.4f, 0, 0.4f, 0.35f, 0.6f); line(0, -0.7f, 0, 0.7f); break;
+        case LkStrip:      for (int i = 0; i < 4; ++i) box(-0.72f + i * 0.48f, 0, 0.18f, 0.3f, i == 1 ? 1.0f : 0.5f); break;
+        case LkTiming: case LkCarNum: case LkPitLaps: rows(); break;
+        case LkResetTower: rows(); dot(0.85f, 0.6f, 0.2f); break;
+        case LkGapBox:     rows(); frame(0, 0, 0.95f, 0.25f); break;
+        case LkFuel:       DrawKnobIcon(rd, kKnobFuelStint, cx, cy, h, r, g, b, a); break;   // pump
+        case LkFuelSave:   DrawKnobIcon(rd, kKnobMixture, cx, cy, h, r, g, b, a); break;     // drop
+        case LkTyres:      rd.AddRing(cx, cy, h * 0.5f, h * 0.85f, r, g, b, a, 20); break;
+        case LkTyreWear:   DrawKnobIcon(rd, kKnobTyreWear, cx, cy, h, r, g, b, a); break;
+        case LkTyreTemps:  thermo(); line(0.3f, -0.6f, 0.6f, -0.6f); line(0.3f, -0.2f, 0.6f, -0.2f); break;
+        case LkBias:       DrawKnobIcon(rd, kKnobBias, cx, cy, h, r, g, b, a); break;        // balance
+        case LkEngineTemps: thermo(); line(-0.8f, -0.4f, -0.4f, -0.4f); line(0.4f, -0.4f, 0.8f, -0.4f); break;
+        case LkFfbLevel:   ring(0, 0, 0.9f); line(-0.85f, 0, 0.85f, 0); line(0, 0, 0, 0.85f); break;   // wheel
+        case LkFfbGraph:   ring(0, 0, 0.9f); box(-0.3f, 0.2f, 0.1f, 0.3f, 1.0f); box(0, 0, 0.1f, 0.5f, 1.0f); box(0.3f, 0.25f, 0.1f, 0.25f, 1.0f); break;
+        case LkTrackMap:   DrawKnobIcon(rd, kKnobMapColour, cx, cy, h, r, g, b, a); break;   // loop
+        case LkConditions: cloud(); break;
+        case LkWeather:    cloud(); dot(-0.4f, 0.8f, 0.1f); dot(0.0f, 0.8f, 0.1f); dot(0.4f, 0.8f, 0.1f); break;
+        case LkClock:      DrawKnobIcon(rd, kKnobTyreTime, cx, cy, h, r, g, b, a); break;    // ring + hands
+        case LkCover:      box(0, 0, 0.75f, 0.75f, 1.0f); break;
+        case LkPerf: case LkBenchmark: bars(); break;
+        case LkDllCost:    frame(0, 0, 0.55f, 0.55f); box(0, 0, 0.25f, 0.25f, 1.0f);   // chip
+                           for (int i = -1; i <= 1; ++i) { line(-0.55f, i * 0.3f, -0.9f, i * 0.3f); line(0.55f, i * 0.3f, 0.9f, i * 0.3f); } break;
+        default:           dot(0, 0, 0.3f); break;
+        }
+    }
     int g_knobSetting = kKnobTcCut;        // the active rotary's setting (for drawing)
     int g_knobSel[2] = { kKnobTcCut, kKnobFuelStint }; // left / right rotary's setting
     int g_activeSlot = 0;                  // rotary used last
@@ -453,6 +608,8 @@ namespace
         switch (k)
         {
         case kKnobFuelStint:    return g_fuelSaveConfig.enabled;
+        case kKnobFuelBox:      return true;   // the fuel panel's own layout: always offered
+        case kKnobRequiredStops: return g_fuelSaveConfig.enabled;
         case kKnobShiftTarget:  return g_entries[Shortcuts::Gear].visible;
         case kKnobTyreWear:
         case kKnobTyreTime:     return g_tyreSaveConfig.enabled;
@@ -490,13 +647,20 @@ namespace
     // the system has seen the key (SimHub, Discord, ...), and a slow one
     // held the render thread up for milliseconds.
     enum { kKeyFov, kKeyMixture, kKeyTc, kKeyTcCut, kKeyTcSlip, kKeyHeadlights, kKeyFrontArb, kKeyRearArb, kKeyAbs, kKeyBias, kKeySeatX, kKeySeatY, kKeyEscape, kKeyCount };
-    struct KeyPress { int which; bool up; };
+    struct KeyPress { int which; bool up; int scan = 0; };   // scan > 0: send this DIK code instead (Toggle Cursor tap)
     // Filled by Poll (render thread), emptied by PumpKeyPresses (input
     // thread). The lock is only held to add or take an entry.
     SRWLOCK g_keyQueueLock = SRWLOCK_INIT;
     std::vector<KeyPress> g_keyQueue;
     WORD g_heldScan = 0;        // key currently held down; 0 = none (PumpKeyPresses only)
-    int g_keyNetSteps[kKeyCount] = {}; // net steps sent this session, for the box (render thread)
+    // Net presses actually sent this session, for the box. Counted by
+    // PumpKeyPresses only once SendInput took the key (review F191/F213),
+    // cleared at session start (ResetHint).
+    std::atomic<int> g_keyNetSteps[kKeyCount];   // static storage: starts at 0
+    // When PumpKeyPresses last pressed a key: PollKeyboard ignores its pad
+    // keys just after, since a numpad send key reads back as Insert/Home/...
+    // with NumLock off (review F190).
+    std::atomic<ULONGLONG> g_lastSendMs{ 0 };
     // rF2's Toggle Cursor key, to be tapped once (down and up together) for
     // turning layout mode on; -1 = nothing to send. Not part of the timed
     // queue -- it never was -- so it goes out at once.
@@ -526,37 +690,35 @@ namespace
 
     void QueueKeyPresses(int which, int steps)
     {
-        g_keyNetSteps[which] += steps;
         AcquireSRWLockExclusive(&g_keyQueueLock);
         for (int i = 0; i < (steps < 0 ? -steps : steps) && g_keyQueue.size() < 64; ++i)
             g_keyQueue.push_back({ which, steps > 0 });
         ReleaseSRWLockExclusive(&g_keyQueueLock);
     }
 
-    void SendScan(WORD dik, bool up)
+    UINT SendScan(WORD dik, bool up)
     {
         INPUT in = {};
         in.type = INPUT_KEYBOARD;
         in.ki.wScan = static_cast<WORD>(dik & 0x7F);
         in.ki.dwFlags = KEYEVENTF_SCANCODE | (up ? KEYEVENTF_KEYUP : 0) | ((dik & 0x80) ? KEYEVENTF_EXTENDEDKEY : 0);
-        SendInput(1, &in, sizeof(in));
+        return SendInput(1, &in, sizeof(in));
     }
 
     // Input thread, every pass (or Poll, if that thread could not start).
     void PumpKeyPresses()
     {
-        // Layout mode's Toggle Cursor press: a single tap, down and up in
-        // one SendInput, sent as soon as it is asked for.
+        // Layout mode's Toggle Cursor press: goes to the front of the timed
+        // queue, so it gets SendScan's extended-key flag and the same ~60 ms
+        // hold -- a raw instant tap missed Home/Insert/arrows (review F192/F204).
         const int tap = g_tapScan.exchange(-1);
-        if (tap >= 0)
+        if (tap > 0 && tap <= 0xFF)
         {
-            INPUT inputs[2] = {};
-            inputs[0].type = INPUT_KEYBOARD;
-            inputs[0].ki.wScan = static_cast<WORD>(tap);
-            inputs[0].ki.dwFlags = KEYEVENTF_SCANCODE;
-            inputs[1] = inputs[0];
-            inputs[1].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
-            SendInput(2, inputs, sizeof(INPUT));
+            AcquireSRWLockExclusive(&g_keyQueueLock);
+            KeyPress t = { kKeyCount, false };
+            t.scan = tap;
+            g_keyQueue.insert(g_keyQueue.begin(), t);
+            ReleaseSRWLockExclusive(&g_keyQueueLock);
         }
 
         // Each press is held ~60 ms with ~50 ms between presses, by time
@@ -573,6 +735,21 @@ namespace
             return;
         }
         if (nowMs - s_releasedAt < 50) return;
+        // Only into rF2 itself: with another program in front (Discord on a
+        // second screen) the keys would be typed there. Dropped, not kept, so
+        // a burst does not go out on alt-tab back (review F189/F200).
+        {
+            DWORD pid = 0;
+            const HWND fg = GetForegroundWindow();
+            if (fg) GetWindowThreadProcessId(fg, &pid);
+            if (pid != GetCurrentProcessId())
+            {
+                AcquireSRWLockExclusive(&g_keyQueueLock);
+                g_keyQueue.clear();
+                ReleaseSRWLockExclusive(&g_keyQueueLock);
+                return;
+            }
+        }
         KeyPress kp = {};
         AcquireSRWLockExclusive(&g_keyQueueLock);
         const bool have = !g_keyQueue.empty();
@@ -583,10 +760,12 @@ namespace
         }
         ReleaseSRWLockExclusive(&g_keyQueueLock);
         if (!have) return;
-        const int dik = KeyFor(kp.which, kp.up);
-        if (dik <= 0 || dik > 0xFF) return;   // unbound: the press is dropped
+        const int dik = kp.scan > 0 ? kp.scan : KeyFor(kp.which, kp.up);
+        if (dik <= 0 || dik > 0xFF) return;   // unbound: the press is dropped (and not counted)
         g_heldScan = static_cast<WORD>(dik);
-        SendScan(g_heldScan, false);
+        g_lastSendMs.store(nowMs);
+        if (SendScan(g_heldScan, false) == 1 && kp.scan <= 0 && kp.which >= 0 && kp.which < kKeyCount)
+            g_keyNetSteps[kp.which].fetch_add(kp.up ? 1 : -1);
         s_pressedAt = nowMs;
     }
 
@@ -614,7 +793,7 @@ namespace
         auto steps = [&](int which)
         {
             if (KeyFor(which, true) <= 0 && KeyFor(which, false) <= 0) strcpy_s(out, outSize, "no key set");
-            else sprintf_s(out, outSize, "%+d steps", g_keyNetSteps[which]);
+            else sprintf_s(out, outSize, "%+d steps", g_keyNetSteps[which].load());
         };
         switch (setting)
         {
@@ -652,6 +831,11 @@ namespace
         case kKnobTyreTime:
             if (g_tyreSaveConfig.targetMinutes <= 0.0f) strcpy_s(out, outSize, "off");
             else sprintf_s(out, outSize, "%d min", static_cast<int>(g_tyreSaveConfig.targetMinutes + 0.5f));
+            break;
+        case kKnobFuelBox:      strcpy_s(out, outSize, g_fuelSaveConfig.boxMode == 0 ? "Simple" : "Advanced"); break;
+        case kKnobRequiredStops:
+            if (g_fuelSaveConfig.requiredStops <= 0) strcpy_s(out, outSize, "none");
+            else sprintf_s(out, outSize, "%d", g_fuelSaveConfig.requiredStops);
             break;
         case kKnobFuelStint:
             if (g_fuelSaveConfig.stintMinutes <= 0.0f) strcpy_s(out, outSize, "off");
@@ -819,6 +1003,7 @@ namespace
     {
         bool hotWas[kHotCount] = {};
         bool padWas[6] = {};
+        bool enterWas = false;   // Enter = the on/off button (2026-11-24)
     };
 
     // When Poll last ran (GetTickCount64), set every frame. The keys used to
@@ -866,10 +1051,13 @@ namespace
         // = right setting list. "Up" moves the highlight up, the same as
         // turning that rotary counter-clockwise.
         const int keys[6] = { VK_INSERT, VK_DELETE, VK_HOME, VK_END, VK_PRIOR, VK_NEXT };
+        // Just after the plugin pressed a key itself, a numpad send key reads
+        // back as one of these (NumLock off) -- not a rotary step (review F190).
+        const bool justSent = GetTickCount64() - g_lastSendMs.load() < 150;
         for (int k = 0; k < 6; ++k)
         {
             const bool down = (GetAsyncKeyState(keys[k]) & 0x8000) != 0;
-            if (down && !ks.padWas[k])
+            if (down && !ks.padWas[k] && !justSent)
             {
                 const int dir = (k % 2 == 0) ? 1 : -1;   // even = up
                 if (k < 2) g_slotSel[0].fetch_add(dir);
@@ -877,6 +1065,14 @@ namespace
                 else g_slotSel[1].fetch_add(dir);
             }
             ks.padWas[k] = down;
+        }
+        // Enter = the on/off list's switch button (ElementToggleButton), for
+        // testing on the keyboard. Same down-edge rule as the keys above.
+        {
+            const bool down = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+            if (down && !ks.enterWas && !justSent)
+                g_elemToggles.fetch_add(1);
+            ks.enterWas = down;
         }
     }
 
@@ -995,7 +1191,12 @@ namespace
         for (int i = 0; i < st.count; ++i)
             mostButtons = (std::max)(mostButtons, st.buttonCount[i]);
         const bool missing = st.count == 0 || st.count < st.mostCount || maxBtn > mostButtons;
-        if (!st.scanned || (missing && GetTickCount64() - st.lastScanMs >= 2000))
+        // A button number past every device's last button is not going to
+        // appear: looked for every 30 s, not 2 s. And never while a key is
+        // held down, since a slow look would hold it (review F194).
+        const bool onlyTooHigh = st.count > 0 && st.count >= st.mostCount && maxBtn > mostButtons;
+        const ULONGLONG rescanMs = onlyTooHigh ? 30000 : 2000;
+        if (!st.scanned || (missing && g_heldScan == 0 && GetTickCount64() - st.lastScanMs >= rescanMs))
         {
             st.di->EnumDevices(DI8DEVCLASS_GAMECTRL, EnumJoyCb, &st, DIEDFL_ATTACHEDONLY);
             st.lastScanMs = GetTickCount64();   // after: the look itself can take a while
@@ -1016,7 +1217,7 @@ namespace
             {
                 st.shortLogged = true;
                 Log::Write("Shortcuts: wheel button %d is past the last button of every controller found (%d) -- "
-                           "looking again every 2 s", maxBtn, mostButtons);
+                           "looking again every 30 s", maxBtn, mostButtons);
             }
         }
 
@@ -1060,7 +1261,16 @@ namespace
     // thread only takes the results (atomics, or a copy under a small lock),
     // so none of this -- kernel calls, other programs' keyboard hooks, a
     // file read -- can hold up a frame.
-    DWORD WINAPI JoyThreadProc(void*)
+    // An exception must not leave a thread: std::terminate would take the
+    // game down (review F271). The real body is JoyThreadProcBody below.
+    DWORD JoyThreadProcBody(LPVOID param);
+    DWORD WINAPI JoyThreadProc(LPVOID param)
+    {
+        try { return JoyThreadProcBody(param); }
+        catch (...) { return 0; }
+    }
+
+    DWORD JoyThreadProcBody(void*)
     {
         DiState st;
         KeyboardState keys;
@@ -1077,6 +1287,10 @@ namespace
             PumpKeyPresses();
 
             unsigned char buttons[128] = {};
+            // rF2 not drawing (alt-tab, loading): presses are not counted, so
+            // they do not all go out at once on return (review F200). The
+            // "was" states still follow the buttons.
+            const bool live = GetTickCount64() - g_lastPollMs.load(std::memory_order_relaxed) <= 250;
             ReadWheelButtons(st, MaxWheelButton(), buttons);
 
             // Each watched button and where its press goes.
@@ -1101,7 +1315,7 @@ namespace
             for (int i = 0; i < kWatched; ++i)
             {
                 const bool now = ButtonDown(buttons, watch[i].btn);
-                if (now && !was[i]) watch[i].target->fetch_add(watch[i].delta);
+                if (live && now && !was[i]) watch[i].target->fetch_add(watch[i].delta);
                 was[i] = now;
             }
             Sleep(10);
@@ -1259,6 +1473,7 @@ namespace
         case 27: return "Car numbers (standings)";
         case 28: return "Gap box (2 ahead, 2 behind)";
         case 29: return "Update check (GitHub, at game start)";
+        case 30: return "Benchmark (FPS per lap)";
         default: return "Reset timing tower (gaps return after one lap)";
         }
     }
@@ -1277,6 +1492,7 @@ namespace
         case 27: return g_relativeTimingConfig.showCarNumber;
         case 28: return g_relativeTimingConfig.showGapBox;
         case 29: return g_updateCheckConfig.enabled;
+        case 30: return g_benchmarkConfig.enabled;
         default: return true;
         }
     }
@@ -1330,6 +1546,10 @@ namespace
         case 26:
             g_resetTimingRequested = true;
             break;
+        case 30:
+            g_benchmarkConfig.enabled = !g_benchmarkConfig.enabled;
+            Config::WriteBool("Benchmark", "Enabled", g_benchmarkConfig.enabled);
+            break;
         case 29:
             // Saved like the others; switched on, it also checks now if it
             // has not this game start (a thread of its own, see UpdateCheck.h).
@@ -1345,11 +1565,21 @@ namespace
 void Shortcuts::Poll()
 {
     const ShortcutConfig& cfg = g_shortcutConfig;
+    // Before the enabled check, so Toggled() reads the INI's on/off
+    // states with shortcuts disabled too (review F199).
+    SyncFromConfig();
     if (!cfg.enabled)
         return;
 
-    SyncFromConfig();
     g_lastPollMs.store(GetTickCount64(), std::memory_order_relaxed);
+
+    // A queued INI write failed on the save thread: one warning, out of the
+    // car only (that is when the writes happen; review F218/F276).
+    if (!g_inRealtime.load(std::memory_order_relaxed) && Config::TakeSaveFailed())
+    {
+        sprintf_s(g_toastText, "Settings could not be saved -- check the INI is writable");
+        ShowPopup(Popup::Warning, kWarningSeconds);
+    }
 
     // The input thread (JoyThreadProc) reads the keyboard and the wheel,
     // sends the queued key presses and keeps rF2's Toggle Cursor binding
@@ -1363,6 +1593,9 @@ void Shortcuts::Poll()
         s_threadTried = true;
         g_joyStop.store(false);
         g_joyThread = CreateThread(nullptr, 0, JoyThreadProc, nullptr, 0, nullptr);
+        // NOT in efficiency mode (2026-11-24): rotary encoders send button
+        // pulses only a few ms long, and EcoQoS stretched this thread's sleeps
+        // enough to miss them -- the rotary lists stopped stepping.
         if (!g_joyThread)
             Log::Write("Shortcuts: could not start the input thread (error %lu) -- reading keys on the render thread",
                        GetLastError());
@@ -1518,16 +1751,36 @@ void Shortcuts::Poll()
     }
 
     // Centre rotary + on/off button: the on/off list.
-    const int elemSteps = g_elemSteps.exchange(0);
-    const int elemToggles = g_elemToggles.exchange(0);
+    // Out of the car the rotary lists are not drawn, so rotary input is
+    // dropped there rather than acted on unseen (review F214); queued key
+    // presses are dropped too, so none go into the garage screens.
+    const bool knobsLive = g_inRealtime.load(std::memory_order_relaxed);
+    if (!knobsLive)
+    {
+        AcquireSRWLockExclusive(&g_keyQueueLock);
+        g_keyQueue.clear();
+        ReleaseSRWLockExclusive(&g_keyQueueLock);
+    }
+    const int elemSteps = g_elemSteps.exchange(0) * (knobsLive ? 1 : 0);
+    const int elemToggles = g_elemToggles.exchange(0) * (knobsLive ? 1 : 0);
     if (elemSteps != 0)
         // Sign flipped: counter-clockwise (and "up" keys) move the highlight
         // UP the list, clockwise DOWN, matching how the list is drawn.
         g_elemIndex = StepListOrder(g_elemIndex, -elemSteps);
     bool closeList = false;
-    if (elemToggles % 2 != 0)
+    // The on/off button acts only on a list that is on screen: a press
+    // while it is hidden just brings it up (review F198). After ESC the
+    // highlight goes back to the first real entry, so a stray press later
+    // cannot send Esc again.
+    const bool elemListShown = !g_shortcutConfig.showKnobBox || SecondsSince(g_elemSelTime) <= 10.0;
+    if (elemToggles % 2 != 0 && elemListShown)
     {
-        if (kListOrder[g_elemIndex] == kCloseEntry) { closeList = true; QueueKeyPresses(kKeyEscape, 1); }
+        if (kListOrder[g_elemIndex] == kCloseEntry)
+        {
+            closeList = true;
+            QueueKeyPresses(kKeyEscape, 1);
+            g_elemIndex = StepListOrder(0, 1);
+        }
         else ToggleListEntry(kListOrder[g_elemIndex]);
     }
     if (closeList)
@@ -1541,8 +1794,8 @@ void Shortcuts::Poll()
     for (int slot = 0; slot < 2; ++slot)
     {
         g_knobSetting = g_knobSel[slot];
-        const int selSteps = g_slotSel[slot].exchange(0);
-        const int adjSteps = g_slotAdj[slot].exchange(0);
+        const int selSteps = g_slotSel[slot].exchange(0) * (knobsLive ? 1 : 0);
+        const int adjSteps = g_slotAdj[slot].exchange(0) * (knobsLive ? 1 : 0);
         if (selSteps != 0 || adjSteps != 0)
             g_activeSlot = slot;
         if (!KnobAvailable(g_knobSetting))
@@ -1590,6 +1843,25 @@ void Shortcuts::Poll()
                 Config::WriteFloat("FuelSave", "StintMinutes", v);
                 break;
             }
+            case kKnobRequiredStops:
+            {
+                int v = g_fuelSaveConfig.requiredStops + adjSteps;
+                if (v < 0) v = 0;
+                if (v > 9) v = 9;
+                g_fuelSaveConfig.requiredStops = v;
+                char buf[8];
+                sprintf_s(buf, "%d", v);
+                Config::WriteString("FuelSave", "RequiredStops", buf);
+                break;
+            }
+            case kKnobFuelBox:
+                // Two layouts, so any odd number of clicks flips it.
+                if (adjSteps % 2 != 0)
+                {
+                    g_fuelSaveConfig.boxMode = g_fuelSaveConfig.boxMode == 0 ? 1 : 0;
+                    Config::WriteString("FuelSave", "FuelBoxMode", g_fuelSaveConfig.boxMode == 0 ? "0" : "1");
+                }
+                break;
             case kKnobTyreWear:
             {
                 float v = floorf(g_tyreSaveConfig.targetWearPercent + 0.5f) + static_cast<float>(adjSteps);
@@ -1610,10 +1882,16 @@ void Shortcuts::Poll()
                 double v;
                 if (gs.pitLaneLimitKmh > 0.0)
                     v = floor(gs.pitLaneLimitKmh / div + 0.5) + adjSteps;
-                else if (gs.learnedPitLimitKmh > 0.0)
-                    v = floor(gs.learnedPitLimitKmh / div + 0.5);
+                else if (adjSteps < 0)
+                    break;   // off: only a click up turns it on (review F414)
                 else
-                    v = g_gearDisplayConfig.speedUnitsKmh ? 60.0 : 40.0;
+                {
+                    // From the learned limit (else 60 km/h / 40 mph), never below the
+                    // 20 cut-off, so a low learned limit (30 km/h = 19 mph) can be set.
+                    const double start = gs.learnedPitLimitKmh > 0.0 ? floor(gs.learnedPitLimitKmh / div + 0.5)
+                                       : (g_gearDisplayConfig.speedUnitsKmh ? 60.0 : 40.0);
+                    v = (std::max)(start, 20.0) + (adjSteps - 1);
+                }
                 if (v > 250.0) v = 250.0;
                 g_gearDisplay.SetPitLaneLimit(v < 20.0 ? 0.0 : v * div);
                 break;
@@ -1630,8 +1908,16 @@ void Shortcuts::Poll()
             case kKnobHeadlights:
                 // A toggle: one press per turn, whichever way and however
                 // many clicks the turn was.
-                QueueKeyPresses(kKeyHeadlights, 1);
+            {
+                // A turn's clicks reach Poll over several frames, so "one per turn"
+                // means: no further press until the knob has rested 0.5 s (review F205).
+                static ULONGLONG s_lightsMs = 0;
+                const ULONGLONG lightsNow = GetTickCount64();
+                if (lightsNow - s_lightsMs >= 500)
+                    QueueKeyPresses(kKeyHeadlights, 1);
+                s_lightsMs = lightsNow;
                 break;
+            }
             default:
                 break;
             }
@@ -1666,7 +1952,17 @@ void Shortcuts::Shutdown()
     if (!g_joyThread)
         return;
     g_joyStop.store(true);
-    WaitForSingleObject(g_joyThread, 1000);
+    if (WaitForSingleObject(g_joyThread, 1000) != WAIT_OBJECT_0)
+    {
+        // Still running (stuck in a device scan?): keep this DLL loaded so
+        // its code is not unmapped under it, and leave g_joyThread set so
+        // nothing starts the render-thread fallback (review F234).
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(&JoyThreadProc), &self);
+        Log::Write("Shortcuts: input thread did not stop within 1 s -- DLL pinned");
+        return;
+    }
     CloseHandle(g_joyThread);
     g_joyThread = nullptr;
 }
@@ -1695,6 +1991,11 @@ bool Shortcuts::OverlayEnabled()
     if (!g_shortcutConfig.enabled)
         return true;
     return g_shortcutConfig.showOverlay;
+}
+
+bool Shortcuts::MessageShowing()
+{
+    return PopupAlpha() > 0.0f;
 }
 
 void Shortcuts::ShowMessage(const char* text, double holdSeconds)
@@ -1741,6 +2042,10 @@ bool Shortcuts::Visible(Element e)
 
 void Shortcuts::ResetHint()
 {
+    // New session: the car starts from its own setup, so the "+N steps"
+    // counts start again (review F191/F203/F213).
+    for (int i = 0; i < kKeyCount; ++i)
+        g_keyNetSteps[i].store(0);
     g_hintShownThisSession = false;
     g_wasRealtime = false;
     g_realtimeSince.QuadPart = 0;
@@ -1763,6 +2068,10 @@ void Shortcuts::NoteRealtime(bool inRealtime)
     const double stableSeconds = static_cast<double>(now.QuadPart - g_realtimeSince.QuadPart)
                                / static_cast<double>(freq.QuadPart);
     if (stableSeconds < 2.0)
+        return;
+    // Not over another message (a car-layout notice, a save warning): tried
+    // again on a later frame instead (review F381).
+    if (PopupAlpha() > 0.0f && g_popup != Popup::Hint)
         return;
 
     char listKey[16], layoutKey[16];
@@ -1798,6 +2107,9 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
     // dragged/resized from then on (see Layout.h).
     if (g_listOpen)
     {
+        // Each temporary box on its own layer, so a later box's panel covers
+        // an earlier box's text (review F148).
+        renderer.BeginTopLayer();
         const float listScale = uiScale * cfg.listScale;
         // Text size preset (S / M / L boxes at the top): small is the compact
         // size of 2026-11-22, medium the size before it, large one more step
@@ -1824,7 +2136,9 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
         int rowElementIndex[kMaxLines];   // -1 = not a toggleable element row
         bool rowIsInfo[kMaxLines];        // dimmer, smaller -- not a hotkey at all
         int rowCustom[kMaxLines];         // -1, or a menu-setting row id (see addSettingRow)
-        for (int i = 0; i < kMaxLines; ++i) rowCustom[i] = -1;
+        int rowGroup[kMaxLines];          // -1, or index into kGroupName (heading + its rows)
+        int rowKind[kMaxLines];           // -1, or a ListKind (entry rows in a group)
+        for (int i = 0; i < kMaxLines; ++i) { rowCustom[i] = -1; rowGroup[i] = -1; rowKind[i] = -1; }
         int n = 0;
         float widest = renderer.MeasureText("Overlay shortcuts", titlePx) + titlePx * 1.5f + sizeBoxesW;
         // The key text varies in width ("1" vs "Ctrl+Shift+F1"), so the
@@ -1842,7 +2156,7 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
         {
             if (n >= kMaxLines)
                 return;
-            strcpy_s(lines[n], text);
+            strncpy_s(lines[n], text, _TRUNCATE);  // a 3-digit button made the wheel row 96+ chars (review F208)
             rowElementIndex[n] = -1;
             rowIsInfo[n] = true;
             const float w = renderer.MeasureText(text, infoPx);
@@ -1937,25 +2251,35 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
 
         // Every panel and on/off option, in groups (kListOrder, shared with
         // the centre rotary).
+        int curGroup = -1;
         for (int code : kListOrder)
         {
             if (code == kCloseEntry) continue;   // rotary only
-            if (code < 0) { addInfo(kGroupName[-1 - code]); continue; }
-            if (code < 1000) { addElement(code); continue; }
-            const int id = code - 1000;
-            char line[80];
-            if (code == kResetTowerCode) sprintf_s(line, ">> %s", ListEntryLabel(code));
-            else sprintf_s(line, "%s%s", ListEntryLabel(code),
-                           ListEntryOn(code) ? "" : (code == kUpdateCheckCode ? "   (off)" : "   (hidden)"));
-            addSettingRow(id, line);
+            const int before = n;
+            if (code < 0) { curGroup = -1 - code; addInfo(kGroupName[curGroup]); }
+            else if (code < 1000) addElement(code);
+            else
+            {
+                const int id = code - 1000;
+                char line[80];
+                if (code == kResetTowerCode) sprintf_s(line, ">> %s", ListEntryLabel(code));
+                else sprintf_s(line, "%s%s", ListEntryLabel(code),
+                               ListEntryOn(code) ? "" : (code == kUpdateCheckCode ? "   (off)" : "   (hidden)"));
+                addSettingRow(id, line);
+            }
+            // Tag the row(s) just added with their group and, for entries,
+            // what they show (icon, screen-map box).
+            for (int r = before; r < n; ++r)
+            {
+                rowGroup[r] = curGroup;
+                rowKind[r] = code < 0 ? -1 : ListKindFor(code);
+            }
         }
         // How to drive the list without the mouse.
         addInfo("Rotaries: Home/End on/off list, Insert/Delete left setting, PgUp/PgDn right setting");
         {
             const ShortcutConfig& w = g_shortcutConfig;
-            if (w.centreKnobPrevButton > 0 || w.centreKnobNextButton > 0 || w.elementToggleButton > 0
-                || w.leftKnobPrevButton > 0 || w.leftKnobNextButton > 0 || w.rightKnobPrevButton > 0 || w.rightKnobNextButton > 0
-                || w.leftSettingUpButton > 0 || w.leftSettingDownButton > 0 || w.rightSettingUpButton > 0 || w.rightSettingDownButton > 0)
+            if (AnyWheelButtonBound(w))
             {
                 char knobLabel[160];
                 sprintf_s(knobLabel, "Wheel: btn %d/%d on/off item, %d toggles; left %d/%d setting, %d/%d up/down; right %d/%d, %d/%d",
@@ -1965,7 +2289,7 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
                 addInfo(knobLabel);
             }
             else
-                addInfo("Wheel: no rotary buttons set ([Shortcuts] *KnobPrev/NextButton etc. in the INI)");
+                addInfo(kNoWheelHint);
         }
         char lsLine[64];
 
@@ -2043,6 +2367,9 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
             addSettingRow(17, fontLine);
             sprintf_s(fontLine, "Text weight: %s  (click to change)", Renderer::kWeightNames[g_textFontConfig.weight]);
             addSettingRow(18, fontLine);
+            // id 40: 19..29 are taken by the extra on/off rows in this tree.
+            sprintf_s(fontLine, "  [%c] Box rate + cost labels (Hz, ms per frame)", g_dllCostConfig.showBoxStats ? 'x' : ' ');
+            addSettingRow(40, fontLine);
         }
         char versionLine[32];
         sprintf_s(versionLine, "ver. %s", RF2RO_VERSION);
@@ -2058,7 +2385,11 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
         // Now that widestKeyPx is final, resolve how wide each hotkey row
         // actually is (key column + gap + its own label) and fold that into
         // the panel width alongside the info rows measured earlier.
-        const float labelColumnX = widestKeyPx + keyLabelGapPx;
+        // A square icon column between the key and the label (group rows
+        // draw an icon there; other hotkey rows just leave it empty).
+        const float iconColW = textPx * 1.3f;
+        const float iconColX = widestKeyPx + keyLabelGapPx;
+        const float labelColumnX = iconColX + iconColW;
         for (int i = 0; i < totalLines; ++i)
         {
             if (rowIsInfo[i]) continue;
@@ -2079,7 +2410,7 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
         float cumulativeY = 0.0f;
         for (int i = 0; i < totalLines; ++i)
         {
-            rowStep[i] = rowIsInfo[i] ? infoLineStep : lineStep;
+            rowStep[i] = (rowIsInfo[i] && rowGroup[i] < 0) ? infoLineStep : lineStep;   // group headings: full pitch
             if (i == carsSliderLabelRow || i == mapRotLabelRow || i == mapSectorsLabelRow
                 || i == coverGreyRow || i == coverAlphaRow || i == beepDropLabelRow)
                 rowStep[i] += carsSliderBarExtraPx;
@@ -2168,6 +2499,10 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
         const bool clickNow = haveCursor && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
         bool clickEdge = clickNow && !g_listClickDown;
         g_listClickDown = clickNow;
+        // In layout mode a press on the list starts Layout's drag of it, so
+        // it is not also a row, box or slider click (review F209).
+        if (Layout::Active())
+            clickEdge = false;
 
         // S / M / L text size boxes.
         if (clickEdge && fabsf(cursorY - sizeBoxCY) <= sizeBoxPx * 0.5f)
@@ -2242,8 +2577,10 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
                     const float newW = (boxR - boxL) * k, newH = (boxB - boxT) * k;
                     const float newBoxL = g_listSideX > 0.0f ? g_listAnchorX - newW : g_listAnchorX;
                     const float newBoxT = g_listSideY > 0.0f ? g_listAnchorY - newH : g_listAnchorY;
-                    g_shortcutConfig.listPosXFraction = (newBoxL + padding * k) / screenWidth;
-                    g_shortcutConfig.listPosYFraction = (newBoxT + padding * k) / screenHeight;
+                    // Kept in 0..0.98 like a move: a negative value means
+                    // "auto position" and would snap the list away (review F210).
+                    g_shortcutConfig.listPosXFraction = (std::min)(0.98f, (std::max)(0.0f, (newBoxL + padding * k) / screenWidth));
+                    g_shortcutConfig.listPosYFraction = (std::min)(0.98f, (std::max)(0.0f, (newBoxT + padding * k) / screenHeight));
                     g_shortcutConfig.listScale = newScale;
                 }
                 else
@@ -2288,8 +2625,10 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
             };
 
             const float thumbTop = thumbTopFor(rowY[g_listFirstRow]);
+            // Starts a little left of the drawn bar, not at the sliders' right
+            // end, so a slider knob at its maximum is not under it (review F211).
             const bool overBar = haveCursor
-                && cursorX >= barX - scrollBarStripW * 0.5f - padding * 0.5f
+                && cursorX >= barX - barHalfW * 2.0f
                 && cursorX <= barX + scrollBarStripW * 0.5f + padding * 0.5f
                 && cursorY >= trackTop && cursorY <= trackTop + trackH;
             const bool overThumb = overBar && cursorY >= thumbTop && cursorY <= thumbTop + thumbH;
@@ -2304,6 +2643,8 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
                 const float target = rowY[g_listFirstRow] + (cursorY < thumbTop ? -page : page);
                 g_listFirstRow = rowForOffset(target < 0.0f ? 0.0f : (target > maxOffset ? maxOffset : target));
             }
+            if (overBar)
+                clickEdge = false;   // used by the bar: not also a row click
             if (!clickNow)
                 g_listScrollDragging = false;
             if (g_listScrollDragging && haveCursor && trackH > thumbH)
@@ -2371,6 +2712,14 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
                                        widest * 0.5f + padding * 0.5f, rowStep[i] * 0.5f, 0.0f,
                                        1.0f, 1.0f, 1.0f, 0.16f);
             }
+            // Group stripe at the panel's left edge, one segment per row so
+            // it follows scrolling; contiguous because the segments use the
+            // same centre/height as the hover band.
+            const int grp = rowGroup[i];
+            const float* gc = grp >= 0 ? kListGroupCol[grp] : nullptr;
+            if (gc)
+                renderer.AddFilledRect(leftX - padding * 0.6f, y + textPx * 0.5f, (std::max)(1.0f, 2.5f * listScale),
+                                       rowStep[i] * 0.5f, 0.0f, gc[0], gc[1], gc[2], 0.9f);
             // Hidden elements are dimmed; info lines are dimmer still (and
             // smaller, since they are context, not something to press); the
             // action lines are always full brightness.
@@ -2379,7 +2728,14 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
             float sizePx = textPx;
             if (rowIsInfo[i]) { shade = 0.62f; sizePx = infoPx; }
             else if (elemIdx >= 0 && !g_entries[elemIdx].visible) shade = 0.55f;
-            if (rowIsInfo[i])
+            if (rowIsInfo[i] && gc)
+            {
+                // Group heading: full text size in the group colour, drawn
+                // twice a pixel apart for a bolder look.
+                renderer.AddText(leftX, y, lines[i], textPx, gc[0], gc[1], gc[2], 1.0f);
+                renderer.AddText(leftX + (std::max)(1.0f, textPx * 0.04f), y, lines[i], textPx, gc[0], gc[1], gc[2], 1.0f);
+            }
+            else if (rowIsInfo[i])
             {
                 renderer.AddText(leftX, y, lines[i], sizePx, shade, shade, shade, 1.0f);
 
@@ -2651,10 +3007,65 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
                 // column, the label starting at the same x on every row --
                 // rather than one string per row, whose label x drifted with
                 // however wide that row's own key name happened to be.
-                renderer.AddText(leftX, y, keyPart[i], sizePx, shade, shade, shade, 1.0f);
+                // Group rows: key text and icon in the group colour, times the
+                // same on/hidden shade as the label, so dim still means hidden.
+                if (gc)
+                {
+                    renderer.AddText(leftX, y, keyPart[i], sizePx, gc[0] * shade, gc[1] * shade, gc[2] * shade, 1.0f);
+                    DrawListIcon(renderer, rowKind[i], leftX + iconColX + iconColW * 0.4f, y + textPx * 0.5f, textPx * 0.4f,
+                                 gc[0] * shade, gc[1] * shade, gc[2] * shade, 1.0f);
+                }
+                else
+                    renderer.AddText(leftX, y, keyPart[i], sizePx, shade, shade, shade, 1.0f);
                 renderer.AddText(leftX + labelColumnX, y, labelPart[i], sizePx, shade, shade, shade, 1.0f);
             }
             y += rowStep[i];
+        }
+
+        // Screen map: while an entry row is hovered, a miniature of the
+        // screen in a corner of the list (the one away from the cursor) with
+        // that row's panel box filled in its group colour and every other
+        // box Layout knows as a faint outline. Layout remembers boxes it has
+        // seen this session, so a panel that is hidden now still shows where
+        // it was (dimmer); one never seen says so.
+        if (hoveredRow >= 0 && rowKind[hoveredRow] >= 0 && rowGroup[hoveredRow] >= 0 && screenWidth > 0)
+        {
+            const float* gc = kListGroupCol[rowGroup[hoveredRow]];
+            const float mapW = (widest + padding * 2.0f) * 0.22f;
+            const float mapH = mapW * static_cast<float>(screenHeight) / screenWidth;
+            const float mapR = leftX + widest;
+            const bool cursorHigh = cursorY < rowsTopY + shownRowsH * 0.5f;
+            const float mapT = cursorHigh ? topY + blockH - mapH : rowsTopY;
+            const float mcx = mapR - mapW * 0.5f, mcy = mapT + mapH * 0.5f;
+            const float s = mapW / screenWidth;
+            const float thin = (std::max)(1.0f, 1.5f * listScale);
+            renderer.AddFilledRect(mcx, mcy, mapW * 0.5f, mapH * 0.5f, 0.0f, 0.07f, 0.07f, 0.09f, 0.97f);
+            renderer.AddRectOutline(mcx, mcy, mapW * 0.5f, mapH * 0.5f, thin, 0.6f, 0.6f, 0.65f, 0.9f);
+            bool prefix = false;
+            const char* want = ListKindBox(rowKind[hoveredRow], prefix);
+            const size_t wantLen = want ? strlen(want) : 0;
+            bool found = false, foundSeen = false;
+            for (int pass = 0; pass < 2; ++pass)   // others first, so the highlight is on top
+                for (int k = 0; k < Layout::RegisteredCount(); ++k)
+                {
+                    const char* nm = nullptr; float bx, by, bhw, bhh; bool seen;
+                    if (!Layout::GetRegistered(k, &nm, &bx, &by, &bhw, &bhh, &seen) || !nm) continue;
+                    const bool hit = want && (prefix ? strncmp(nm, want, wantLen) == 0 : strcmp(nm, want) == 0);
+                    const float x = mapR - mapW + bx * s, yy = mapT + by * s;
+                    const float hw = (std::max)(1.0f, bhw * s), hh = (std::max)(1.0f, bhh * s);
+                    if (pass == 0 && !hit)
+                        renderer.AddRectOutline(x, yy, hw, hh, 1.0f, 0.7f, 0.7f, 0.75f, seen ? 0.35f : 0.15f);
+                    else if (pass == 1 && hit)
+                    {
+                        found = true;
+                        foundSeen = foundSeen || seen;
+                        renderer.AddFilledRect(x, yy, hw, hh, 0.0f, gc[0], gc[1], gc[2], seen ? 0.55f : 0.25f);
+                        renderer.AddRectOutline(x, yy, hw, hh, thin, gc[0], gc[1], gc[2], seen ? 1.0f : 0.6f);
+                    }
+                }
+            if (!found || !foundSeen)
+                renderer.AddText(mcx, mapT + mapH - infoPx * 1.15f, found ? "last position (hidden)" : "not on screen",
+                                 infoPx * 0.8f, 0.85f, 0.85f, 0.85f, 1.0f, Renderer::HAlign::Center);
         }
 
         if (clickEdge && hoveredRow >= 0 && rowCustom[hoveredRow] >= 0)
@@ -2693,6 +3104,10 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
                 Config::WriteString("Text", "FontWeight", Renderer::kWeightNames[g_textFontConfig.weight]);
                 renderer.SetFont(g_textFontConfig.font, g_textFontConfig.weight);
                 break;
+            case 40:
+                g_dllCostConfig.showBoxStats = !g_dllCostConfig.showBoxStats;
+                Config::WriteBool("DllCost", "ShowBoxStats", g_dllCostConfig.showBoxStats);
+                break;
             case 19: case 20: case 21: case 22: case 23: case 24: case 25: case 27: case 28: case 29:
                 ToggleListEntry(1000 + rowCustom[hoveredRow]);
                 break;
@@ -2725,6 +3140,7 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
     const float alpha = PopupAlpha();
     if (alpha > 0.0f)
     {
+        renderer.BeginTopLayer(); // review F148
         const float msgScale = uiScale * cfg.messageScale;
         const float textPx = (g_popup == Popup::Warning ? 38.0f : 44.0f) * msgScale;
         const float padding = 20.0f * msgScale;
@@ -2760,8 +3176,10 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
     // driving. While a rotary is in use, its 10-line list shows at the side
     // of the screen: the left knob's on the left, the right knob's and the
     // on/off list on the right (DrawScrollList: fixed width, numbered).
-    if (cfg.showKnobBox && g_inRealtime.load(std::memory_order_relaxed))
+    // Not with the overlay switched off or shortcuts disabled (review F207).
+    if (cfg.enabled && cfg.showOverlay && cfg.showKnobBox && g_inRealtime.load(std::memory_order_relaxed))
     {
+        renderer.BeginTopLayer(); // review F148
         const float s = uiScale * cfg.knobBoxScale;
         const float textPx = 40.0f * s;
         const float listPx = 34.0f * s;
@@ -2814,16 +3232,44 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
         KnobGroupColour(g_knobSel[1], r, g, b);
         DrawKnobIcon(renderer, g_knobSel[1], centerX + colGap * 0.5f + textPx * 0.5f, centerY, textPx * 0.42f, r, g, b, 1.0f);
         renderer.AddText(centerX + colGap * 0.5f + boxIconW, y, rightText, textPx, r, g, b, 1.0f, Renderer::HAlign::Left);
+        const bool noWheel = !AnyWheelButtonBound(cfg);
+        if (noWheel)
+        {
+            // Just above the box, on a small dark strip like the list captions.
+            const float capPx = textPx * 0.6f;
+            const float capW = renderer.MeasureText(kNoWheelHint, capPx);
+            const float capY = centerY - halfH - capPx * 1.6f;
+            renderer.AddFilledRoundedRect(centerX, capY + capPx * 0.5f, capW * 0.5f + padding, capPx * 0.5f + padding * 0.4f,
+                                          6.0f * s, 0.0f, 0.08f, 0.08f, 0.08f, 0.6f);
+            renderer.AddText(centerX, capY, kNoWheelHint, capPx, 0.85f, 0.85f, 0.85f, 1.0f, Renderer::HAlign::Center);
+        }
 
         // The rotary lists: at the screen's side edges, mid-height -- the
         // left knob's on the left, the right knob's and the centre (on/off)
         // list on the right.
-        const float edgeMargin = screenWidth * 0.012f;
-        const float listCenterY = screenHeight * 0.45f;
+        // Placed and sized from [Shortcuts] Rotary* (layout mode drags /
+        // resizes them; in layout mode both sides are shown so they can be).
+        const float ls = uiScale * cfg.rotaryListScale;
+        const float rlPx = 34.0f * ls;
+        const float leftEdgeX = screenWidth * cfg.rotaryLeftXFraction, leftY = screenHeight * cfg.rotaryLeftYFraction;
+        const float rightEdgeX = screenWidth * cfg.rotaryRightXFraction, rightY = screenHeight * cfg.rotaryRightYFraction;
+        const bool arranging = Layout::Active();
+        float rect[4];
+        auto regList = [&](bool leftSide) {
+            ShortcutConfig& w = g_shortcutConfig;
+            if (leftSide)
+                Layout::Register("Rotary list (left)", "Shortcuts", "RotaryLeftXFraction", "RotaryLeftYFraction",
+                                 &w.rotaryLeftXFraction, &w.rotaryLeftYFraction, rect[0], rect[1], rect[2], rect[3],
+                                 &w.rotaryListScale, "RotaryListScale");
+            else
+                Layout::Register("Rotary list (right)", "Shortcuts", "RotaryRightXFraction", "RotaryRightYFraction",
+                                 &w.rotaryRightXFraction, &w.rotaryRightYFraction, rect[0], rect[1], rect[2], rect[3],
+                                 &w.rotaryListScale, "RotaryListScale");
+        };
         // A line above each list naming the button that acts on it.
         char elemCaption[96], knobCaption[96];
         if (cfg.elementToggleButton > 0)
-            sprintf_s(elemCaption, "Button %d switches on / off", cfg.elementToggleButton);
+            sprintf_s(elemCaption, "Button %d or Enter switches on / off", cfg.elementToggleButton);
         else
             strcpy_s(elemCaption, "No on/off button set ([Shortcuts] ElementToggleButton)");
         {
@@ -2832,14 +3278,19 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
             if (up > 0 && dn > 0) sprintf_s(knobCaption, "Buttons %d / %d change the value", up, dn);
             else knobCaption[0] = '\0';
         }
-        if (elemView > 0.0f)
+        if (noWheel)
+        {
+            strcpy_s(elemCaption, kNoWheelHint);
+            strcpy_s(knobCaption, kNoWheelHint);
+        }
+        if (elemView > 0.0f || arranging)
         {
             // Entries only (headings skipped), in list order.
             int flat[kListOrderCount];
             int count = 0, sel = 0;
             for (int i = 0; i < kListOrderCount; ++i)
                 if (kListOrder[i] >= 0) { if (i == g_elemIndex) sel = count; flat[count++] = kListOrder[i]; }
-            DrawScrollList(renderer, g_elemWin, count, sel, false, screenWidth - edgeMargin, listCenterY, listPx, s, elemView,
+            DrawScrollList(renderer, g_elemWin, count, sel, false, rightEdgeX, rightY, rlPx, ls, arranging ? 1.0f : elemView,
                            [&](int i, char* name, char* val, float& r, float& g, float& b)
                            {
                                const int idx = flat[i];
@@ -2850,13 +3301,14 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
                                strcpy_s(name, 128, ListEntryLabel(idx));
                                strcpy_s(val, 64, on ? "ON" : "OFF");
                                r = on ? 0.45f : 1.0f; g = on ? 1.0f : 0.45f; b = on ? 0.5f : 0.45f;
-                           }, elemCaption);
+                           }, elemCaption, nullptr, rect);
+            regList(false);
         }
-        else if (nb > 0.0f)
+        if ((nb > 0.0f && elemView <= 0.0f) || arranging)
         {
-            const bool leftKnob = g_activeSlot == 0;
+            const bool leftKnob = arranging ? true : g_activeSlot == 0;
             DrawScrollList(renderer, g_knobWin, kKnobSettingCount, g_knobSetting, leftKnob,
-                           leftKnob ? edgeMargin : screenWidth - edgeMargin, listCenterY, listPx, s, nb,
+                           leftKnob ? leftEdgeX : rightEdgeX, leftKnob ? leftY : rightY, rlPx, ls, arranging ? 1.0f : nb,
                            [&](int i, char* name, char* val, float& r, float& g, float& b)
                            {
                                KnobGroupColour(i, r, g, b);
@@ -2869,7 +3321,8 @@ void Shortcuts::Draw(Renderer& renderer, int screenWidth, int screenHeight, HWND
                                }
                                else if (i == g_knobSetting) KnobValue(i, val, 64);
                                else val[0] = '\0';
-                           }, knobCaption, DrawKnobIcon);
+                           }, knobCaption, DrawKnobIcon, rect);
+            regList(leftKnob);
         }
     }
 

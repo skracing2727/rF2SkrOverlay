@@ -37,6 +37,13 @@ private:
 
     int m_lastLegalStatus = -1; // -1 = unknown yet, so the very first sample can't spuriously fire
 
+    // rF2 reports DRS legal everywhere on tracks with no zones (or free-DRS
+    // rules). Legal without a break for this long means "unrestricted": the
+    // flashing sign and the beep are muted until it next goes not-legal
+    // (review F53). No real zone is anywhere near 40 s long.
+    double m_legalSinceET = -1.0;
+    bool m_unrestricted = false;
+
     void PlayBeep();
 };
 

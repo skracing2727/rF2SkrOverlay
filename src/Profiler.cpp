@@ -1,4 +1,5 @@
 #include "Profiler.h"
+#include "RenderThrottle.h"
 #include "Renderer.h"
 #include "Config.h"
 #include "Layout.h"
@@ -11,7 +12,7 @@
 
 namespace
 {
-    const int kMaxSlots = 48;
+    const int kMaxSlots = 64;   // more PROF/DRAWN names than 48 exist (review F347)
     // 1 s snapshots; 11 of them span the 10 s window.
     const int kSnapshots = 11;
 
@@ -128,9 +129,14 @@ namespace
             char line[512]; int len = sprintf_s(line, "Spikes:  worst #%d %.2f ms:", w + 1, g_win.worst[w].ms);
             int order[kMaxSlots]; for (int i = 0; i < n; ++i) order[i] = i;
             std::sort(order, order + n, [&](int a, int b) { return g_win.worst[w].slotMs[a] > g_win.worst[w].slotMs[b]; });
+            if (len < 0) len = 0;
             for (int k = 0; k < n && k < 5 && len < 440; ++k)
                 if (g_win.worst[w].slotMs[order[k]] >= 0.05f)
-                    len += sprintf_s(line + len, sizeof(line) - len, "  %s %.2f", g_names[order[k]], g_win.worst[w].slotMs[order[k]]);
+                {
+                    // A failed format returns -1: skip it rather than step back (review F263).
+                    const int add = sprintf_s(line + len, sizeof(line) - len, "  %s %.2f", g_names[order[k]], g_win.worst[w].slotMs[order[k]]);
+                    if (add > 0) len += add;
+                }
             Log::Write("%s", line);
         }
         int order[kMaxSlots]; for (int i = 0; i < n; ++i) order[i] = i;
@@ -245,6 +251,15 @@ int Profiler::Slot(const char* name)
     int slot = -1;
     for (int i = 0; i < n; ++i)
         if (strcmp(g_names[i], name) == 0) { slot = i; break; }
+    if (slot < 0 && n >= kMaxSlots)
+    {
+        static bool s_loggedFull = false;   // under g_registerLock
+        if (!s_loggedFull)
+        {
+            s_loggedFull = true;
+            Log::Write("Profiler: no free slot for '%s' (kMaxSlots %d) -- not timed", name, kMaxSlots);
+        }
+    }
     if (slot < 0 && n < kMaxSlots)
     {
         g_names[n] = name; // string literals only (see PROF)
@@ -312,8 +327,24 @@ void Profiler::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     const long long last = g_snapCount > 0 ? g_snaps[(g_snapNext + kSnapshots - 1) % kSnapshots].qpc : 0;
+    // Snapshots only advance while the panel is drawn: after a hidden
+    // stretch, start the window afresh so it does not span the hidden time
+    // (review F185).
+    if (g_snapCount > 0 && now.QuadPart - last >= 2 * g_freq.QuadPart)
+    {
+        g_snapCount = 0;
+        g_snapNext = 0;
+        g_shown.valid = false;
+    }
     if (g_snapCount == 0 || now.QuadPart - last >= g_freq.QuadPart)
         TakeSnapshot(now.QuadPart);
+
+    // 2 Hz rebuild, replayed in between (2026-11-24 throttle pass); the
+    // figures themselves change once a second.
+    static RenderThrottle s_throttle(0.5);
+    if (!Layout::Active() && s_throttle.TryReplay(renderer))
+        return;
+    RenderThrottle::Capture throttleCapture(s_throttle, renderer);
 
     const float uiScale = static_cast<float>(screenHeight) / 2160.0f * cfg.scale;
     const float textPx = cfg.textHeightPx * uiScale;

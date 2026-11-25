@@ -74,6 +74,41 @@ float FuelTyrePanel::BottomEdgeY(int screenWidth, int screenHeight)
     return screenHeight * g_fuelTyrePanelConfig.fuelPosYFraction;
 }
 
+namespace
+{
+    // Review F157: a box still on the -1 "stack under the box above"
+    // sentinel is given its drawn top-left when a drag or resize starts, so
+    // Layout's grab offset starts from where it really is. One slot (and
+    // one plain-function hook) per box; render thread only.
+    struct ResolvedPos { float* x = nullptr; float* y = nullptr; float fx = 0.0f, fy = 0.0f; };
+    ResolvedPos s_resolvedPos[4];
+    template <int N> void ResolveSentinel()
+    {
+        ResolvedPos& r = s_resolvedPos[N];
+        if (r.x && r.y && (*r.x < 0.0f || *r.y < 0.0f))
+        {
+            *r.x = r.fx;
+            *r.y = r.fy;
+        }
+    }
+    void (*const kResolveHooks[4])() = { ResolveSentinel<0>, ResolveSentinel<1>, ResolveSentinel<2>, ResolveSentinel<3> };
+
+    // The hook for this box's position, remembering where it is drawn now.
+    void (*RememberDrawnPos(float* x, float* y, float fx, float fy))()
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            ResolvedPos& r = s_resolvedPos[i];
+            if (r.x == x || r.x == nullptr)
+            {
+                r.x = x; r.y = y; r.fx = fx; r.fy = fy;
+                return kResolveHooks[i];
+            }
+        }
+        return nullptr;
+    }
+}
+
 bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
 {
     // Low tier (~5Hz): fuel/tyre wear change over minutes, not frames, so
@@ -234,7 +269,9 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
             // Only a TIMED race has a race-minutes figure to compare
             // against; in a lap race the laps row below carries the verdict
             // instead and this one stays plain.
-            if (fuel.isTimedRace && minsFromFuel >= 0.0 && fuel.raceMinutesLeft >= 0.0)
+            // > 0: after 0:00 raceMinutesLeft is 0 and the final lap's verdict
+            // belongs to the laps row below, not a "0 minutes needed" one.
+            if (fuel.isTimedRace && minsFromFuel >= 0.0 && fuel.raceMinutesLeft > 0.0)
             {
                 time.status = fuelVerdict(minsFromFuel, fuel.raceMinutesLeft, cfg.fuelMarginMinutes);
                 if (time.status == RowStatus::Marginal)
@@ -254,8 +291,11 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                 // A lap race is compared against its exact remaining laps
                 // with a one-lap cushion; a timed race against the same
                 // estimate the rest of the panel uses.
-                const double needLaps = (fuel.isLapRace && fuel.lapsLeft >= 0.0)
-                                      ? fuel.lapsLeft : fuel.raceLapsRemainingEstimate;
+                // Review F10: whole laps left (counting the lap you are on as
+                // a full one) against fuel that falls through the lap made it
+                // flip to SHORT every lap; use the fractional estimate.
+                const double needLaps = (fuel.raceLapsRemainingEstimate >= 0.0)
+                                      ? fuel.raceLapsRemainingEstimate : fuel.lapsLeft;
                 lapsLeft.status = fuelVerdict(lapsFromFuel, needLaps, cfg.fuelMarginLaps);
                 if (lapsLeft.status == RowStatus::Marginal)
                     strcat_s(lapsLeft.value, "  marginal");
@@ -388,7 +428,16 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         // even when the OTHER three are fine.
         int worstEndOfRaceWheel = -1;
         double worstEndOfRacePercent = 0.0;
-        if (showRaceEndProjection && fuel.valid && fuel.raceLapsRemainingEstimate >= 0.0)
+        // Review F18: if the fuel does not reach the flag there is a stop
+        // (and so fresh tyres) first: project to the end of this stint.
+        double projLaps = fuel.raceLapsRemainingEstimate;
+        bool toStintEnd = false;
+        if (fuel.valid && fuel.fuelPerLap > 0.01 && projLaps >= 0.0)
+        {
+            const double lapsFromFuelHere = fuel.fuelLoad / fuel.fuelPerLap;
+            if (lapsFromFuelHere < projLaps) { projLaps = lapsFromFuelHere; toStintEnd = true; }
+        }
+        if (showRaceEndProjection && fuel.valid && projLaps >= 0.0)
         {
             for (int w = 0; w < 4; ++w)
             {
@@ -396,7 +445,7 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                     continue;
 
                 double projectedPercent = tyres.wheel[w].remainingPercent
-                                         * (1.0 - fuel.raceLapsRemainingEstimate / tyres.wheel[w].lapsRemaining);
+                                         * (1.0 - projLaps / tyres.wheel[w].lapsRemaining);
                 if (projectedPercent < 0.0) projectedPercent = 0.0;
 
                 if (projectedPercent < 20.0) wheelEndOfRaceTier[w] = 2;
@@ -416,7 +465,7 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         // The worst tyre's OWN corner + its projected % remaining at the end
         // of the race -- the summary row above only conveys a colour tier,
         // not the actual number, or which of the four tyres it's about.
-        strcpy_s(tyreEndRow.label, "Tyre @ Race End");
+        strcpy_s(tyreEndRow.label, toStintEnd ? "Tyre @ Stint End" : "Tyre @ Race End");
         if (worstEndOfRaceWheel >= 0)
             sprintf_s(tyreEndRow.value, "%s %.0f%%", kWheelLabel[worstEndOfRaceWheel], worstEndOfRacePercent);
         else
@@ -430,10 +479,10 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
             if (tyreEndOfRaceTier > s_lastTyreTier)
             {
                 char msg[128];
-                sprintf_s(msg, "TYRE WEAR %s -- %s ~%.0f%% at race end",
+                sprintf_s(msg, "TYRE WEAR %s -- %s ~%.0f%% at %s end",
                           tyreEndOfRaceTier == 2 ? "CRITICAL" : "LOW",
                           worstEndOfRaceWheel >= 0 ? kWheelLabel[worstEndOfRaceWheel] : "?",
-                          worstEndOfRacePercent);
+                          worstEndOfRacePercent, toStintEnd ? "stint" : "race");
                 Shortcuts::ShowMessage(msg, 3.0);
             }
             s_lastTyreTier = tyreEndOfRaceTier;
@@ -578,10 +627,12 @@ bool FuelTyrePanel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         const float centerX = boxLeftX + halfW;
         const float centerY = boxTopY + halfH;
 
+        void (*onDragStart)() = RememberDrawnPos(posXFraction, posYFraction,
+                                                 boxLeftX / screenWidth, boxTopY / screenHeight);
         Layout::Register(layoutName, iniSection, "PosXFraction", "PosYFraction",
                          posXFraction, posYFraction,
                          centerX, centerY, halfW, halfH,
-                         scale, "Scale");
+                         scale, "Scale", onDragStart);
 
         if (cfg.bgEnabled)
         {

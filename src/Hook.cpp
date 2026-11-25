@@ -3,6 +3,7 @@
 #include "FrameLatency.h"
 #include "FrameRate.h"
 #include "PerfStats.h"
+#include "Benchmark.h"
 #include "Log.h"
 #include <d3d11.h>
 #include <cstdio>
@@ -23,6 +24,12 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSwapChain, UINT 
     // shown. Latency is timed around the real call itself, so the number
     // drawn this frame reflects the last fully-measured present, one or two
     // frames behind -- normal for this kind of live readout.
+    // A test present shows nothing: drawing into it would blend the HUD a
+    // second time onto the next real frame, and counting it would inflate the
+    // FPS (review F337).
+    if (Flags & DXGI_PRESENT_TEST)
+        return s_originalPresent(pSwapChain, SyncInterval, Flags);
+
     Overlay::OnPresent(pSwapChain);
 
     // Frame stats follow the game view's swapchain only (decided after
@@ -45,6 +52,8 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSwapChain, UINT 
         // Right after Present, same as FrameLatency above -- CPU thread time
         // wants to bracket the real Present() call itself.
         PerfStats::OnFrame();
+        // After OnFrame, so this frame's CPU time is ready to sample.
+        Benchmark::OnFrameEnd();
     }
 
     return hr;

@@ -3,8 +3,10 @@
 #include "RealtimeState.h"
 #include <Windows.h>
 #include <cstdio>
+#include <share.h>
 #include <cstdarg>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <vector>
 
@@ -12,6 +14,9 @@ namespace
 {
     char g_logPath[MAX_PATH] = {};
     CRITICAL_SECTION g_lock;
+    // Serialises the file writers (Persist thread, render-hook crash handler)
+    // so their chunks never interleave and a requeue keeps the order.
+    CRITICAL_SECTION g_writeLock;
     bool g_ready = false;
 
     // The buffer is a list of fixed-size chunks rather than one growing
@@ -52,17 +57,20 @@ namespace
         c.used += len;
     }
 
-    void WriteChunks(const std::vector<std::unique_ptr<Chunk>>& chunks)
+    // Shared open (_SH_DENYNO), not fopen_s's exclusive one: a log viewer
+    // tailing the file made every flush fail and the buffered text was
+    // thrown away (review F280). False if the file could not be opened.
+    bool WriteChunks(const std::vector<std::unique_ptr<Chunk>>& chunks)
     {
         if (chunks.empty())
-            return;
-        FILE* f = nullptr;
-        if (fopen_s(&f, g_logPath, "a") == 0 && f)
-        {
-            for (const std::unique_ptr<Chunk>& c : chunks)
-                fwrite(c->data, 1, c->used, f);
-            fclose(f);
-        }
+            return true;
+        FILE* f = _fsopen(g_logPath, "a", _SH_DENYNO);
+        if (!f)
+            return false;
+        for (const std::unique_ptr<Chunk>& c : chunks)
+            fwrite(c->data, 1, c->used, f);
+        fclose(f);
+        return true;
     }
 }
 
@@ -72,6 +80,7 @@ void Log::Init()
         return;
 
     InitializeCriticalSection(&g_lock);
+    InitializeCriticalSection(&g_writeLock);
 
     // Log beside the game exe (Bin64), which is always writable enough for a text file.
     GetModuleFileNameA(nullptr, g_logPath, MAX_PATH);
@@ -146,12 +155,24 @@ void Log::FlushBuffered()
     // Swap the chunk list out under the lock (a few pointers), write with
     // the lock released, so a thread logging meanwhile never waits for the
     // disk. Only the Persist thread and the render hook's crash handler call
-    // this; two writers at once could interleave whole chunks in the file,
-    // never corrupt one.
+    // this; g_writeLock keeps the two from writing at once.
+    EnterCriticalSection(&g_writeLock);
     std::vector<std::unique_ptr<Chunk>> toWrite;
     EnterCriticalSection(&g_lock);
     toWrite.swap(g_chunks);
     LeaveCriticalSection(&g_lock);
 
-    WriteChunks(toWrite);
+    if (!WriteChunks(toWrite))
+    {
+        // Could not open the file: put the text back in front of anything
+        // logged meanwhile, so the next pass tries again (oldest dropped
+        // first if that goes over the cap).
+        EnterCriticalSection(&g_lock);
+        g_chunks.insert(g_chunks.begin(), std::make_move_iterator(toWrite.begin()),
+                        std::make_move_iterator(toWrite.end()));
+        if (g_chunks.size() > kMaxChunks)
+            g_chunks.erase(g_chunks.begin(), g_chunks.begin() + (g_chunks.size() - kMaxChunks));
+        LeaveCriticalSection(&g_lock);
+    }
+    LeaveCriticalSection(&g_writeLock);
 }

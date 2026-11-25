@@ -6,6 +6,14 @@
 #include "Log.h"
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
+
+namespace
+{
+    // Side offset (m) needed to light a bar, and to keep one lit (review F134).
+    const double kSideOnM = 0.9;
+    const double kSideHoldM = 0.5;
+}
 
 ProximityHue g_proximityHue;
 
@@ -144,6 +152,23 @@ void ProximityHue::Draw(Renderer& renderer, int screenWidth, int screenHeight, H
         return;
     }
 
+    // Draw is skipped outside realtime, so the slots freeze as they were.
+    // After a gap (monitor, garage, session change) drop them rather than
+    // fading a stale bar out with no car near (review F371).
+    if (m_freq.QuadPart == 0)
+        QueryPerformanceFrequency(&m_freq);
+    {
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        if (m_lastDrawTime.QuadPart != 0 && m_freq.QuadPart != 0 &&
+            static_cast<double>(t.QuadPart - m_lastDrawTime.QuadPart) / static_cast<double>(m_freq.QuadPart) > 0.5)
+        {
+            for (int k = 0; k < kMaxContributions; ++k)
+                m_contributions[k] = Contribution();
+            m_lastDrawTime.QuadPart = 0;
+        }
+    }
+
     const double cosH = cos(-playerHeading);
     const double sinH = sin(-playerHeading);
 
@@ -152,12 +177,34 @@ void ProximityHue::Draw(Renderer& renderer, int screenWidth, int screenHeight, H
     // snapshot entirely).
     bool stillActive[kMaxContributions] = {};
 
+    // In the garage or anywhere in the pit lane: nothing is "alongside" in a
+    // way that needs a warning (review F129; was only when stopped in the
+    // box, now the whole pit lane like CrewChief's spotter -- CrewChief
+    // review 2026-11-24). Existing bars fade out.
+    const bool playerParked = player->inGarage || player->inPits;
+
+    // Now, in seconds, for the short hold before a side is cleared.
+    double nowS = 0.0;
+    {
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        if (m_freq.QuadPart != 0)
+            nowS = static_cast<double>(t.QuadPart) / static_cast<double>(m_freq.QuadPart);
+    }
+
     // Deliberately mirrors DrawRadar()'s per-car pipeline step for step. If
     // that one's range/fade/danger rules change, change these to match --
     // the whole point of this widget is that it agrees with the red blips.
-    for (int i = 0; i < count; ++i)
+    for (int i = 0; i < count && !playerParked; ++i)
     {
         if (cars[i].isPlayer)
+            continue;
+        // Garage cars, and pit-lane cars not moving with you, are not traffic (review F129).
+        // A negative lap distance means the game has no real position for the
+        // car yet (CrewChief review 2026-11-24).
+        if (cars[i].inGarage || cars[i].lapDist < 0.0)
+            continue;
+        if (cars[i].inPits && fabsf(cars[i].speedMps - player->speedMps) >= 8.0f)
             continue;
 
         const double dx = cars[i].x - player->x;
@@ -191,15 +238,52 @@ void ProximityHue::Draw(Renderer& renderer, int screenWidth, int screenHeight, H
         if (alpha <= 0.004)
             continue;
 
-        // Byte-for-byte the same test Radar.cpp uses for a red blip, off the
-        // same config values -- a bar appearing and a blip going red must
-        // always mean the same thing.
+        // Whether this car already has a lit bar: decides the hysteresis
+        // below and the side hold further down.
+        const long carId = cars[i].id;
+        int prev = -1;
+        for (int s = 0; s < kMaxContributions; ++s)
+            if (m_contributions[s].id == carId) { prev = s; break; }
+        const bool wasLit = prev >= 0 && m_contributions[prev].fade > 0.0f;
+
+        // The same test Radar.cpp uses for a red blip, off the same config
+        // values -- a bar appearing and a blip going red must mean the same
+        // thing. One difference: a car already alongside keeps its bar until
+        // it is 0.5 m beyond the front/back of the window, so a car hovering
+        // on the edge does not flicker it (CrewChief review 2026-11-24, after
+        // CrewChief's NoisyCartesianCoordinateSpotter length hysteresis).
+        const double lenHyst = wasLit ? 0.5 : 0.0;
         const bool inLongitudinalWindow =
-            (forward <= cfg.dangerAheadM) && (forward >= -cfg.dangerBehindM);
+            (forward <= cfg.dangerAheadM + lenHyst) && (forward >= -(cfg.dangerBehindM + lenHyst));
         const bool lateralOverlap = fabs(lateral) <= cfg.dangerLateralM;
         const bool danger = inLongitudinalWindow && lateralOverlap;
 
         if (!danger)
+            continue;
+
+        // A moving car heading more than ~75 degrees off your heading is going
+        // the other way or crossing (bridge, other leg of a hairpin), not
+        // alongside (review F131). Slow/spun cars still count.
+        if (cars[i].speedMps > 5.0f)
+        {
+            double dh = fmod(fabs(cars[i].heading - playerHeading), 6.283185307179586);
+            if (dh > 3.141592653589793) dh = 6.283185307179586 - dh;
+            if (dh > 1.309)
+                continue;
+        }
+
+        // A car nose-to-tail is not "alongside": it needs some side offset to
+        // light a bar, and once lit it keeps its side until it is clearly
+        // across, so a weaving car behind does not flip the bar (review F134).
+        if (fabs(lateral) < (wasLit ? kSideHoldM : kSideOnM))
+            continue;
+
+        // A car closing or dropping back faster than this is flashing past,
+        // not running alongside: it does not start a bar, though one already
+        // lit is kept (CrewChief review 2026-11-24, CrewChief's
+        // max_closing_speed_for_spotter).
+        if (!wasLit && cfg.sideBarMaxClosingSpeedMps > 0.0f
+            && fabsf(cars[i].speedMps - player->speedMps) > cfg.sideBarMaxClosingSpeedMps)
             continue;
 
         // Every triggering car gets its own tracked slot, matched by car id
@@ -223,11 +307,26 @@ void ProximityHue::Draw(Renderer& renderer, int screenWidth, int screenHeight, H
             c = Contribution();       // reusing a free slot: start from zero fade
             c.id = cars[i].id;
         }
-        c.onLeft = lateral < 0.0;
+        if (!wasLit || fabs(lateral) >= kSideOnM)
+            c.onLeft = lateral < 0.0;
         c.lateralM = fabs(lateral);
         c.forwardM = forward;
+        c.lastSeenS = nowS;
         stillActive[slot] = true;
     }
+
+    // Lighting is immediate, clearing waits 150 ms: a car that drops out of
+    // the test for a frame or two (noisy positions) keeps its bar, at its
+    // last position (CrewChief review 2026-11-24). Not in the pit lane or
+    // garage, where bars go straight away.
+    if (!playerParked && nowS > 0.0)
+        for (int s = 0; s < kMaxContributions; ++s)
+        {
+            const Contribution& c = m_contributions[s];
+            if (c.id >= 0 && !stillActive[s] && c.fade > 0.0f && c.lastSeenS >= 0.0
+                && nowS - c.lastSeenS < 0.15)
+                stillActive[s] = true;
+        }
 
     // Frame delta for the fade. Clamped so a hitch, a pause, or the first
     // call after the overlay was hidden can't jump the fade in one step.
@@ -290,7 +389,7 @@ void ProximityHue::Draw(Renderer& renderer, int screenWidth, int screenHeight, H
         // in sync with each other.
         bool tooCloseFlashOn = false;
         float flashR = 0.0f, flashG = 0.0f, flashB = 0.0f;
-        if (cfg.sideBarTooCloseFlashEnabled && c.lateralM < cfg.sideBarTooCloseMeters
+        if (cfg.sideBarTooCloseFlashEnabled && stillActive[s] && c.lateralM < cfg.sideBarTooCloseMeters
             && cfg.sideBarTooCloseFlashHz > 0.01f && m_freq.QuadPart != 0)
         {
             const double nowSeconds = static_cast<double>(nowTicks.QuadPart) / static_cast<double>(m_freq.QuadPart);
@@ -460,8 +559,9 @@ void ProximityHue::DrawLayoutControls(Renderer& renderer, int screenWidth, int s
     const float kMinScale = (cfg.sideBarWidthFraction > 0.0001f) ? (0.05f / cfg.sideBarWidthFraction) : 0.05f;
     const float kMaxScale = 3.0f;
     const float kMinOpacity = 0.1f, kMaxOpacity = 2.0f;
-    const float kMinCloseM = 0.0f, kMaxCloseM = cfg.sideBarTooCloseMetersMax;
-    const float kMinHz = 1.0f, kMaxHz = cfg.sideBarTooCloseFlashHzMax;
+    // INI maxima clamped so the ranges can never be empty or inverted (review F405).
+    const float kMinCloseM = 0.0f, kMaxCloseM = (std::max)(cfg.sideBarTooCloseMetersMax, 0.5f);
+    const float kMinHz = 1.0f, kMaxHz = (std::max)(cfg.sideBarTooCloseFlashHzMax, kMinHz + 0.5f);
 
     float cx = 0.0f, cy = 0.0f;
     const bool haveCursor = Layout::CursorPosition(hwnd, screenWidth, screenHeight, cx, cy);
@@ -560,6 +660,9 @@ void ProximityHue::DrawLayoutControls(Renderer& renderer, int screenWidth, int s
             Log::Write("ProximityHue: failed to write [Radar] SideBarTooCloseFlashHz to the INI");
     }
 
+    // A slider took this press: Layout must not also drag the panel under it (review F132).
+    if (buttonDown && (m_resizeDragging || m_sliderDragging || m_tooCloseMetersDragging || m_tooCloseHzDragging))
+        Layout::ClaimPress();
     m_controlsPrevButtonDown = buttonDown;
 
     // --- Draw both, with a short instruction under each title so the

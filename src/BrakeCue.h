@@ -2,6 +2,7 @@
 #include <Windows.h>
 #include <vector>
 #include <string>
+#include <atomic>
 
 // Beeps at each braking point from your own best lap.
 //
@@ -51,11 +52,6 @@ public:
     // session", and wiping it here made it "wherever you braked on the first
     // lap after you last looked at the monitor" instead.
     void OnExitRealtime();
-
-    // Writes the saved brake profiles if a new one joined the best five.
-    // Called from the save thread (Persist.cpp) at any moment: copies the
-    // list under m_saveLock, writes after releasing it.
-    void FlushIfDirty();
 
     // Beep-to-pedal reaction times, for the on-screen readout.
     struct State
@@ -108,49 +104,61 @@ private:
     double m_reference[kMaxPoints];
     double m_referenceDropMs[kMaxPoints];
     int m_referenceCount = 0;
-    double m_referenceLapTime = -1.0; // -1 = no reference yet
-    int m_nextCueIndex = 0;           // next reference point still to fire, this lap
+    double m_referenceLapTime = -1.0; // -1 = no reference yet (scoring thread only)
+    // Reference points/drops/count are written by scoring and read by
+    // telemetry, so both sides hold m_lock (review F65). Each point fires
+    // when its target is CROSSED, in any order, and re-arms half a lap later
+    // -- one missed window no longer silences the rest of the lap, and a
+    // point just after the line works (review F59/F394).
+    bool m_refFired[kMaxPoints] = {};
+    double m_prevDist = 0.0;          // last tick's lap distance (telemetry)
+    bool m_havePrevDist = false;
+    // Beeps only with the player's own hands on the car, out of the pits,
+    // green flag, in realtime; recording only under local control
+    // (review F62/F257). Set by scoring, read by telemetry.
+    std::atomic<bool> m_cueAllowed{ false };
+    std::atomic<bool> m_recordAllowed{ false };
 
-    // Brake pedal round the lap, the highest value in each kBrakeBinM bin.
-    // Recorded on the lap in progress (telemetry thread), copied to the
-    // reference on a new best (scoring thread) -- so both under m_lock. Recorded whether or
-    // not the beep itself is enabled.
-    static constexpr double kBrakeBinM = 5.0;
-    std::vector<float> m_recBrake;
-    std::vector<float> m_refBrake;
+    // The public build keeps no brake pedal profile and writes no .brake
+    // file: nothing here reads one (review F63).
     double m_currentDist = 0.0;       // this tick's extrapolated lap distance
-    bool m_lapFullyRecorded = false;  // this lap's profile began at the line (scoring thread)
+    // This lap's recording began at the line and stayed under local control.
+    // Telemetry thread owns it; scoring asks for a reset via m_invalidateLap.
+    bool m_lapFullyRecorded = false;
+    std::atomic<bool> m_invalidateLap{ false };
+    // Lap rollover happens on telemetry from mLapNumber (review F65/F394):
+    // the finished lap is handed to scoring here, under m_lock, for the
+    // accept/reject decision once its lap time has reached scoring.
+    long m_lastTelemLap = -1;
+    struct LapSnapshot
+    {
+        double points[kMaxPoints];
+        double dropMs[kMaxPoints];
+        int count = 0;
+        bool fullyRecorded = false;
+    };
+    LapSnapshot m_finished;           // under m_lock
+    bool m_finishedReady = false;     // under m_lock
 
-    // The brake profiles of your five fastest valid laps in this car at this
-    // track, kept across sessions (BestLaps\<car>__<track>.brake). The
-    // reference profile (m_refBrake) is their per-bin median, so it is
-    // there from the first lap of a session and one odd lap cannot skew it.
-    // Scoring thread only, apart from m_refBrake -- and the save thread's
-    // copy in FlushIfDirty, which is why every change to these three takes
-    // m_saveLock (nothing else does, so neither telemetry nor drawing ever
-    // waits on it). The scoring thread's own reads need no lock.
-    static const int kKeptLaps = 5;
-    struct SavedLap { double lapTime; std::vector<float> brake; };
-    SRWLOCK m_saveLock = SRWLOCK_INIT;
-    std::vector<SavedLap> m_savedLaps;  // fastest first
-    std::string m_savedKey;             // car+track the list belongs to; empty = not loaded
-    bool m_savedDirty = false;
-    void LoadSavedLaps(const std::string& key, size_t bins);
-    static void WriteSavedLaps(const std::string& key, const std::vector<SavedLap>& laps);
-    void AddSavedLap(double lapTime, const std::vector<float>& brake);
-    void RebuildReferenceFromSaved();   // takes m_lock itself
-    // A finished lap whose time had not reached scoring yet.
+    std::string m_carKey;   // LapDelta's car+track key the reference belongs to (F359)
+    // A finished lap waiting for its snapshot and/or its lap time to reach
+    // scoring (the time can lag the lap count by a tick or two -- review F58).
     double m_lapTimeAtStart = 0.0;
-    bool m_pendingSave = false;
+    bool m_pendingLap = false;
+    bool m_pendingHaveSnap = false;
+    bool m_pendingCountsForTime = false;
     double m_pendingOldLapTime = 0.0;
     double m_pendingSinceET = 0.0;
-    std::vector<float> m_pendingBrake;
+    LapSnapshot m_pendingSnap;
+    void ResolvePendingLap(double lastLapTime, double currentET);
+    void ResetReference();   // scoring thread: drop the beep reference
 
     short m_lastTotalLaps = -1;
     // Latch the minimum mCountLapFlag seen across the current lap, not a
     // snapshot at lap completion -- the flag resets to a new lap before being
     // read here, so single-point reads would miss valid laps. Use the latch
-    // instead: if it ever hits 2 during the lap, the lap counts.
+    // instead. Counts at >= 1, like LapDelta (online servers report 1 for
+    // ordinary flying laps -- review F57); only 0 rejects.
     short m_lapValidityLatch = 2;
 
     // --- Reaction-time measurement (telemetry thread only) ---
@@ -173,7 +181,9 @@ private:
     // Guarded by m_lock -- the only state the render thread reads.
     State m_state;
 
-    void PlayBeep();
+    // True only if a beep was actually queued (review F60: no reaction is
+    // timed against a beep that was never heard).
+    bool PlayBeep();
     // Folds one measurement into the history and republishes the averages.
     void RecordReaction(double reactionSeconds);
     // Learned average if there is one, else the configured seed value.

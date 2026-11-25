@@ -1,4 +1,5 @@
 #include "Conditions.h"
+#include "EcoThread.h"
 #include "TrackMap.h"
 #include "InternalsPlugin.hpp"
 #include "Renderer.h"
@@ -8,6 +9,7 @@
 #include "Log.h"
 #include "RenderThrottle.h"
 #include "LapDelta.h"
+#include "StoreFile.h"
 #include <Windows.h>
 #include <cstdio>
 #include <cstring>
@@ -35,6 +37,7 @@ namespace
         double lapDist = 0.0;
         double pathLateral = 0.0;
         bool   isPlayer = false;
+        bool   inPits = false;     // pit lane: drawn dimmed, underneath, unlabelled (review F121)
     };
 
     CRITICAL_SECTION g_lock;
@@ -49,6 +52,8 @@ namespace
     CarSample g_prevCars[kMaxCars];
     int g_prevCount = 0;
     LARGE_INTEGER g_prevTime = {};
+
+    double g_scoringTrackLen = 0.0;  // ScoringInfoV01::mLapDist, where mLapDist wraps (under g_lock)
 
     std::atomic<long long> g_lastScoringQpc{ 0 };
     LARGE_INTEGER g_qpcFreq = {};
@@ -135,7 +140,8 @@ namespace
         bool pit = false;
         short validLatch = 2;          // minimum mCountLapFlag seen this lap
         double lastDist = -1.0;
-        double lapTimeAtStart = 0.0;   // mLastLapTime when this lap began
+        double lapTimeAtStart = 0.0;   // mLastLapTime just before this lap's time is due
+        double lastSeenLapTime = 0.0;  // mLastLapTime on the previous tick (review F115)
         std::vector<std::pair<float, float>> samples;
         // A finished lap whose time has not reached scoring yet.
         bool pending = false;
@@ -240,6 +246,7 @@ namespace
                 g_carLaps.push_back(CarLap{});
                 c = &g_carLaps.back();
                 c->id = v.mID;
+                c->lastSeenLapTime = v.mLastLapTime;
             }
 
             if (c->pending)
@@ -262,7 +269,14 @@ namespace
 
             if (v.mTotalLaps != c->laps)
             {
-                if (c->active && c->laps >= 0 && v.mTotalLaps == c->laps + 1 && !c->pit && c->validLatch == 2)
+                // The time to beat is the one seen BEFORE the line tick: on
+                // that tick mLastLapTime may already be the new lap's, or
+                // still the old one (review F115).
+                if (!c->pending)
+                    c->lapTimeAtStart = c->lastSeenLapTime;
+                // Flag 1 ("counts, time not") is what some servers send on
+                // ordinary laps; only 0 is invalid (review F114, as LapDelta).
+                if (c->active && c->laps >= 0 && v.mTotalLaps == c->laps + 1 && !c->pit && c->validLatch >= 1)
                 {
                     if (v.mLastLapTime > 0.0 && v.mLastLapTime != c->lapTimeAtStart)
                         FastestTryFinish(v, v.mLastLapTime, trackLen, c->samples);
@@ -278,12 +292,9 @@ namespace
                 c->validLatch = 2;
                 c->lastDist = -1.0;
                 c->samples.clear();
-                // While a lap is still pending, its time is what the next one
-                // must differ from -- the old value is kept until it arrives.
-                if (!c->pending)
-                    c->lapTimeAtStart = v.mLastLapTime;
                 c->active = v.mLapDist >= 0.0 && v.mLapDist < 200.0 && !v.mInPits;
             }
+            c->lastSeenLapTime = v.mLastLapTime;
             if (!c->active)
                 continue;
 
@@ -452,6 +463,17 @@ namespace
         std::vector<Pt> map;
         std::vector<Pt> dist;
         int s1 = -1, s2 = -1;
+        // review F117: lowest mCountLapFlag this lap (0 = cut / does not
+        // count), and the lap time seen on the previous tick, since on the
+        // line tick it can still be the previous lap's. A lap whose time has
+        // not arrived yet waits (up to 5 s) in the pending copy.
+        short validLatch = 2;
+        double lastSeenLapTime = 0.0;
+        bool pending = false;
+        double pendingSinceET = 0.0;
+        double pendingOldLapTime = 0.0;
+        std::vector<Pt> pendingMap, pendingDist;
+        int pendingS1 = -1, pendingS2 = -1;
     };
     Recorder g_rec;
 
@@ -464,6 +486,12 @@ namespace
     std::vector<Pt>    g_baked;    // after mirror + rotation
     std::vector<float> g_lapDist;  // lap distance at each index, strictly increasing
     float g_trackLength = 0.0f;
+    // Map length / game length (ScoringInfoV01::mLapDist). 1 unless the map's
+    // lap is more than 2% off the game's (a track update, another sim's file):
+    // lap distances are then stretched onto the old map until a fresh
+    // recording replaces it (review F120). Render thread, reset by ApplyMap.
+    float g_lapScale = 1.0f;
+    bool  g_lenChecked = false;
     int   g_sector1Index = -1;
     int   g_sector2Index = -1;
 
@@ -523,6 +551,9 @@ namespace
             const double b = strtod(p, &next);
             if (next == p) break;
             p = next;
+            // strtod takes "nan"/"inf"; one bad sample would break the
+            // ordering and the fit (review F400).
+            if (!std::isfinite(a) || !std::isfinite(b)) continue;
             out.push_back({ static_cast<float>(a), static_cast<float>(b) });
         }
         return !out.empty();
@@ -540,10 +571,38 @@ namespace
         if (sscanf_s(body.c_str(), "%d,%d", &a, &b) == 2) { s1 = a; s2 = b; }
     }
 
-    bool ReadWholeFile(const char* path, std::string& out)
+    // Game text to UTF-16: taken as UTF-8 when it is valid UTF-8, otherwise
+    // as the Windows code page (review F119/F426).
+    std::wstring ToWide(const char* s)
+    {
+        std::wstring w;
+        if (!s || !s[0]) return w;
+        UINT cp = CP_UTF8;
+        int n = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, s, -1, nullptr, 0);
+        if (n <= 0) { cp = CP_ACP; n = MultiByteToWideChar(cp, 0, s, -1, nullptr, 0); }
+        if (n <= 0) return w;
+        w.resize(static_cast<size_t>(n));
+        MultiByteToWideChar(cp, cp == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0, s, -1, &w[0], n);
+        w.resize(static_cast<size_t>(n - 1)); // drop the terminator
+        return w;
+    }
+
+    std::string ToUtf8(const char* s)
+    {
+        const std::wstring w = ToWide(s);
+        std::string u;
+        if (w.empty()) return u;
+        const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+        if (n <= 0) return u;
+        u.resize(static_cast<size_t>(n));
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), &u[0], n, nullptr, nullptr);
+        return u;
+    }
+
+    bool ReadWholeFile(const std::wstring& path, std::string& out)
     {
         FILE* f = nullptr;
-        if (fopen_s(&f, path, "rb") != 0 || !f)
+        if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f)
             return false;
         fseek(f, 0, SEEK_END);
         const long size = ftell(f);
@@ -572,13 +631,27 @@ namespace
 
     // Track names come from the game; anything Windows will not take in a
     // file name becomes an underscore. Only for this plugin's own files --
-    // TinyPedal's are looked up under the raw name, as it saved them.
+    // TinyPedal's names are built by TinyPedalFileName.
     void SafeFileName(const char* track, char* out, size_t outSize)
     {
         size_t n = 0;
         for (const char* p = track; *p && n + 1 < outSize; ++p)
             out[n++] = strchr("\\/:*?\"<>|", *p) ? '_' : *p;
         out[n] = '\0';
+    }
+
+    // TinyPedal's own file name for a track: the name with \ / : * ? " < > |
+    // removed (not replaced) and trailing spaces stripped (review F119).
+    std::wstring TinyPedalFileName(const char* track)
+    {
+        std::wstring w = ToWide(track);
+        std::wstring out;
+        for (wchar_t ch : w)
+            if (!wcschr(L"\\/:*?\"<>|", ch))
+                out += ch;
+        while (!out.empty() && out.back() == L' ')
+            out.pop_back();
+        return out;
     }
 
     void XmlEscape(const char* in, std::string& out)
@@ -612,7 +685,12 @@ namespace
         char name[64];
         SafeFileName(rec.track, name, sizeof(name));
         char path[MAX_PATH];
-        sprintf_s(path, "%s%s.svg", dir, name);
+        // A long folder must not end the process the way sprintf_s would.
+        if (_snprintf_s(path, sizeof(path), _TRUNCATE, "%s%s.svg", dir, name) < 0)
+        {
+            Log::Write("TrackMap: map path too long, not saved");
+            return;
+        }
 
         float minX = rec.map[0].x, maxX = minX, minZ = rec.map[0].z, maxZ = minZ;
         for (const Pt& p : rec.map)
@@ -621,16 +699,18 @@ namespace
             minZ = (std::min)(minZ, p.z); maxZ = (std::max)(maxZ, p.z);
         }
 
-        char tmp[MAX_PATH + 8];
-        sprintf_s(tmp, "%s.tmp", path);
-        FILE* f = nullptr;
-        if (fopen_s(&f, tmp, "w") != 0 || !f)
+        // StoreFile: flushed to disk before the rename (review F278).
+        char tmp[StoreFile::kTmpPathSize];
+        FILE* f = StoreFile::Begin(path, tmp, sizeof(tmp), "w");
+        if (!f)
         {
             Log::Write("TrackMap: could not write '%s' (read-only? UAC?)", path);
             return;
         }
+        // The file says utf-8, so the game's (code page) name is converted
+        // first -- a raw 0xE9 makes TinyPedal reject the file (review F426).
         std::string title;
-        XmlEscape(rec.track, title);
+        XmlEscape(ToUtf8(rec.track).c_str(), title);
         const float m = 20.0f;
         fprintf(f, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
         fprintf(f, "<!-- Track map recorded by rF2SkrOverlayPublic, in TinyPedal's format -->\n");
@@ -646,11 +726,8 @@ namespace
         for (size_t i = 0; i < rec.dist.size(); ++i)
             fprintf(f, "%s%.4f,%.4f", i ? " " : "", rec.dist[i].x, rec.dist[i].z);
         fprintf(f, "\"/>\n</svg>\n");
-        const bool written = !ferror(f);
-        const bool closed = fclose(f) == 0;
-        if (!written || !closed || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+        if (!StoreFile::Commit(f, tmp, path))
         {
-            DeleteFileA(tmp);
             Log::Write("TrackMap: could not write '%s' (read-only? UAC? disk full?)", path);
             return;
         }
@@ -745,7 +822,7 @@ namespace
                    what, static_cast<int>(raw.size()),
                    out.s1, out.s2,
                    lapDist.front(), lapDist.back(), out.trackLength);
-        out.ok = true;
+        out.ok = std::isfinite(out.trackLength) && out.trackLength > 1.0f;
     }
 
     // Render thread: makes a built map the loaded one. Swapped, not copied
@@ -755,6 +832,8 @@ namespace
         g_raw.swap(m.raw);
         g_lapDist.swap(m.lapDist);
         g_trackLength = m.trackLength;
+        g_lapScale = 1.0f;
+        g_lenChecked = false;
         g_sector1Index = m.s1;
         g_sector2Index = m.s2;
         g_bakeValid = false;
@@ -771,15 +850,22 @@ namespace
         OwnMapDir(ownDir, sizeof(ownDir));
         char safeName[64];
         SafeFileName(trackName, safeName, sizeof(safeName));
-        char candidates[2][MAX_PATH];
-        sprintf_s(candidates[0], "%s%s.svg", ownDir, safeName);
-        sprintf_s(candidates[1], "%s%s.svg", g_trackMapConfig.tinyPedalMapDir, trackName);
-        for (int i = 0; i < 2; ++i)
-            if (ReadWholeFile(candidates[i], text))
-            {
-                Log::Write("TrackMap: loaded '%s'", candidates[i]);
-                return true;
-            }
+        // Wide paths: TinyPedal saves under the Unicode name (review F119).
+        // Own file first, then TinyPedal's cleaned name, then the raw name.
+        std::wstring candidates[3];
+        candidates[0] = ToWide(ownDir) + ToWide(safeName) + L".svg";
+        const std::wstring tpDir = ToWide(g_trackMapConfig.tinyPedalMapDir);
+        candidates[1] = tpDir + TinyPedalFileName(trackName) + L".svg";
+        candidates[2] = tpDir + ToWide(trackName) + L".svg";
+        for (int i = 0; i < 3; ++i)
+        {
+            if (i == 2 && candidates[2] == candidates[1])
+                break;
+            if (candidates[i].size() >= 32000 || !ReadWholeFile(candidates[i], text))
+                continue;
+            Log::Write("TrackMap: loaded '%ls'", candidates[i].c_str());
+            return true;
+        }
         Log::Write("TrackMap: no map file for track '%s'", trackName);
         return false;
     }
@@ -807,6 +893,35 @@ namespace
 
     // --- Recorder --------------------------------------------------------------
 
+    // A recorded lap that passed every check becomes the map and is queued
+    // for saving.
+    void RecordCommit(const ScoringInfoV01& info, const std::vector<Pt>& map, const std::vector<Pt>& dist,
+                      int s1, int s2, double lapTime)
+    {
+        Recording rec;
+        strncpy_s(rec.track, sizeof(rec.track), info.mTrackName, _TRUNCATE);
+        rec.map = map;
+        rec.dist = dist;
+        rec.s1 = s1;
+        rec.s2 = s2;
+        Log::Write("TrackMap: recorded '%s' -- %d points, sectors %d/%d, lap %.3fs",
+                   rec.track, static_cast<int>(rec.map.size()), rec.s1, rec.s2, lapTime);
+        // Built into a map here (once per recording), so the
+        // render thread only has to swap it in.
+        MapData built;
+        BuildMapData(rec.track, std::vector<Pt>(rec.map), &rec.dist, rec.s1, rec.s2, built);
+        // Swapped in under the lock; whatever they replace is
+        // freed after it is released.
+        EnterCriticalSection(&g_lock);
+        strcpy_s(g_newMapTrack, sizeof(g_newMapTrack), rec.track);
+        std::swap(g_newMap, built);
+        g_haveNewRecording = true;
+        std::swap(g_saveQueue, rec);
+        g_saveDirty = true;
+        LeaveCriticalSection(&g_lock);
+        g_wantRecording.store(false, std::memory_order_relaxed);
+    }
+
     // Scoring thread. Captures the player's line from one line crossing to
     // the next -- the same rules TinyPedal records by: start within 200m of
     // the line, no pit visit during the lap, no teleport (a jump of more than
@@ -818,8 +933,34 @@ namespace
         {
             r.active = false;
             r.laps = -1;
+            r.pending = false;
+            r.pendingMap.clear();
+            r.pendingDist.clear();
+            r.lastSeenLapTime = v.mLastLapTime;
             return;
         }
+
+        // A finished lap waiting for its time (review F117).
+        if (r.pending)
+        {
+            if (v.mLastLapTime > 0.0 && v.mLastLapTime != r.pendingOldLapTime)
+            {
+                r.pending = false;
+                RecordCommit(info, r.pendingMap, r.pendingDist, r.pendingS1, r.pendingS2, v.mLastLapTime);
+                r.pendingMap.clear();
+                r.pendingDist.clear();
+                if (!g_wantRecording.load(std::memory_order_relaxed))
+                    return;
+            }
+            else if (info.mCurrentET - r.pendingSinceET > 5.0)
+            {
+                Log::Write("TrackMap: recorded lap not used (no new lap time within 5s)");
+                r.pending = false;
+                r.pendingMap.clear();
+                r.pendingDist.clear();
+            }
+        }
+
         if (v.mInPits)
             r.pitLap = true;
 
@@ -830,40 +971,33 @@ namespace
                 const double trackLen = info.mLapDist; // ScoringInfoV01::mLapDist is the TRACK length
                 const bool spans = r.map.size() >= 50 && trackLen > 100.0
                     && r.dist.front().x < 100.0f && r.dist.back().x > trackLen - 150.0;
-                const bool clean = !r.pitLap && v.mLastLapTime > 0.0;
-                if (spans && clean)
+                // Flag 1 ("counts, time not") is normal online; only 0 marks a
+                // cut / invalid lap (review F117, same rule as LapDelta).
+                const bool clean = !r.pitLap && r.validLatch >= 1;
+                if (spans && clean && v.mLastLapTime > 0.0 && v.mLastLapTime != r.lastSeenLapTime)
                 {
-                    Recording rec;
-                    strncpy_s(rec.track, sizeof(rec.track), info.mTrackName, _TRUNCATE);
-                    rec.map = r.map;
-                    rec.dist = r.dist;
-                    rec.s1 = r.s1;
-                    rec.s2 = r.s2;
-                    Log::Write("TrackMap: recorded '%s' -- %d points, sectors %d/%d, lap %.3fs",
-                               rec.track, static_cast<int>(rec.map.size()), rec.s1, rec.s2, v.mLastLapTime);
-                    // Built into a map here (once per recording), so the
-                    // render thread only has to swap it in.
-                    MapData built;
-                    BuildMapData(rec.track, std::vector<Pt>(rec.map), &rec.dist, rec.s1, rec.s2, built);
-                    // Swapped in under the lock; whatever they replace is
-                    // freed after it is released.
-                    EnterCriticalSection(&g_lock);
-                    strcpy_s(g_newMapTrack, sizeof(g_newMapTrack), rec.track);
-                    std::swap(g_newMap, built);
-                    g_haveNewRecording = true;
-                    std::swap(g_saveQueue, rec);
-                    g_saveDirty = true;
-                    LeaveCriticalSection(&g_lock);
-                    g_wantRecording.store(false, std::memory_order_relaxed);
+                    RecordCommit(info, r.map, r.dist, r.s1, r.s2, v.mLastLapTime);
+                }
+                else if (spans && clean && !r.pending)
+                {
+                    // The time on this tick is still the previous lap's.
+                    r.pending = true;
+                    r.pendingSinceET = info.mCurrentET;
+                    r.pendingOldLapTime = r.lastSeenLapTime;
+                    r.pendingMap.swap(r.map);
+                    r.pendingDist.swap(r.dist);
+                    r.pendingS1 = r.s1;
+                    r.pendingS2 = r.s2;
                 }
                 else
                 {
-                    Log::Write("TrackMap: recorded lap not used (%d points, %.0f..%.0fm of %.0fm, pit %d, lap %.3fs)",
+                    Log::Write("TrackMap: recorded lap not used (%d points, %.0f..%.0fm of %.0fm, pit %d, valid %d, lap %.3fs)",
                                static_cast<int>(r.map.size()),
                                r.dist.empty() ? 0.0 : r.dist.front().x, r.dist.empty() ? 0.0 : r.dist.back().x,
-                               trackLen, r.pitLap ? 1 : 0, v.mLastLapTime);
+                               trackLen, r.pitLap ? 1 : 0, static_cast<int>(r.validLatch), v.mLastLapTime);
                 }
             }
+            r.validLatch = 2;
             r.active = v.mLapDist >= 0.0 && v.mLapDist < 200.0 && !v.mInPits;
             r.laps = v.mTotalLaps;
             r.pitLap = v.mInPits != 0;
@@ -873,6 +1007,11 @@ namespace
             r.dist.clear();
             r.s1 = r.s2 = -1;
         }
+        else if (v.mCountLapFlag < r.validLatch)
+        {
+            r.validLatch = static_cast<short>(v.mCountLapFlag);
+        }
+        r.lastSeenLapTime = v.mLastLapTime;
         if (!r.active)
             return;
 
@@ -955,7 +1094,7 @@ namespace
         const int n = static_cast<int>(g_baked.size());
         if (n < 2) { sx = sy = 0.0f; return; }
 
-        float d = static_cast<float>(lapDist);
+        float d = static_cast<float>(lapDist) * g_lapScale; // game -> map metres (F120)
         if (g_trackLength > 1.0f)
         {
             while (d < g_lapDist[0]) d += g_trackLength;
@@ -1127,6 +1266,18 @@ namespace
             out[n++] = ok ? static_cast<char>(c) : '_';
         }
         out[n] = '\0';
+        // review F420: non-ASCII names all became "___"; add a short hash
+        // of the original so they don't share a key (ASCII names unchanged).
+        bool lossy = false;
+        unsigned int hash = 2166136261u;
+        for (const char* p = track; *p; ++p)
+        {
+            const unsigned char c = static_cast<unsigned char>(*p);
+            hash = (hash ^ c) * 16777619u;
+            if (c >= 0x80 || c < 0x20) lossy = true;
+        }
+        if (lossy && n + 8 <= outSize)
+            sprintf_s(out + n, outSize - n, "_%06x", hash & 0xFFFFFFu);
     }
 
     // The global RotationDegrees/Mirror are only the fallback for a circuit
@@ -1164,7 +1315,16 @@ namespace
     } g_mapJob;
     unsigned g_mapGen = 0;   // bumped by DropLoadedMap: a load in flight is then stale
 
-    DWORD WINAPI MapJobProc(LPVOID)
+    // An exception must not leave a thread: std::terminate would take the
+    // game down (review F271). The real body is MapJobProcBody below.
+    DWORD MapJobProcBody(LPVOID param);
+    DWORD WINAPI MapJobProc(LPVOID param)
+    {
+        try { return MapJobProcBody(param); }
+        catch (...) { return 0; }
+    }
+
+    DWORD MapJobProcBody(LPVOID)
     {
         std::string text;
         const bool read = ReadMapText(g_mapJob.track, text);
@@ -1241,19 +1401,26 @@ void TrackMap::OnScoring(const ScoringInfoV01& info)
     g_prevTime = g_curTime;
 
     g_curCount = 0;
+    g_scoringTrackLen = info.mLapDist;
     if (info.mVehicle)
     {
         const int n = (info.mNumVehicles < kMaxCars) ? info.mNumVehicles : kMaxCars;
         for (int i = 0; i < n; ++i)
         {
             const VehicleScoringInfoV01& v = info.mVehicle[i];
+            if (v.mIsPlayer)
+                player = &v;
+            // Retired / disqualified cars and cars sitting in their garage
+            // are not on track: leave them off the map, as the standings
+            // do (review F121). Your own car always stays.
+            if (!v.mIsPlayer && (v.mFinishStatus == 2 || v.mFinishStatus == 3 || v.mInGarageStall))
+                continue;
             CarSample& s = g_curCars[g_curCount++];
             s.id = v.mID;
             s.lapDist = v.mLapDist;
             s.pathLateral = v.mPathLateral;
             s.isPlayer = v.mIsPlayer != 0;
-            if (s.isPlayer)
-                player = &v;
+            s.inPits = v.mInPits != 0;
         }
     }
     QueryPerformanceCounter(&g_curTime);
@@ -1356,6 +1523,7 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
             g_mapJob.gen = g_mapGen;
             g_mapJob.map = MapData{};
             g_mapJob.thread = CreateThread(nullptr, 0, MapJobProc, nullptr, 0, nullptr);
+            MakeThreadEfficient(g_mapJob.thread);
             if (!g_mapJob.thread)
             {
                 // No worker: load here rather than never.
@@ -1398,7 +1566,40 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         }
         // A recording made for the circuit now loaded: show it at once.
         if (haveFresh && strcmp(freshTrack, g_loadedTrack) == 0)
+        {
             g_haveMap = ApplyMap(fresh);
+            Log::Write("TrackMap: new recording of '%s' now shown (lap %.1f m)", g_loadedTrack, g_trackLength);
+        }
+
+        // Once per applied map, when the game's track length is known:
+        // a map whose lap is >2% off is kept, stretched, while a fresh one
+        // is recorded; the recorder's usual rules accept it, it is swapped in
+        // above and saved by the Persist thread at the line (review F120).
+        if (g_haveMap && !g_lenChecked && g_loadedTrack[0])
+        {
+            double gameLen = 0.0;
+            bool sameTrack = false;
+            EnterCriticalSection(&g_lock);
+            gameLen = g_scoringTrackLen;
+            sameTrack = !g_pendingChanged
+                && strncmp(g_pendingTrack, g_loadedTrack, sizeof(g_loadedTrack) - 1) == 0;
+            LeaveCriticalSection(&g_lock);
+            if (sameTrack && gameLen > 1.0 && g_trackLength > 1.0f)
+            {
+                g_lenChecked = true;
+                const double ratio = g_trackLength / gameLen;
+                if (fabs(ratio - 1.0) > 0.02)
+                {
+                    g_lapScale = static_cast<float>(ratio);
+                    const bool record = cfg.recordMissing;
+                    if (record)
+                        g_wantRecording.store(true, std::memory_order_relaxed);
+                    Log::Write("TrackMap: map of '%s' is %.1f m, game lap is %.1f m -- stretching it%s",
+                               g_loadedTrack, g_trackLength, gameLen,
+                               record ? " and recording a new one from the next clean lap" : "");
+                }
+            }
+        }
     }
 
     // Nothing until the first scoring tick of the session.
@@ -1517,7 +1718,8 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         }
         s_screen.push_back(sx);
         s_screen.push_back(sy);
-        s_screenDist.push_back(i < g_lapDist.size() ? g_lapDist[i] : 0.0f);
+        // In game metres, to match the delta bins (F120 stretch).
+        s_screenDist.push_back(i < g_lapDist.size() ? g_lapDist[i] / g_lapScale : 0.0f);
     }
     // The closing segment runs back to the first point; drop a last point
     // sitting on top of it.
@@ -1593,15 +1795,19 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                 if (purple)
                 {
                     coloured = true;
-                    r = cfg.purpleR;
-                    g = cfg.purpleG;
-                    bl = cfg.purpleB;
+                    // Last lap's purple ahead of the car is faded like the
+                    // rest of the stretch ahead (review F122).
+                    r += (cfg.purpleR - r) * strength;
+                    g += (cfg.purpleG - g) * strength;
+                    bl += (cfg.purpleB - bl) * strength;
                 }
                 else if (!isnan(loss))
                 {
                     coloured = true;
                     // Solid colour, no shading by size: red = lost, green = gained.
-                    const float t = 1.0f;
+                    // Last lap's stretch ahead is fainter (DeltaAheadStrength),
+                    // so it does not read as live data (review F122).
+                    const float t = strength;
                     const float tr = loss > 0.0f ? cfg.lossR : cfg.gainR;
                     const float tg = loss > 0.0f ? cfg.lossG : cfg.gainG;
                     const float tb = loss > 0.0f ? cfg.lossB : cfg.gainB;
@@ -1689,7 +1895,29 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         // Above the map's box, never inside it, so the track line can not
         // run through the text.
         const float boxTop = centerY - halfH - (cfg.bgEnabled ? cfg.bgPaddingPx * uiScale : 0.0f);
-        renderer.AddText(centerX - halfW, boxTop - px * 1.25f, buf, px,
+        float capY = boxTop - px * 1.25f;
+        if (cfg.showNorth)
+        {
+            // Keep it clear of the north badge in the same band (review F123):
+            // shorten it, and if even that does not fit, move it up a line.
+            const float pad = cfg.bgEnabled ? cfg.bgPaddingPx * uiScale : 0.0f;
+            const float badgeLeft = centerX + halfW + pad - 2.0f * 17.0f * uiScale
+                                  - 5.0f * uiScale - renderer.MeasureText("N", 22.0f * uiScale) - 8.0f * uiScale;
+            const float room = badgeLeft - (centerX - halfW);
+            if (renderer.MeasureText(buf, px) > room)
+            {
+                const char* shortWhat = cfg.deltaColourMode == 1 ? "vs PB"
+                                      : cfg.deltaColourMode == 2 ? "vs SB" : "vs fastest";
+                sprintf_s(buf, coloured ? "%s" : "%s (no lap)", shortWhat);
+                if (renderer.MeasureText(buf, px) > room)
+                {
+                    sprintf_s(buf, "%s", shortWhat);
+                    if (renderer.MeasureText(buf, px) > room)
+                        capY -= px * 1.25f;
+                }
+            }
+        }
+        renderer.AddText(centerX - halfW, capY, buf, px,
                          1.0f, 1.0f, 1.0f, 0.75f, Renderer::HAlign::Left);
         renderer.SetTextBackground(hadBg);
     }
@@ -1806,11 +2034,20 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                     if (g_prevCars[j].id != s.id) continue;
                     const double a = g_prevCars[j].lapDist;
                     double b = s.lapDist;
-                    // Crossing the line makes b jump back to near zero;
-                    // unwrap before interpolating, or the dot sprints
-                    // backwards round the whole circuit.
-                    if (g_trackLength > 1.0f && a - b > g_trackLength * 0.5)
-                        b += g_trackLength;
+                    // Crossing the line makes b jump back to near zero (or,
+                    // backwards over it, up to the lap length); unwrap both
+                    // ways with the scoring track length, where mLapDist
+                    // wraps (review F125).
+                    const double L = g_scoringTrackLen > 1.0 ? g_scoringTrackLen : g_trackLength;
+                    if (L > 1.0 && a - b > L * 0.5)
+                        b += L;
+                    else if (L > 1.0 && b - a > L * 0.5)
+                        b -= L;
+                    // A jump no car drives in one ~5Hz tick is a teleport
+                    // (back to the pits, a reset): show the new place at
+                    // once rather than sweeping round the map.
+                    if (fabs(b - a) > 150.0)
+                        break;
                     s.lapDist = a + (b - a) * frac;
                     s.pathLateral = g_prevCars[j].pathLateral +
                                     (s.pathLateral - g_prevCars[j].pathLateral) * frac;
@@ -1840,6 +2077,9 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
             if (s_info[j].id == cars[i].id) { infoOf[i] = j; break; }
         const int place = infoOf[i] >= 0 ? s_info[infoOf[i]].place : 0;
         rank[i] = cars[i].isPlayer ? 100000 : (place ? place : 9999);
+        // Pit-lane cars first, so cars on track draw over them (review F121).
+        if (cars[i].inPits && !cars[i].isPlayer)
+            rank[i] -= 200000;
     }
 
     // Leader first, so an overlapping label is kept by the car further up the
@@ -1879,11 +2119,15 @@ void TrackMap::Draw(Renderer& renderer, int screenWidth, int screenHeight)
 
         // A larger dot as well as its own colour: two independent cues.
         const float thisDotR = c.isPlayer ? dotR * cfg.playerRadiusScale : dotR;
+        // Pit-lane cars: dimmed, and no label, so they are not taken for
+        // traffic and do not crowd out labels of cars on track (review F121).
+        const bool dim = c.inPits && !c.isPlayer;
+        const float a = dim ? 0.45f : 1.0f;
         renderer.AddFilledCircle(cxp, cyp, thisDotR + cfg.carOutlineWidthPx * uiScale,
-                                 cfg.outlineR, cfg.outlineG, cfg.outlineB, 1.0f, 16);
-        renderer.AddFilledCircle(cxp, cyp, thisDotR, r, g, b, 1.0f, 16);
+                                 cfg.outlineR, cfg.outlineG, cfg.outlineB, a, 16);
+        renderer.AddFilledCircle(cxp, cyp, thisDotR, r, g, b, a, 16);
 
-        if (!cfg.showLabels)
+        if (!cfg.showLabels || dim)
             continue;
 
         bool crowded = false;
@@ -1930,7 +2174,7 @@ void TrackMap::DrawLayoutControls(Renderer& renderer, int screenWidth, int scree
         return;
     }
     // Nothing to rotate, and no circuit name to save an angle under.
-    if (!g_haveMap || !g_loadedTrack[0])
+    if (!HasMap())
         return;
 
     const TrackMapConfig& cfg = g_trackMapConfig;
@@ -1973,6 +2217,7 @@ void TrackMap::DrawLayoutControls(Renderer& renderer, int screenWidth, int scree
     }
     if (g_rotDragging && buttonDown)
     {
+        Layout::ClaimPress(); // the slider, not a map drag (review F124)
         float t = (cx - sliderX) / sliderW;
         t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
         g_trackRotationDeg = kMin + t * (kMax - kMin);
@@ -1988,6 +2233,7 @@ void TrackMap::DrawLayoutControls(Renderer& renderer, int screenWidth, int scree
     if (clickEdge && !g_rotDragging &&
         fabsf(cx - buttonCx) <= buttonW * 0.5f && fabsf(cy - sliderY) <= buttonH * 0.5f)
     {
+        Layout::ClaimPress(); // review F124
         g_trackMirror = !g_trackMirror;
         PersistTrackMirror();
     }
@@ -2027,7 +2273,23 @@ void TrackMap::DrawLayoutControls(Renderer& renderer, int screenWidth, int scree
 
 bool TrackMap::HasMap()
 {
-    return g_haveMap && g_loadedTrack[0] != 0;
+    if (!g_haveMap || !g_loadedTrack[0])
+        return false;
+    // Draw (which drops and reloads the map) does not run while the map is
+    // hidden, so after a session end or a track change the loaded map may be
+    // the old circuit: no rotation / mirror / re-record against it (review F116).
+    if (g_resetRequested.load(std::memory_order_relaxed))
+        return false;
+    if (g_lockReady)
+    {
+        EnterCriticalSection(&g_lock);
+        const bool stale = g_pendingChanged
+            || strncmp(g_pendingTrack, g_loadedTrack, sizeof(g_loadedTrack) - 1) != 0;
+        LeaveCriticalSection(&g_lock);
+        if (stale)
+            return false;
+    }
+    return true;
 }
 
 float TrackMap::RotationDegrees()

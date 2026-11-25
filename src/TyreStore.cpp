@@ -31,6 +31,7 @@ namespace
         long lastLap = -1000;
         bool prevLimiter = false;
         bool haveSample = false;
+        int frontIdx = -1, rearIdx = -1;   // compound index last folded
         Compound front = kUnknown;
         Compound rear = kUnknown;
     };
@@ -80,9 +81,14 @@ namespace
     // three dry compounds on a given weekend regardless of what rubber is
     // actually underneath, so flattening the family is the right answer, not
     // a loss of information.
-    Compound Fold(const char* name)
+    // The SDK names are 18 chars and need not be NUL-terminated: copy into a
+    // terminated buffer so a full-length name cannot run on (review F29).
+    Compound Fold(const char (&raw)[18])
     {
-        if (!name || !name[0])
+        char name[19];
+        memcpy(name, raw, sizeof(raw));
+        name[18] = 0;
+        if (!name[0])
             return kUnknown;
 
         if (ContainsNoCase(name, "inter") || ContainsNoCase(name, "intermediate"))
@@ -144,6 +150,7 @@ void TyreStore::OnTelemetry(const TelemInfoV01& info)
         e->lastLap = -1000;
         e->prevLimiter = false;
         e->haveSample = false;
+        e->frontIdx = e->rearIdx = -1;
     }
 
     if (e)
@@ -153,9 +160,15 @@ void TyreStore::OnTelemetry(const TelemInfoV01& info)
         // moment a new set is actually on the car and running.
         const bool leftPits = e->prevLimiter && !limiterNow;
         const bool newLap = (info.mLapNumber != e->lastLap);
+        // AI cars report the limiter on even at speed, so also re-read when
+        // the compound index changes at a stop (review F29).
+        const bool idxChanged = info.mFrontTireCompoundIndex != e->frontIdx ||
+                                info.mRearTireCompoundIndex != e->rearIdx;
 
-        if (newLap || leftPits || !e->haveSample)
+        if (newLap || leftPits || idxChanged || !e->haveSample)
         {
+            e->frontIdx = info.mFrontTireCompoundIndex;
+            e->rearIdx = info.mRearTireCompoundIndex;
             e->front = Fold(info.mFrontTireCompoundName);
             e->rear = Fold(info.mRearTireCompoundName);
             e->lastLap = info.mLapNumber;

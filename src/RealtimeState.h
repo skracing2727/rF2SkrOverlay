@@ -25,21 +25,25 @@ extern std::atomic<int> g_headlightsOn;
 // then, even flat out, so the PIT warning ignores the limiter while this is set.
 extern std::atomic<bool> g_playerAiControl;
 
-// The player's vehicle CLASS ("MX-5 Cup", "F2", ...), captured once per
-// scoring tick and readable from the telemetry-driven widgets too.
+// PhysicsOptionsV01::mAutoShift (0 off, 1 upshifts, 2 downshifts, 3 all),
+// from SetPhysicsOptions; -1 = not told yet. Shift learning skips the
+// gearbox's own upshifts (review F30).
+extern std::atomic<int> g_autoShift;
+
+// The player's CAR identity, captured from the scoring thread and readable
+// from the telemetry-driven widgets too. Every learned-data store keys its
+// save file on it (PB/lap delta, brake points, fuel stats and fuel/tyre save
+// profiles, pit limit, shift targets, speed reference).
 //
-// This exists because every persisted store used to key its save file on
-// mVehicleName, which is the per-ENTRY name -- mods set it per car number or
-// even per driver, so a PB, a learned fuel rate and a learned shift point all
-// fragmented across liveries and numbers of the same car. mVehicleClass is
-// the model/class field and is the right key; it only lives on
-// VehicleScoringInfoV01, so the telemetry-side widgets read it from here
-// rather than from their own callback.
-//
-// Falls back to the entry name when the class is blank (some mods leave it
-// empty) so a key is never empty. Known trade-off: for a multi-make class
-// like GT3 this shares one file between genuinely different cars -- fine for
-// the spec series this is actually used with.
+// History: stores first keyed on mVehicleName (the per-ENTRY name, which
+// mods set per number or driver), then on mVehicleClass -- which shared one
+// file between different cars of a multi-make class such as GT3 (review
+// F261/F169). Since 2026-11-24 the key is the car MODEL: the vehicle folder
+// of the player's .VEH file, asked from rF2's own web interface on
+// localhost (/rest/race/car, the list TinyPedal's brand import uses) on a
+// background thread at each car change. When that is unavailable it falls
+// back to the entry name. The class at the same moment is kept too, so a
+// store with no file for the car yet can seed from its old class file.
 namespace VehicleKey
 {
     // Call once, single-threaded, before Startup() returns -- i.e. before
@@ -48,8 +52,15 @@ namespace VehicleKey
     // callbacks share; see RealtimeState.cpp for why this can't just happen
     // lazily on first use from whichever of them gets there first.
     void Init();
-    // Scoring thread.
+    // Plugin Shutdown: stops the REST worker thread.
+    void Shutdown();
+    // Scoring thread. Starts the REST lookup on a car change; the new key is
+    // published once it answers (or after ~3 s with the fallback), so the
+    // stores rekey once per car change, not twice.
     void SetFromScoring(const char* vehicleClass, const char* vehicleName);
-    // Any thread. Copies into 'out'; never empty.
+    // Any thread. The car key; copies into 'out'; never empty.
     void Get(char* out, size_t outSize);
+    // Any thread. The vehicle CLASS published together with Get()'s car --
+    // the old (pre-2026-11-24) key, used only to seed a car's first file.
+    void GetClass(char* out, size_t outSize);
 }

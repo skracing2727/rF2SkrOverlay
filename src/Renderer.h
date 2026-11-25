@@ -57,6 +57,11 @@ public:
     // glyph height in screen pixels. ASCII 32..126 only.
     float MeasureText(const char* text, float pixelHeight) const;
     void AddText(float x, float y, const char* text, float pixelHeight, float r, float g, float b, float a, HAlign align = HAlign::Left);
+    // Text turned 90 degrees anticlockwise, reading bottom to top. (x, y) is
+    // the bottom-left of the turned block: the column is pixelHeight wide
+    // from x to the right, and the text runs upward from y for
+    // MeasureText(text, pixelHeight). No background plate.
+    void AddTextRotated(float x, float y, const char* text, float pixelHeight, float r, float g, float b, float a);
 
     // Text font, chosen from kFontNames (0 = Auto: Consolas when installed,
     // else the built-in DejaVu Sans Mono) and kWeightNames. Call before
@@ -86,8 +91,14 @@ public:
     // Everything queued after this call is drawn above everything queued
     // before it, text included. Without it all shapes go first and all text
     // after, so any panel's text shows through a box drawn later (the knob
-    // menus, 2026-11-23). Once per frame; reset by BeginFrame.
-    void BeginTopLayer() { m_topShape = m_vertices.size(); m_topText = m_textVertices.size(); }
+    // menus, 2026-11-23). May be called several times a frame: each call
+    // starts a new layer above the previous ones, so stacked temporary boxes
+    // hide each other's text too (review F148). Reset by BeginFrame.
+    void BeginTopLayer();
+    // Bumped whenever cached vertices go stale: a screen size change (they
+    // hold NDC positions) or a rebuilt glyph atlas (text holds old UVs).
+    // Throttle caches from an older generation are not replayed (F374/F375).
+    unsigned Generation() const { return m_generation; }
     void SetTextBackgroundStyle(float r, float g, float b, float a, float paddingPx, float cornerRadiusPx);
 
 private:
@@ -131,6 +142,17 @@ private:
     // which shows as panels flashing off. Overflow is now logged.
     static const UINT kMaxVertices = 200000;
     UINT m_droppedVertices = 0;
+    UINT m_droppedText = 0;              // text vertices dropped this frame (F149)
+    unsigned long long m_droppedTotal = 0;   // never reset; lets EndStatic see a drop (F156)
+    unsigned long long m_staticDropMark = 0;
+    unsigned m_generation = 1;
+    // Saved in BeginFrame, put back at the end of EndFrame (F152): the game's
+    // PS t0/s0 and its HS/DS, which this renderer overwrites or nulls.
+    ID3D11ShaderResourceView* m_savedSRV = nullptr;
+    ID3D11SamplerState* m_savedSampler = nullptr;
+    ID3D11HullShader* m_savedHS = nullptr;
+    ID3D11DomainShader* m_savedDS = nullptr;
+    void RestoreGameSlots();
     // Write positions in the two dynamic vertex buffers, used as rings: each
     // frame appends after the last (MAP_WRITE_NO_OVERWRITE) and only a full
     // buffer is renamed with MAP_WRITE_DISCARD. Discarding every frame made
@@ -151,6 +173,7 @@ private:
     char m_activeFace[64] = "";
     void ShutdownText();
     void PushGlyphQuad(float x, float y, float w, float h, const Glyph& g, UINT64 rgba);
+    void PushGlyphQuadRotated(float x, float yBottom, float along, float w, float h, const Glyph& g, UINT64 rgba);
 
     ID3D11VertexShader* m_textVs = nullptr;
     ID3D11PixelShader* m_textPs = nullptr;
@@ -175,7 +198,9 @@ private:
     // (PushGlyphQuad just stops appending, no error). Sized with real
     // headroom instead of exactly fitting current usage; 24 bytes/vertex
     // makes even this a rounding error in GPU memory.
-    static const UINT kMaxTextVertices = 20000;
+    // Raised to 40000 (review F149): the full shortcut list alone is ~14.7k
+    // and a full HUD ~8k; overflow is now counted and logged.
+    static const UINT kMaxTextVertices = 40000;
 
     static const int kGlyphFirst = 32;   // ' '
     static const int kGlyphCount = 95;   // through '~' (126)
@@ -203,7 +228,7 @@ public:
         unsigned long long key = 0;   // the widget's hash of what it holds
         bool valid = false;
     };
-    size_t BeginStatic() const { return m_vertices.size(); }
+    size_t BeginStatic() { m_staticDropMark = m_droppedTotal; return m_vertices.size(); }
     void EndStatic(size_t mark, StaticBatch& batch);
     void DrawStatic(StaticBatch& batch);
 
@@ -212,9 +237,9 @@ private:
     struct StaticInsert { size_t at; StaticBatch* batch; };
     std::vector<StaticInsert> m_inserts;
     std::vector<StaticBatch*> m_batches;   // to release on Shutdown
-    // BeginTopLayer's split points (vertex indices); SIZE_MAX = no top layer.
-    size_t m_topShape = static_cast<size_t>(-1);
-    size_t m_topText = static_cast<size_t>(-1);
+    // BeginTopLayer's split points (shape, text vertex indices), in order.
+    struct LayerSplit { size_t shape; size_t text; };
+    std::vector<LayerSplit> m_layers;
 
 public:
     // Lets a widget throttled below full frame rate (see the tier notes on
@@ -228,8 +253,11 @@ public:
         std::vector<TextVertex> textVerts;
         std::vector<StaticInsert> inserts;   // static batches drawn in the captured range
         bool valid = false;
+        unsigned generation = 0;             // Renderer::Generation() when captured
     };
-    struct CaptureMark { size_t shapeCount; size_t textCount; };
+    // insertCount: only inserts added after the mark belong to the capture,
+    // not one another widget added exactly at it (review F156).
+    struct CaptureMark { size_t shapeCount; size_t textCount; size_t insertCount; };
 
     // Call right before running normal draw logic...
     CaptureMark BeginCapture() const;
@@ -238,4 +266,5 @@ public:
     // On a throttled-out frame, call this INSTEAD of the normal draw logic
     // to re-append the last captured geometry unchanged.
     void Replay(const Cache& cache);
+    bool CacheCurrent(const Cache& cache) const { return cache.valid && cache.generation == m_generation; }
 };

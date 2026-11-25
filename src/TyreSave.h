@@ -15,8 +15,17 @@ namespace TyreSave
 {
     bool Draw(Renderer& renderer, int screenWidth, int screenHeight);
 
+    // Scoring thread, after g_fuelStore/g_tyreWear.OnScoring: set clock, lap
+    // bookkeeping and targets, kept running while the panel is hidden (F25).
+    void Update();
+
     // Save thread (Persist.cpp), any time: writes the tyre-wear profile if a
     // lap was learned since the last call, and reads a new car+track's
-    // profile that Draw asked for (Draw picks it up on a later frame).
-    void FlushIfDirty();
+    // profile that Update asked for (picked up on a later update).
+    // loadOnly: just the pending profile read (Persist::RequestLoad, review F275).
+    void FlushIfDirty(bool loadOnly = false);
+
+    // Any thread (EndSession): forget the current set; Update acts on it on
+    // its next call, so the next session starts a fresh set clock (review F353).
+    void RequestReset();
 }

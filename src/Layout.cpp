@@ -7,10 +7,13 @@
 #include <cstring>
 #include <cmath>
 
+static int g_ownerTag = -1;   // box-stats owner tag, see Layout::SetOwnerTag
+
 namespace
 {
     struct Panel
     {
+        int ownerTag = -1;   // box-stats: which drawn box registered it
         const char* name;
         const char* section;
         const char* xKey;
@@ -161,7 +164,15 @@ namespace
             return false;
 
         POINT p;
-        if (!GetCursorPos(&p) || !ScreenToClient(hwnd, &p))
+        if (!GetCursorPos(&p))
+            return false;
+        // Only while the game has focus and the pointer is over it: a click
+        // in another window on top (or a second monitor) must not land on a
+        // panel underneath (review F215).
+        const HWND root = GetAncestor(hwnd, GA_ROOT);
+        if (GetForegroundWindow() != root || GetAncestor(WindowFromPoint(p), GA_ROOT) != root)
+            return false;
+        if (!ScreenToClient(hwnd, &p))
             return false;
 
         RECT client;
@@ -255,6 +266,7 @@ void Layout::Register(const char* name,
     }
 
     p->name = name;
+    p->ownerTag = g_ownerTag;
     p->section = section;
     p->xKey = xKey;
     p->yKey = yKey;
@@ -356,6 +368,36 @@ bool Layout::NudgeFraction(float* fraction, const char* section, const char* key
     return Config::WriteFloat(section, key, *fraction);
 }
 
+namespace { bool g_pressClaimed = false; }
+
+void Layout::SetOwnerTag(int tag) { g_ownerTag = tag; }
+int Layout::OwnerTagOf(int index) { return (index >= 0 && index < g_panelCount) ? g_panels[index].ownerTag : -1; }
+
+int Layout::RegisteredCount()
+{
+    return g_panelCount;
+}
+
+bool Layout::GetRegistered(int index, const char** name, float* centerX, float* centerY,
+                           float* halfW, float* halfH, bool* seenThisFrame)
+{
+    if (index < 0 || index >= g_panelCount)
+        return false;
+    const Panel& p = g_panels[index];
+    if (p.screenW != g_lastScreenW || p.screenH != g_lastScreenH)
+        return false;   // offsets measured at another resolution
+    float cx, cy;
+    PanelBox(p, g_lastScreenW, g_lastScreenH, cx, cy);
+    *name = p.name; *centerX = cx; *centerY = cy;
+    *halfW = p.halfW; *halfH = p.halfH; *seenThisFrame = p.seenThisFrame;
+    return true;
+}
+
+void Layout::ClaimPress()
+{
+    g_pressClaimed = true;
+}
+
 void Layout::Poll(HWND hwnd, int bbW, int bbH)
 {
     // Outside layout mode the mouse is not read at all -- no cursor query, no
@@ -373,11 +415,19 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
 
     float cx = 0.0f, cy = 0.0f;
     const bool haveCursor = CursorInBackbuffer(hwnd, bbW, bbH, cx, cy);
-    const bool buttonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    // No cursor counts as button up, so a gesture whose release was never
+    // seen (cursor hidden first) still ends here instead of hijacking the
+    // next click (review F159).
+    const bool buttonDown = haveCursor && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const bool gestureActive = g_dragX || g_resizeScale || g_boxW;
+    // A claim lasts for the press it was made in (review F124).
+    const bool claimed = g_pressClaimed;
+    if (!buttonDown)
+        g_pressClaimed = false;
 
-    if (!haveCursor)
+    if (!haveCursor && !gestureActive)
     {
-        g_prevButtonDown = buttonDown;
+        g_prevButtonDown = false;
         return;
     }
 
@@ -387,7 +437,7 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
     // Handle size in pixels, matching what Draw paints.
     const float handlePx = 22.0f * (static_cast<float>(bbH) / 2160.0f);
 
-    if (buttonDown && !g_prevButtonDown)
+    if (buttonDown && !g_prevButtonDown && !claimed)
     {
         // Corner handles are tested BEFORE panel bodies: a handle sits on its
         // own panel's edge, so body-first would always win and resizing
@@ -409,6 +459,15 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
                     corner = c;
             }
             if (corner < 0) continue;
+            // A panel still on a negative "place me automatically" sentinel
+            // has no real anchor to resize from: it would jump to 0,0 and
+            // save that (review F157). Give it a chance to resolve, else skip.
+            if (p.onDragStart && (*p.xFraction < 0.0f || *p.yFraction < 0.0f)) p.onDragStart();
+            if (*p.xFraction < 0.0f || *p.yFraction < 0.0f)
+            {
+                Log::Write("Layout: '%s' has no resolved position yet -- resize ignored", p.name ? p.name : "?");
+                break;
+            }
             // The anchor is the opposite corner.
             g_anchorSideX = (corner & 1) ? 1.0f : -1.0f;
             g_anchorSideY = (corner & 2) ? 1.0f : -1.0f;
@@ -479,6 +538,16 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
         if (best)
         {
             if (best->onDragStart) best->onDragStart();
+            // Still on a negative sentinel after the hook: the grab offset
+            // would pin it to 0,0 for the whole drag and save that (F157).
+            if (*best->xFraction < 0.0f || *best->yFraction < 0.0f)
+            {
+                Log::Write("Layout: '%s' has no resolved position yet -- drag ignored", best->name ? best->name : "?");
+                best = nullptr;
+            }
+        }
+        if (best)
+        {
             g_dragX = best->xFraction;
             g_dragY = best->yFraction;
             g_dragSection = best->section;
@@ -508,8 +577,10 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
             const float hw = p.halfW * k, hh = p.halfH * k;
             const float wantCx = g_anchorX - g_anchorSideX * hw;
             const float wantCy = g_anchorY - g_anchorSideY * hh;
-            *p.xFraction += (wantCx - pcx) / bbW;
-            *p.yFraction += (wantCy - pcy) / bbH;
+            // Clamped like drag and nudge, so a resize near an edge can't
+            // save an off-screen position (review F409).
+            *p.xFraction = Clamp01(*p.xFraction + (wantCx - pcx) / bbW);
+            *p.yFraction = Clamp01(*p.yFraction + (wantCy - pcy) / bbH);
             break;
         }
         *g_resizeScale = newScale;
@@ -534,8 +605,8 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
             PanelBox(p, bbW, bbH, pcx, pcy);
             const float wantCx = g_anchorX - g_anchorSideX * w * px * 0.5f;
             const float wantCy = g_anchorY - g_anchorSideY * h * px * 0.5f;
-            *p.xFraction += (wantCx - pcx) / bbW;
-            *p.yFraction += (wantCy - pcy) / bbH;
+            *p.xFraction = Clamp01(*p.xFraction + (wantCx - pcx) / bbW);   // F409
+            *p.yFraction = Clamp01(*p.yFraction + (wantCy - pcy) / bbH);
             break;
         }
     }
@@ -544,7 +615,7 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
         *g_dragX = Clamp01(fx - g_grabOffsetX);
         *g_dragY = Clamp01(fy - g_grabOffsetY);
     }
-    else if (!buttonDown && g_prevButtonDown && g_resizeScale)
+    else if (!buttonDown && g_resizeScale)   // no prev-state test: F159
     {
         if (!Config::WriteFloat(g_resizeSection, g_resizeKey, *g_resizeScale))
             Log::Write("Layout: failed to write [%s] %s to the INI", g_resizeSection, g_resizeKey);
@@ -553,7 +624,7 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
         g_resizeScale = nullptr;
         SaveResizedPosition();
     }
-    else if (!buttonDown && g_prevButtonDown && g_boxW && g_boxH)
+    else if (!buttonDown && g_boxW && g_boxH)
     {
         const bool okW = Config::WriteFloat(g_boxSection, g_boxWKey, *g_boxW);
         const bool okH = Config::WriteFloat(g_boxSection, g_boxHKey, *g_boxH);
@@ -563,7 +634,7 @@ void Layout::Poll(HWND hwnd, int bbW, int bbH)
         g_boxH = nullptr;
         SaveResizedPosition();
     }
-    else if (!buttonDown && g_prevButtonDown && g_dragX && g_dragY)
+    else if (!buttonDown && g_dragX && g_dragY)
     {
         // Release: persist once, rather than writing to the INI on every
         // frame of the drag.

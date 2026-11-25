@@ -9,11 +9,9 @@
 #include "LapDelta.h"
 #include "Persist.h"
 #include "Sound.h"
-#include "StoreFile.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <algorithm>
 
 BrakeCueStore g_brakeCue;
 
@@ -96,18 +94,43 @@ void BrakeCueStore::Init()
     m_ready = true;
 }
 
-void BrakeCueStore::PlayBeep()
+bool BrakeCueStore::PlayBeep()
 {
     if (!m_ready || !m_wavBuffer)
-        return;
+        return false;
     // The Ctrl+Shift toggle kills the beep as well as the on-screen cue --
     // one switch for the whole feature, so hiding it does not leave the sim
     // still beeping at you from a widget you cannot see.
-    if (!Shortcuts::Visible(Shortcuts::BrakeCue))
-        return;
+    // Toggled, not Visible: layout mode or Enabled=0 overrides must not
+    // switch the beep on (review F199).
+    if (!Shortcuts::Toggled(Shortcuts::BrakeCue))
+        return false;
     // Handed to the sound thread: even SND_ASYNC PlaySound opens the wave
     // device before returning, and this is the game's telemetry callback.
     Sound::PlayMemory(m_wavBuffer);
+    return true;
+}
+
+namespace
+{
+    // Largest forward step between two telemetry ticks still treated as
+    // driving past a cue (a scoring resync, a cut chicane). Anything bigger
+    // is a teleport/rejoin: nothing fires across it.
+    const double kMaxCueStepM = 60.0;
+
+    double WrapDist(double d, double len)
+    {
+        while (d >= len) d -= len;
+        while (d < 0.0) d += len;
+        return d;
+    }
+
+    // Did moving 'step' metres forward from 'prev' pass 'target'? Wrap-aware.
+    bool Crossed(double prev, double step, double target, double len)
+    {
+        const double ahead = WrapDist(target - prev, len);
+        return ahead > 0.0 && ahead <= step;
+    }
 }
 
 double BrakeCueStore::LeadTimeSeconds() const
@@ -160,8 +183,10 @@ void BrakeCueStore::OnTelemetry(const TelemInfoV01& info)
     if (!m_ready)
         return;
 
-    // Forward speed from local velocity (Z is the car's own forward axis).
-    m_forwardSpeed = info.mLocalVel.z;
+    // Forward speed from local velocity. rF2's local +z points to the REAR,
+    // so forward is -z; the raw value ran the extrapolated distance
+    // backwards between scoring resyncs (review F240, as MiniSector/Radar).
+    m_forwardSpeed = -info.mLocalVel.z;
 
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -181,22 +206,42 @@ void BrakeCueStore::OnTelemetry(const TelemInfoV01& info)
     }
     m_currentDist = dist;
 
-    // --- Brake pedal profile of the current lap ---
-    if (m_trackLength > kBrakeBinM)
+    // Scoring re-anchored (lap count jumped) or the car is not under local
+    // control: this lap's recording can no longer count.
+    if (m_invalidateLap.exchange(false) || !m_recordAllowed.load())
+        m_lapFullyRecorded = false;
+
+    // --- Lap rollover, straight from telemetry (review F65/F394) ---
+    // The finished lap's points go to scoring under m_lock; the
+    // accept/reject decision waits there for the lap time.
+    if (m_lastTelemLap < 0)
     {
-        const size_t bins = static_cast<size_t>(ceil(m_trackLength / kBrakeBinM));
-        const size_t bin = static_cast<size_t>(dist / kBrakeBinM);
-        const float brake = static_cast<float>(info.mUnfilteredBrake);
+        m_lastTelemLap = info.mLapNumber;
+        m_lapFullyRecorded = false; // joined part way
+    }
+    else if (info.mLapNumber != m_lastTelemLap)
+    {
+        const bool plusOne = (info.mLapNumber == m_lastTelemLap + 1);
+        m_lastTelemLap = info.mLapNumber;
         EnterCriticalSection(&m_lock);
-        if (m_recBrake.size() != bins)
-            m_recBrake.assign(bins, 0.0f);
-        if (bin < bins && brake > m_recBrake[bin])
-            m_recBrake[bin] = brake;
+        m_finished.count = m_recordingCount;
+        for (int i = 0; i < m_recordingCount; ++i)
+        {
+            m_finished.points[i] = m_recording[i];
+            m_finished.dropMs[i] = m_recordingEntrySpeed[i] - m_recordingMinSpeed[i];
+        }
+        m_finished.fullyRecorded = m_lapFullyRecorded && plusOne;
+        m_finishedReady = true;
         LeaveCriticalSection(&m_lock);
+        m_recordingCount = 0;
+        m_lapFullyRecorded = plusOne && m_recordAllowed.load();
     }
 
     if (!g_brakeCueConfig.enabled)
+    {
+        m_havePrevDist = false;
         return;
+    }
 
     // --- Record braking points on the current lap ---
     const bool braking = info.mUnfilteredBrake > g_brakeCueConfig.brakeThreshold;
@@ -242,36 +287,51 @@ void BrakeCueStore::OnTelemetry(const TelemInfoV01& info)
     m_wasPedalPressed = pedalPressed;
 
     // --- Check against the reference (best) lap ---
-    if (m_referenceCount > 0 && m_nextCueIndex < m_referenceCount)
+    // Every point whose target was crossed since last tick fires, in any
+    // order (review F59/F394). A fired point re-arms half a lap later, so a
+    // target sliding forward as the car slows cannot fire it twice.
+    bool beep = false;
+    if (m_havePrevDist && m_trackLength > 1.0)
     {
-        // Current speed as the estimate of speed at the point itself -- a good
-        // approximation since this is re-evaluated every telemetry update as
-        // you get closer, so it keeps refining right up to the trigger.
-        const double leadDistance = fabs(m_forwardSpeed) * LeadTimeSeconds();
-
-        double target = m_reference[m_nextCueIndex] - leadDistance;
-        if (target < 0.0) target += m_trackLength;
-
-        // Fire once we reach or pass the target (handles frame-to-frame gaps
-        // stepping slightly past it rather than landing exactly on it).
-        if (dist >= target && dist < target + 10.0) // +10m guard against a lap-wrap false match
+        const double len = m_trackLength;
+        double step = dist - m_prevDist;
+        if (step < -0.5 * len) step += len;
+        else if (step > 0.5 * len) step -= len;
+        if (step > 0.0 && step <= kMaxCueStepM)
         {
-            // Small stops (a lift, a dab) are passed over silently. Read
-            // live, so the slider takes effect straight away.
-            if (m_referenceDropMs[m_nextCueIndex] * 3.6 < g_brakeCueConfig.minSpeedDropKmh)
+            // Current speed as the estimate of speed at the point itself --
+            // re-evaluated every tick, so it keeps refining up to the trigger.
+            const double leadDistance = fabs(m_forwardSpeed) * LeadTimeSeconds();
+            const bool cueOk = m_cueAllowed.load();
+            EnterCriticalSection(&m_lock);
+            for (int i = 0; i < m_referenceCount; ++i)
             {
-                ++m_nextCueIndex;
-                return;
+                if (!m_refFired[i])
+                {
+                    if (Crossed(m_prevDist, step, WrapDist(m_reference[i] - leadDistance, len), len))
+                    {
+                        m_refFired[i] = true;
+                        // Small stops (a lift, a dab) pass silently; pit lane,
+                        // yellow, AI or ride-along pass silently too (F257).
+                        if (cueOk && m_referenceDropMs[i] * 3.6 >= g_brakeCueConfig.minSpeedDropKmh)
+                            beep = true;
+                    }
+                }
+                else if (Crossed(m_prevDist, step, WrapDist(m_reference[i] + 0.5 * len, len), len))
+                    m_refFired[i] = false;
             }
-            PlayBeep();
-            ++m_nextCueIndex;
-
-            // Only arm a measurement if the pedal is currently free -- a cue
-            // landing mid-braking (a second point in the same zone, a corner
-            // taken on the brakes) has no pedal movement of its own to time.
-            m_pendingBeep = !pedalPressed;
-            m_beepTime = now;
+            LeaveCriticalSection(&m_lock);
         }
+    }
+    m_prevDist = dist;
+    m_havePrevDist = true;
+
+    // Only arm a measurement if a beep was really heard and the pedal is
+    // free -- a cue landing mid-braking has no pedal movement of its own.
+    if (beep && PlayBeep())
+    {
+        m_pendingBeep = !pedalPressed;
+        m_beepTime = now;
     }
 }
 
@@ -295,7 +355,26 @@ void BrakeCueStore::OnScoring(const ScoringInfoV01& info)
         }
     }
     if (!player)
+    {
+        // Ride-along / spectating: nothing here is ours (review F62).
+        m_cueAllowed = false;
+        m_recordAllowed = false;
         return;
+    }
+
+    // Only learn from and beep for the player's own driving (review F62),
+    // and only beep on track at green in realtime (review F257).
+    const bool human = (player->mControl == 0);
+    // Also not while the AI or a team-mate drives our car (review F167/F252).
+    m_recordAllowed = human && g_localPlayerDriving.load(std::memory_order_relaxed);
+    // Phase 5 (green), 6 (full-course yellow) and 8 (leader has finished)
+    // while you are still racing: phase 5 alone went silent on your last lap
+    // once the leader took the flag, and under FCY (CrewChief review
+    // 2026-11-24). Your own mFinishStatus ends it once you are done.
+    const bool racingPhase = info.mGamePhase == 5 || info.mGamePhase == 6
+                          || info.mGamePhase == 8;
+    m_cueAllowed = human && !player->mInPits && info.mInRealtime && racingPhase
+                && player->mFinishStatus == 0;
 
     // Resync extrapolated distance to the authoritative value.
     m_lastKnownDist = player->mLapDist;
@@ -308,26 +387,15 @@ void BrakeCueStore::OnScoring(const ScoringInfoV01& info)
     if (player->mCountLapFlag < m_lapValidityLatch)
         m_lapValidityLatch = player->mCountLapFlag;
 
-    // This car+track's saved brake profiles, once LapDelta has the key.
+    // A different car in the same session (LapDelta's car+track key): the
+    // old car's braking points and best time must not cue this one (F359).
     {
         const std::string& key = g_lapDelta.CurrentKey();
-        if (!key.empty() && key != m_savedKey && m_trackLength > kBrakeBinM)
-            LoadSavedLaps(key, static_cast<size_t>(ceil(m_trackLength / kBrakeBinM)));
-    }
-
-    if (m_pendingSave)
-    {
-        if (player->mLastLapTime > 0.0 && player->mLastLapTime != m_pendingOldLapTime)
+        if (!key.empty() && key != m_carKey)
         {
-            AddSavedLap(player->mLastLapTime, m_pendingBrake);
-            m_lapTimeAtStart = player->mLastLapTime;
-            m_pendingSave = false;
-            m_pendingBrake.clear();
-        }
-        else if (info.mCurrentET - m_pendingSinceET > 5.0)
-        {
-            m_pendingSave = false;
-            m_pendingBrake.clear();
+            if (!m_carKey.empty())
+                ResetReference();
+            m_carKey = key;
         }
     }
 
@@ -338,71 +406,117 @@ void BrakeCueStore::OnScoring(const ScoringInfoV01& info)
         return;
     }
 
-    // Lap just completed.
-    if (player->mTotalLaps > m_lastTotalLaps)
+    if (player->mTotalLaps != m_lastTotalLaps)
     {
+        const bool plusOne = (player->mTotalLaps == m_lastTotalLaps + 1);
         m_lastTotalLaps = player->mTotalLaps;
-
-        const bool validForTiming = (m_lapValidityLatch == 2);
-        const bool isNewBest = validForTiming &&
-            (m_referenceLapTime < 0.0 || player->mLastLapTime < m_referenceLapTime);
-
-        // The brake profile goes with the best lap, then starts over. Only
-        // when it covered the whole lap: a lap joined part way (left the
-        // pits, came back from the monitor) leaves bins never driven at 0,
-        // which is indistinguishable from "did not brake here". Without
-        // braking points (beep off) the lap time is tracked here instead.
-        // The profile goes into the saved best five (see the header) rather
-        // than straight into the reference. The lap time can reach scoring a
-        // tick or two after the lap count, so wait for it to change.
-        std::vector<float> finished;
-        EnterCriticalSection(&m_lock);
-        if (validForTiming && m_lapFullyRecorded && !m_recBrake.empty())
-            finished = m_recBrake;
-        std::fill(m_recBrake.begin(), m_recBrake.end(), 0.0f);
-        LeaveCriticalSection(&m_lock);
-        if (!finished.empty())
+        if (plusOne)
         {
-            if (player->mLastLapTime > 0.0 && player->mLastLapTime != m_lapTimeAtStart)
-                AddSavedLap(player->mLastLapTime, finished);
-            else
-            {
-                m_pendingSave = true;
-                m_pendingOldLapTime = m_lapTimeAtStart;
-                m_pendingSinceET = info.mCurrentET;
-                m_pendingBrake.swap(finished);
-            }
+            // Lap just completed. The decision waits for both the telemetry
+            // snapshot and a fresh lap time (review F58).
+            m_pendingLap = true;
+            m_pendingHaveSnap = false;
+            // Captured now: the "driven by you all lap" latch is re-armed
+            // after this tick, and the lap may resolve ticks later.
+            m_pendingCountsForTime = (m_lapValidityLatch >= 1)
+                && g_localPlayerLapClean.load(std::memory_order_relaxed);
+            m_pendingOldLapTime = m_lapTimeAtStart;
+            m_pendingSinceET = info.mCurrentET;
         }
-        if (isNewBest && (m_recordingCount == 0 || !g_brakeCueConfig.enabled))
-            m_referenceLapTime = player->mLastLapTime;
-        m_lapTimeAtStart = player->mLastLapTime;
-        m_lapFullyRecorded = true;
-
-        if (isNewBest && m_recordingCount > 0)
+        else
         {
-            memcpy(m_reference, m_recording, sizeof(double) * m_recordingCount);
-            int bigStops = 0;
-            for (int i = 0; i < m_recordingCount; ++i)
-            {
-                m_referenceDropMs[i] = m_recordingEntrySpeed[i] - m_recordingMinSpeed[i];
-                if (m_referenceDropMs[i] * 3.6 >= g_brakeCueConfig.minSpeedDropKmh)
-                    ++bigStops;
-            }
-            m_referenceCount = m_recordingCount;
-            m_referenceLapTime = player->mLastLapTime;
-            Log::Write("BrakeCue: new best lap %.3fs, %d braking points recorded, %d over the %.0f km/h drop",
-                       m_referenceLapTime, m_referenceCount, bigStops, g_brakeCueConfig.minSpeedDropKmh);
-            for (int i = 0; i < m_recordingCount; ++i)
-                Log::Write("BrakeCue:   point %d at %.0fm, drop %.0f km/h", i + 1, m_reference[i],
-                           m_referenceDropMs[i] * 3.6);
+            // Any other jump (restart, stale tick, a team-mate's stint) is
+            // not one finished lap: re-anchor instead (review F61).
+            m_pendingLap = false;
+            m_invalidateLap = true;
+            m_lapTimeAtStart = player->mLastLapTime;
+            EnterCriticalSection(&m_lock);
+            m_finishedReady = false;
+            LeaveCriticalSection(&m_lock);
+            Log::Write("BrakeCue: lap count jumped to %d -- re-anchored", static_cast<int>(player->mTotalLaps));
         }
-
-        // Start recording fresh for the new lap either way.
-        m_recordingCount = 0;
-        m_wasBraking = false;
-        m_nextCueIndex = 0;
         m_lapValidityLatch = 2; // reset for next lap
     }
+
+    if (m_pendingLap)
+        ResolvePendingLap(player->mLastLapTime, info.mCurrentET);
+    // The time seen before the next line tick (review F115): a lap time that
+    // arrived after a pending lap timed out must not be taken as the next
+    // lap's time.
+    if (!m_pendingLap)
+        m_lapTimeAtStart = player->mLastLapTime;
+}
+
+void BrakeCueStore::ResolvePendingLap(double lastLapTime, double currentET)
+{
+    if (!m_pendingHaveSnap)
+    {
+        EnterCriticalSection(&m_lock);
+        if (m_finishedReady)
+        {
+            m_pendingSnap = m_finished;
+            m_finishedReady = false;
+            m_pendingHaveSnap = true;
+        }
+        LeaveCriticalSection(&m_lock);
+    }
+
+    const bool fresh = lastLapTime > 0.0 && lastLapTime != m_pendingOldLapTime;
+    if (!m_pendingHaveSnap || !fresh)
+    {
+        if (currentET - m_pendingSinceET > 5.0)
+        {
+            m_pendingLap = false;
+            m_lapTimeAtStart = lastLapTime;
+        }
+        return;
+    }
+    m_pendingLap = false;
+    m_lapTimeAtStart = lastLapTime;
+
+    // Same acceptance rule as LapDelta (review F57): flag >= 1, a plausible
+    // time, and a lap recorded from the line under local control.
+    const bool plausible = lastLapTime > 5.0 && lastLapTime < 100000.0;
+    const bool valid = m_pendingCountsForTime && plausible && m_pendingSnap.fullyRecorded;
+    if (!valid)
+        return;
+
+    if (m_referenceLapTime >= 0.0 && lastLapTime >= m_referenceLapTime)
+        return;
+    m_referenceLapTime = lastLapTime;
+    // A best lap without braking points (beep off) only moves the time.
+    const int n = m_pendingSnap.count;
+    if (n <= 0)
+        return;
+
+    int bigStops = 0;
+    EnterCriticalSection(&m_lock);
+    for (int i = 0; i < n; ++i)
+    {
+        m_reference[i] = m_pendingSnap.points[i];
+        m_referenceDropMs[i] = m_pendingSnap.dropMs[i];
+        m_refFired[i] = false;
+        if (m_referenceDropMs[i] * 3.6 >= g_brakeCueConfig.minSpeedDropKmh)
+            ++bigStops;
+    }
+    m_referenceCount = n;
+    LeaveCriticalSection(&m_lock);
+    Log::Write("BrakeCue: new best lap %.3fs, %d braking points recorded, %d over the %.0f km/h drop",
+               m_referenceLapTime, n, bigStops, g_brakeCueConfig.minSpeedDropKmh);
+    for (int i = 0; i < n; ++i)
+        Log::Write("BrakeCue:   point %d at %.0fm, drop %.0f km/h", i + 1, m_pendingSnap.points[i],
+                   m_pendingSnap.dropMs[i] * 3.6);
+}
+
+void BrakeCueStore::ResetReference()
+{
+    EnterCriticalSection(&m_lock);
+    m_referenceCount = 0;
+    m_finishedReady = false;
+    LeaveCriticalSection(&m_lock);
+    m_referenceLapTime = -1.0;
+    m_pendingLap = false;
+    m_invalidateLap = true;
 }
 
 void BrakeCueStore::OnExitRealtime()
@@ -416,8 +530,10 @@ void BrakeCueStore::OnExitRealtime()
 
     m_recordingCount = 0;
     m_wasBraking = false;
-    m_nextCueIndex = 0;
     m_lastTotalLaps = -1;
+    m_lastTelemLap = -1;
+    m_havePrevDist = false;
+    m_pendingLap = false;
 
     m_pendingBeep = false;
     m_wasPedalPressed = false;
@@ -427,7 +543,9 @@ void BrakeCueStore::OnExitRealtime()
     if (m_ready)
     {
         EnterCriticalSection(&m_lock);
-        std::fill(m_recBrake.begin(), m_recBrake.end(), 0.0f);
+        m_finishedReady = false;
+        // Re-armed: on rejoin only targets actually crossed fire (F59).
+        for (int i = 0; i < kMaxPoints; ++i) m_refFired[i] = false;
         LeaveCriticalSection(&m_lock);
     }
 }
@@ -441,17 +559,16 @@ void BrakeCueStore::Clear()
     // The reference braking points and the reaction times measured against
     // them belong to the session/track being left, so both go here (unlike
     // OnExitRealtime above, which keeps them).
-    m_referenceCount = 0;
+    if (m_ready)
+    {
+        EnterCriticalSection(&m_lock);
+        m_referenceCount = 0;
+        LeaveCriticalSection(&m_lock);
+    }
     m_referenceLapTime = -1.0;
 
-    // Callers flush first (see Plugin.cpp); reloaded on the next scoring tick.
-    AcquireSRWLockExclusive(&m_saveLock);
-    m_savedLaps.clear();
-    m_savedKey.clear();
-    m_savedDirty = false;
-    ReleaseSRWLockExclusive(&m_saveLock);
-    m_pendingSave = false;
-    m_pendingBrake.clear();
+    m_carKey.clear();
+    m_pendingLap = false;
 
     m_reactionHistoryCount = 0;
     m_reactionHistoryNext = 0;
@@ -461,8 +578,6 @@ void BrakeCueStore::Clear()
         return;
     EnterCriticalSection(&m_lock);
     m_state = State{};
-    m_refBrake.clear();
-    m_recBrake.clear();
     LeaveCriticalSection(&m_lock);
 }
 
@@ -553,159 +668,4 @@ bool BrakeCue::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     renderer.AddText(centerX, centerY - textHeightPx * 0.5f, buf, textHeightPx,
                      cfg.reactionStatsR, cfg.reactionStatsG, cfg.reactionStatsB, 1.0f, Renderer::HAlign::Center);
     return true;
-}
-
-// --- Saved brake profiles: the best five laps, kept across sessions ---
-
-namespace
-{
-    const unsigned kBrakeFileMagic = 0x4B425253; // "SRBK"
-    const unsigned kBrakeFileVersion = 1;
-}
-
-void BrakeCueStore::LoadSavedLaps(const std::string& key, size_t bins)
-{
-    // Read into a local list first, outside any lock; m_saveLock is only
-    // taken to swap it in (FlushIfDirty may be copying the old list on the
-    // save thread at the same moment).
-    std::vector<SavedLap> laps;
-    char dir[MAX_PATH];
-    LapDeltaStore::SaveDir(dir, sizeof(dir));
-    char path[MAX_PATH];
-    sprintf_s(path, "%s\\%s.brake", dir, key.c_str());
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "rb") == 0 && f)
-    {
-        unsigned hdr[4] = {};
-        if (fread(hdr, sizeof(unsigned), 4, f) == 4 && hdr[0] == kBrakeFileMagic && hdr[1] == kBrakeFileVersion
-            && hdr[2] <= static_cast<unsigned>(kKeptLaps))
-        {
-            if (hdr[3] == bins)
-            {
-                for (unsigned i = 0; i < hdr[2]; ++i)
-                {
-                    SavedLap lap;
-                    lap.brake.resize(bins);
-                    if (fread(&lap.lapTime, sizeof(double), 1, f) != 1
-                        || fread(lap.brake.data(), sizeof(float), bins, f) != bins)
-                        break;
-                    laps.push_back(std::move(lap));
-                }
-            }
-            else
-                Log::Write("BrakeCue: saved brake profiles for %s are for a different track length -- ignored", key.c_str());
-        }
-        fclose(f);
-    }
-    std::sort(laps.begin(), laps.end(),
-              [](const SavedLap& a, const SavedLap& b) { return a.lapTime < b.lapTime; });
-
-    AcquireSRWLockExclusive(&m_saveLock);
-    m_savedKey = key;
-    m_savedLaps.swap(laps);
-    m_savedDirty = false;
-    ReleaseSRWLockExclusive(&m_saveLock);
-
-    if (m_savedLaps.empty())
-        Log::Write("BrakeCue: no saved brake profiles yet for %s", key.c_str());
-    else
-        Log::Write("BrakeCue: loaded %zu saved brake profiles for %s (fastest %.3fs)",
-                   m_savedLaps.size(), key.c_str(), m_savedLaps.front().lapTime);
-    RebuildReferenceFromSaved();
-}
-
-void BrakeCueStore::WriteSavedLaps(const std::string& key, const std::vector<SavedLap>& laps)
-{
-    if (key.empty() || laps.empty())
-        return;
-    char dir[MAX_PATH];
-    LapDeltaStore::SaveDir(dir, sizeof(dir));
-    CreateDirectoryA(dir, nullptr);
-    char path[MAX_PATH];
-    sprintf_s(path, "%s\\%s.brake", dir, key.c_str());
-    char tmp[StoreFile::kTmpPathSize];
-    FILE* f = StoreFile::Begin(path, tmp, sizeof(tmp), "wb");
-    if (!f)
-    {
-        Log::Write("BrakeCue: failed to save brake profiles to %s", path);
-        return;
-    }
-    const unsigned bins = static_cast<unsigned>(laps.front().brake.size());
-    const unsigned hdr[4] = { kBrakeFileMagic, kBrakeFileVersion, static_cast<unsigned>(laps.size()), bins };
-    bool ok = fwrite(hdr, sizeof(unsigned), 4, f) == 4;
-    for (const SavedLap& lap : laps)
-    {
-        ok = ok && fwrite(&lap.lapTime, sizeof(double), 1, f) == 1;
-        ok = ok && fwrite(lap.brake.data(), sizeof(float), bins, f) == bins;
-    }
-    if (!StoreFile::Commit(f, tmp, path, ok))
-    {
-        Log::Write("BrakeCue: failed to save brake profiles to %s", path);
-        return;
-    }
-    Log::Write("BrakeCue: saved %zu brake profiles to %s", laps.size(), path);
-}
-
-void BrakeCueStore::AddSavedLap(double lapTime, const std::vector<float>& brake)
-{
-    if (m_savedKey.empty() || brake.empty() || lapTime <= 0.0)
-        return;
-    if (!m_savedLaps.empty() && m_savedLaps.front().brake.size() != brake.size())
-        return; // track length changed under us -- not comparable
-    if (static_cast<int>(m_savedLaps.size()) >= kKeptLaps && lapTime >= m_savedLaps.back().lapTime)
-        return;
-    SavedLap lap{ lapTime, brake };   // copied before taking the lock
-    AcquireSRWLockExclusive(&m_saveLock);
-    m_savedLaps.push_back(std::move(lap));
-    std::sort(m_savedLaps.begin(), m_savedLaps.end(),
-              [](const SavedLap& a, const SavedLap& b) { return a.lapTime < b.lapTime; });
-    if (static_cast<int>(m_savedLaps.size()) > kKeptLaps)
-        m_savedLaps.resize(kKeptLaps);
-    m_savedDirty = true;
-    ReleaseSRWLockExclusive(&m_saveLock);
-    // Learned at (or a tick or two after) the line: the save pass the line
-    // itself asked for may already have run.
-    Persist::RequestLearned();
-    Log::Write("BrakeCue: %.3fs joins the best %d brake profiles", lapTime, kKeptLaps);
-    RebuildReferenceFromSaved();
-}
-
-void BrakeCueStore::RebuildReferenceFromSaved()
-{
-    std::vector<float> ref;
-    if (!m_savedLaps.empty())
-    {
-        const size_t bins = m_savedLaps.front().brake.size();
-        const size_t n = m_savedLaps.size();
-        ref.resize(bins);
-        std::vector<float> v(n);
-        for (size_t b = 0; b < bins; ++b)
-        {
-            for (size_t i = 0; i < n; ++i) v[i] = m_savedLaps[i].brake[b];
-            std::sort(v.begin(), v.end());
-            ref[b] = (n % 2) ? v[n / 2] : 0.5f * (v[n / 2 - 1] + v[n / 2]);
-        }
-    }
-    EnterCriticalSection(&m_lock);
-    m_refBrake.swap(ref);
-    LeaveCriticalSection(&m_lock);
-}
-
-void BrakeCueStore::FlushIfDirty()
-{
-    if (!m_ready)
-        return;
-    // Save thread, any time. Copy under m_saveLock (which only the scoring
-    // thread's list changes also take), write after letting go.
-    std::string key;
-    std::vector<SavedLap> laps;
-    AcquireSRWLockExclusive(&m_saveLock);
-    if (m_savedDirty)
-    {
-        key = m_savedKey;
-        laps = m_savedLaps;
-        m_savedDirty = false;
-    }
-    ReleaseSRWLockExclusive(&m_saveLock);
-    WriteSavedLaps(key, laps);
 }

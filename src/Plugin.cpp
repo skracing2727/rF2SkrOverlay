@@ -16,6 +16,7 @@
 #include "Log.h"
 #include "CarState.h"
 #include "PedalTrace.h"
+#include "BrakeCue.h"
 #include "Config.h"
 #include "FrameLatency.h"
 #include "GearDisplay.h"
@@ -25,11 +26,9 @@
 #include "TyreWear.h"
 #include "SetupInfo.h"
 #include "DrsCue.h"
-#include "BrakeCue.h"
 #include "TrackAlerts.h"
 #include "RealtimeState.h"
 #include "PerfStats.h"
-#include "UpdateCheck.h"
 #include "InputLagEstimate.h"
 #include "MiniSector.h"
 #include "ProximityHue.h"
@@ -38,11 +37,13 @@
 #include "TyreTemps.h"
 #include "AmdGpuPower.h"
 #include "Shortcuts.h"
+#include "UpdateCheck.h"
 #include "GpuEngineUsage.h"
 #include "FfbGraph.h"
 #include "Profiler.h"
 #include "TrackMap.h"
 #include "EngineTemps.h"
+#include "Benchmark.h"
 #include "FfbLevel.h"
 #include "Conditions.h"
 #include "Weather.h"
@@ -52,8 +53,11 @@
 #include "Persist.h"
 #include "Sound.h"
 #include <atomic>
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
 
-// Set from the options list ("Reset timing tower"); acted on in the
+// Set from the wheel options list ("Reset timing tower"); acted on in the
 // scoring callback so the store is only ever touched from that thread.
 std::atomic<bool> g_resetTimingRequested{ false };
 #include "CarLayout.h"
@@ -61,6 +65,31 @@ std::atomic<bool> g_resetTimingRequested{ false };
 // Latched from scoring, read on the telemetry thread. -1 until the first
 // scoring tick names a player.
 static std::atomic<long> g_playerId{ -1 };
+
+// Who drives the player's car: see Persist.h for the meaning and how the
+// learning stores use them (review F30, F167, F252, F253).
+std::atomic<bool> g_localPlayerDriving{ false };
+std::atomic<bool> g_localPlayerLapClean{ false };
+
+// Review F263: the CRT's default invalid-parameter handler __fastfails the
+// whole game on any secure-CRT overflow (sprintf_s into a short buffer...),
+// past every __try. The DLL has its own static CRT, so this handler only
+// covers the plugin's calls: the call then fails (empty text) instead.
+// Counted here, logged from the save pass; nothing else is safe to do inside.
+static std::atomic<long> s_crtFaults{ 0 };
+static void __cdecl OnCrtBadParam(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, uintptr_t)
+{
+    s_crtFaults.fetch_add(1, std::memory_order_relaxed);
+}
+// Review F271: exceptions caught at the game-callback boundary (one tick
+// skipped instead of an exception unwinding into rF2).
+static std::atomic<long> s_cbFaults{ 0 };
+
+// Riding along is only trusted for the car you drove yourself earlier in
+// THIS session on this track (review F253): a stranger whose entry has the
+// stock name of a car you drove last week is never taken for yours.
+static bool s_droveThisSession = false;
+static char s_droveTrack[64] = {};
 
 // "My car" when rF2 marks no car as the player's: riding along while a
 // team-mate drives the shared car. It is the car last driven (its entry name,
@@ -80,13 +109,17 @@ static const ScoringInfoV01& PlayerView(const ScoringInfoV01& info, ScoringInfoV
         Config::ReadStringLive("Session", "LastVehicle", s_myVehicle, sizeof(s_myVehicle));
         s_myVehicleLoaded = true;
     }
-    if (!info.mVehicle) { g_playerId.store(-1); return info; }
+    if (!info.mVehicle) { g_playerId.store(-1); g_localPlayerDriving.store(false); return info; }
     for (int i = 0; i < info.mNumVehicles; ++i)
     {
         const VehicleScoringInfoV01& v = info.mVehicle[i];
         if (!v.mIsPlayer) continue;
         g_playerId.store(v.mID, std::memory_order_relaxed);
         g_playerAiControl.store(v.mControl == 1, std::memory_order_relaxed);
+        // 0 = local player; 1 = AI (Esc mid-race, after the flag) (review F167).
+        g_localPlayerDriving.store(v.mControl == 0, std::memory_order_relaxed);
+        s_droveThisSession = true;
+        strncpy_s(s_droveTrack, info.mTrackName, _TRUNCATE);
         if (strncmp(s_myVehicle, v.mVehicleName, sizeof(s_myVehicle) - 1) != 0)
         {
             strncpy_s(s_myVehicle, v.mVehicleName, _TRUNCATE);
@@ -94,10 +127,15 @@ static const ScoringInfoV01& PlayerView(const ScoringInfoV01& info, ScoringInfoV
         }
         return info;
     }
-    if (s_myVehicle[0])
+    // Riding along: never "the local player driving", whatever the car does.
+    g_localPlayerDriving.store(false, std::memory_order_relaxed);
+    if (s_myVehicle[0] && s_droveThisSession
+        && strncmp(s_droveTrack, info.mTrackName, sizeof(s_droveTrack) - 1) == 0)
     {
         for (int i = 0; i < info.mNumVehicles; ++i)
         {
+            // Only a remote driver (2) in that car is a team-mate (review F253).
+            if (info.mVehicle[i].mControl != 2) continue;
             if (strncmp(s_myVehicle, info.mVehicle[i].mVehicleName, sizeof(s_myVehicle) - 1) != 0) continue;
             s_viewVehicles.assign(info.mVehicle, info.mVehicle + info.mNumVehicles);
             s_viewVehicles[i].mIsPlayer = true;
@@ -122,12 +160,28 @@ static void PersistPass(bool all)
     g_gearDisplay.FlushIfDirty();
     g_fuelStore.FlushIfDirty();
     g_lapDelta.FlushIfDirty();
-    g_brakeCue.FlushIfDirty();
     TrackMap::FlushIfDirty();
     FuelSave::FlushIfDirty();
     TyreSave::FlushIfDirty();
+
+    // Faults caught since the last pass (reviews F263, F271).
+    static long s_crtLogged = 0, s_cbLogged = 0;
+    const long crt = s_crtFaults.load(), cb = s_cbFaults.load();
+    if (crt != s_crtLogged || cb != s_cbLogged)
+    {
+        Log::Write("Plugin: caught %ld CRT invalid-parameter fault(s), %ld callback exception(s) so far",
+                   crt, cb);
+        s_crtLogged = crt;
+        s_cbLogged = cb;
+    }
+
     if (!all)
+    {
+        // At the line too (on this thread, allowed by the disk rule), so a
+        // crash mid-race no longer loses the whole stint's log (review F174).
+        Log::FlushBuffered();
         return;
+    }
 
     // Out of the car only: settings, per-car layouts, and the log -- last, so
     // anything this pass itself logged goes out with it.
@@ -136,6 +190,13 @@ static void PersistPass(bool all)
     if (!Config::FlushPendingWrites())
         Log::Write("Plugin: one or more queued INI writes failed (read-only? UAC?)");
     Log::FlushBuffered();
+}
+
+// Persist::RequestLoad: only the profile reads, no writes (review F275).
+static void PersistLoadPass()
+{
+    FuelSave::FlushIfDirty(true);
+    TyreSave::FlushIfDirty(true);
 }
 
 // The player's completed laps at the last scoring tick, to see the line
@@ -150,6 +211,7 @@ public:
 
     void Startup(long version) override
     {
+        _set_invalid_parameter_handler(OnCrtBadParam);   // first: see OnCrtBadParam (review F263)
         Log::Init();
         Log::Write("SkrPlugin::Startup (game version %ld)", version);
         VehicleKey::Init();
@@ -160,6 +222,7 @@ public:
         s_myVehicleLoaded = true;
         g_carState.Init();
         g_pedalTrace.Init();
+        g_brakeCue.Init();
         FrameLatency::Init();
         g_gearDisplay.Init();
         g_lapDelta.Init();
@@ -168,7 +231,6 @@ public:
         g_tyreWear.Init();
         g_setupInfo.Init();
         g_drsCue.Init();
-        g_brakeCue.Init();
         g_trackAlerts.Init();
         g_miniSector.Init();
         g_tyreTemps.Init();
@@ -178,7 +240,7 @@ public:
         g_ffbSpectrum.Init();
         // After every store's Init: the first pass (for the lines logged
         // above) must not find a store whose lock does not exist yet.
-        Persist::Start(PersistPass);
+        Persist::Start(PersistPass, PersistLoadPass);
         // Its own thread; after Config::Load (it reads [Updates]).
         UpdateCheck::Start();
 
@@ -193,18 +255,21 @@ public:
 
     void Shutdown() override
     {
-        Weather::Shutdown();
         Log::Write("SkrPlugin::Shutdown");
         // Last chance -- EndSession's own flush covers a normal session end,
         // but not the game closing (or the plugin being re-ticked off)
         // without one, e.g. mid-session. Done first, before anything below
-        // can go wrong.
+        // can go wrong -- including the weather thread's untimed join,
+        // which could hold the save back for 15 s or more (review F170).
         Persist::FlushAllNow();
+        Benchmark::Shutdown();
+        Weather::Shutdown();
         Hook::Uninstall();
         // File-load workers still running must finish before the DLL can go.
         CarLayout::Shutdown();
         TrackMap::Shutdown();
         Shortcuts::Shutdown();
+        VehicleKey::Shutdown();   // REST car-lookup worker
         PerfStats::StopPoller();
         UpdateCheck::Shutdown();
         AmdGpuPower::Shutdown();
@@ -238,17 +303,23 @@ public:
         // need. Waits for a full pass on the Persist thread, the only place
         // that writes (see Persist.cpp).
         Persist::FlushAllNow();
+        s_droveThisSession = false;   // the ride-along fallback needs a car driven in the next session (F253)
+        g_localPlayerDriving = false;
+        g_localPlayerLapClean = false;
         g_carState.Clear();
         g_pedalTrace.Clear();
+        g_brakeCue.Clear();
         g_gearDisplay.Clear();
         g_lapDelta.Clear();
-        g_brakeCue.Clear();
         g_relativeTiming.Clear();
         g_fuelStore.Clear();
         g_tyreWear.Clear();
         EngineTemps::Reset();
+        Benchmark::Reset();
         Conditions::Reset();
         Weather::Reset();
+        FfbLevel::Reset();         // the clip meter starts fresh each session (review F143)
+        TyreSave::RequestReset();  // the new session's tyre set clock (review F353)
         g_setupInfo.Clear();
         g_drsCue.Clear();
         g_trackAlerts.Clear();
@@ -271,6 +342,7 @@ public:
             Log::Write("SkrPlugin: fuel multiplier is now %dx", mult);
             g_fuelMult = mult;
         }
+        g_autoShift.store(options.mAutoShift, std::memory_order_relaxed);
     }
 
     void EnterRealtime() override
@@ -291,8 +363,11 @@ public:
         g_inRealtime = false;
         g_carState.Clear();
         g_pedalTrace.Clear();
-        // Not a full Clear(): dropping to the monitor is still the same
-        // session, and the reference stays this session's best lap.
+        // NOT a full Clear() for the brake cue: dropping to the monitor is
+        // still the same session, and its reference is meant to be the
+        // braking points from this session's BEST lap. A full clear here
+        // reset the best-lap time too, so the next lap completed after
+        // coming back -- however slow -- became the new reference.
         g_brakeCue.OnExitRealtime();
         // Out of the car: everything may be written now (Persist.cpp).
         Persist::RequestAll();
@@ -301,7 +376,15 @@ public:
     // Scoring: positions of all cars, ~5Hz (radar).
     bool WantsScoringUpdates() override { return true; }
 
+    // Exceptions stop here: one skipped tick, never an exception unwinding
+    // into rF2 (review F271).
     void UpdateScoring(const ScoringInfoV01& info) override
+    {
+        try { ScoringTick(info); }
+        catch (...) { s_cbFaults.fetch_add(1, std::memory_order_relaxed); }
+    }
+
+    void ScoringTick(const ScoringInfoV01& info)
     {
         // Authoritative, self-correcting source of truth for the driving
         // HUD's visibility -- the EnterRealtime/ExitRealtime/StartSession/
@@ -315,11 +398,15 @@ public:
         // requiring a plugin reload to recover.
         g_inRealtime = info.mInRealtime;
 
-        // My car, also while riding along (see PlayerView). Learning stores
-        // (best laps, braking points, mini-sectors) keep the original, so a
-        // team-mate's laps never become yours.
+        // My car, also while riding along (see PlayerView). Stores given the
+        // original see no player car while riding along. Who is actually
+        // driving is published in g_localPlayerDriving / g_localPlayerLapClean
+        // (Persist.h): the learning stores must check those, since the AI or
+        // a team-mate can drive a car still flagged as ours (review F167).
         ScoringInfoV01 viewCopy;
         const ScoringInfoV01& view = PlayerView(info, viewCopy);
+        if (!g_localPlayerDriving.load(std::memory_order_relaxed))
+            g_localPlayerLapClean.store(false, std::memory_order_relaxed);
 
         // Each call timed for the DLL-cost panel (Profiler.h).
         { PROF("Radar"); g_carState.Update(view); }
@@ -328,6 +415,7 @@ public:
         { PROF("Conditions"); Conditions::OnScoring(view); }
         { PROF("Weather"); Weather::OnScoring(info); }
         { PROF("Pit stints"); PitStint::OnScoring(info); }
+        // The view, so the position keeps moving while riding along (review F54).
         if (g_resetTimingRequested.exchange(false))
         {
             g_relativeTiming.Clear();
@@ -339,8 +427,11 @@ public:
         { PROF("Mini-sectors"); g_miniSector.OnScoring(info); }
         { PROF("Relative"); DriverAbbrev::OnScoring(view); }
         { PROF("Track map"); TrackMap::OnScoring(view); }
+        { PROF("Benchmark"); Benchmark::OnScoring(view); }
         { PROF("Car layout"); CarLayout::OnScoring(view); }
         { PROF("Tyre wear"); g_tyreWear.OnScoring(view); }
+        // After both stores: the tyre set clock runs even with its panel hidden (review F25).
+        { PROF("Tyre target"); TyreSave::Update(); }
 
         // The two moments anything is written (the disk rule, Persist.cpp).
         // Both only wake the Persist thread; no disk access on this thread.
@@ -355,6 +446,11 @@ public:
                 if (view.mVehicle[i].mIsPlayer) { playerLaps = view.mVehicle[i].mTotalLaps; break; }
         if (g_inRealtime && s_playerLaps >= 0 && playerLaps > s_playerLaps)
             Persist::RequestLearned();
+        // A new lap starts (or no player car): re-arm the "whole lap driven
+        // by you" latch, after every learner above has seen the old value.
+        if (playerLaps != s_playerLaps)
+            g_localPlayerLapClean.store(g_localPlayerDriving.load(std::memory_order_relaxed),
+                                        std::memory_order_relaxed);
         s_playerLaps = playerLaps;
 
         // Out of the car (monitor, garage, between stints): everything,
@@ -366,33 +462,42 @@ public:
 
     // Telemetry scope: 1 = player car only, 2 = every vehicle.
     //
-    // Player-only is what the driving HUD needs (pedal trace, fuel use,
-    // gear learning) and is far cheaper. The scope is widened only when the
-    // timing table's tyre column is switched on, because compound lives in
-    // TelemInfoV01 and scoring carries no tyre data at all -- there is no
-    // cheaper way to know what the rest of the field is running.
+    // Player-only is what the driving HUD needs (pedal trace, brake cue,
+    // gear learning) and is far cheaper. The scope is widened to every car
+    // when the radar is on (each car's position, heading and speed at
+    // telemetry rate instead of ~5 Hz scoring), or when the timing table's
+    // tyre column is on, because compound lives in TelemInfoV01 and scoring
+    // carries no tyre data at all.
     //
     // The game re-asks this constantly rather than once at startup, so it
     // genuinely can be changed at runtime.
     long WantsTelemetryUpdates() override
     {
-        // The tyre column only shows in the standings table and the gap box:
-        // with both of those switched off, every other car's telemetry would
-        // be fetched and stored for nothing.
+        // Without the radar, the tyre column (standings table and gap box)
+        // is the only user of other cars' telemetry.
         const RelativeTimingConfig& rt = g_relativeTimingConfig;
+        if (g_radarConfig.enabled)
+            return 2;   // radar/side bars: every car's position at telemetry rate
         return ((rt.enabled || rt.showGapBox) && rt.showTyre) ? 2 : 1;
     }
 
     void UpdateTelemetry(const TelemInfoV01& info) override
     {
+        try { TelemetryTick(info); }
+        catch (...) { s_cbFaults.fetch_add(1, std::memory_order_relaxed); }   // review F271
+    }
+
+    void TelemetryTick(const TelemInfoV01& info)
+    {
         // Every car's telemetry, when the scope is wide. Fed first and
         // deliberately ABOVE the player filter below -- the whole point of
         // this store is the rest of the field's compounds.
         { PROF("Relative"); TyreStore::OnTelemetry(info); }
+        { PROF("Radar"); g_carState.OnTelemetry(info); }   // every car, by mID
 
         // CRITICAL: with the scope widened to all vehicles, EVERY car's
         // telemetry arrives here. Everything below assumes player-only data
-        // -- the gear display learns shift points from it, the tyre and
+        // -- the gear display learns shift points from it, the brake cue and
         // fuel store record against it -- so feeding it twenty cars
         // interleaved would corrupt learned state, and do so silently.
         const long playerId = g_playerId.load(std::memory_order_relaxed);
@@ -401,17 +506,17 @@ public:
 
         g_headlightsOn.store(info.mHeadlights ? 1 : 0, std::memory_order_relaxed);
         { PROF("Pedal trace"); g_pedalTrace.Update(info); }
-        { PROF("Brake cue"); g_brakeCue.OnTelemetry(info); }
         {
             PROF("FFB graph");
             g_ffbSpectrum.OnTelemetry(info.mLapNumber, static_cast<float>(sqrt(
                 info.mLocalVel.x * info.mLocalVel.x + info.mLocalVel.y * info.mLocalVel.y + info.mLocalVel.z * info.mLocalVel.z)));
         }
+        { PROF("Brake cue"); g_brakeCue.OnTelemetry(info); }
         { PROF("Gear + speed"); g_gearDisplay.Update(info); }
         { PROF("Fuel"); g_fuelStore.OnTelemetry(info); }
         { PROF("Tyre wear"); g_tyreWear.OnTelemetry(info); }
-        { PROF("Conditions"); Conditions::OnTelemetry(info); }
         { PROF("Engine temps"); EngineTemps::OnTelemetry(info); }
+        { PROF("Benchmark"); Benchmark::OnTelemetry(info); }
         { PROF("Brake bias"); g_setupInfo.OnTelemetry(info); }
         { PROF("DRS"); g_drsCue.OnTelemetry(info); }
         { PROF("Input lag"); InputLagEstimate::OnTelemetry(info); }
@@ -423,9 +528,13 @@ public:
     // returns false. rF2 ignores a plugin's edited value anyway.
     bool ForceFeedback(double& forceValue) override
     {
-        PROF("FFB graph");
-        g_ffbSpectrum.OnForce(forceValue);
-        FfbLevel::OnForce(forceValue);
+        try
+        {
+            PROF("FFB graph");
+            g_ffbSpectrum.OnForce(forceValue);
+            FfbLevel::OnForce(forceValue);
+        }
+        catch (...) { s_cbFaults.fetch_add(1, std::memory_order_relaxed); }   // review F271
         return false;
     }
 

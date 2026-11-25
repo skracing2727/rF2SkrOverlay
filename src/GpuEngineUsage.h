@@ -3,9 +3,9 @@
 // The game's GPU 3D-engine utilization %, via the same OS "GPU Engine"
 // performance counters Task Manager's own GPU graph (and tools built on
 // PresentMon-adjacent data) read -- NOT the D3D11 timestamp-query approach
-// PerfStats.cpp uses for CPU/GPU frame *pacing*. Only this process's engine
-// instances are summed (other programs' GPU work used to be included); if
-// none can be told apart, every process's are, as before.
+// PerfStats.cpp uses for CPU/GPU frame *pacing*. Only this process's 3D
+// engines on rF2's own adapter are read (busiest engine, 0-100); if none can
+// be told apart, every process's are.
 //
 // That distinction matters: a Present-to-Present GPU timestamp interval
 // includes any idle/wait time the GPU spends pacing to a frame cap or
@@ -14,19 +14,20 @@
 // idle -- the same category of figure CapFrameX/Task Manager show.
 namespace GpuEngineUsage
 {
-    // Opens the PDH query and does the first counter-path expansion. Safe
-    // to call multiple times.
+    // Opens the PDH query (one language-independent wildcard counter) and
+    // takes the baseline sample. Safe to call multiple times.
     void Init();
+
+    // Fresh baseline sample; call when the stat is turned back on after
+    // Poll was skipped for a while.
+    void Rebaseline();
 
     void Shutdown();
 
     // Cheap-ish; call at the perf overlay's own refresh cadence (not every
-    // frame). Periodically re-expands the counter list internally, since
-    // GPU engine instances come and go as other processes start/stop.
+    // frame). Poller thread only.
     void Poll();
 
-    // 0-100 (can exceed 100 if summed across multiple concurrent 3D
-    // workloads, though that's rare on a single-GPU gaming rig). False
-    // until the first successful poll.
+    // 0-100, the busiest 3D engine. False until the first successful poll.
     bool GetBusyPercent(double& outPercent);
 }

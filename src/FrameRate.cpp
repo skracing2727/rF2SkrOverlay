@@ -7,8 +7,11 @@ namespace
 {
     LARGE_INTEGER g_freq = {};
     LARGE_INTEGER g_lastTickTime = {};
+    double g_lastFrameMs = 0.0;   // latest raw interval, for the benchmark box
     double g_smoothedFrameMs = 0.0;
     bool g_hasValue = false;
+    double g_decayedSumMs = 0.0;   // see OnFrameTick (review F177)
+    double g_decayedCount = 0.0;
 
     // Rolling FPS history for cap detection. What actually matters for a
     // meaningful judgment is REAL elapsed time covered, not sample count --
@@ -52,20 +55,18 @@ void FrameRate::OnFrameTick()
                               / static_cast<double>(g_freq.QuadPart) * 1000.0;
         if (frameMs > 0.01 && frameMs < 2000.0)
         {
-            if (!g_hasValue)
-            {
-                g_smoothedFrameMs = frameMs;
-                g_hasValue = true;
-            }
-            else
-            {
-                // Same 500ms time-based decay used by the other perf
-                // readouts, for the same reason: a fixed per-tick weight's
-                // window would shrink as frame rate rises.
-                constexpr double kTauMs = 500.0;
-                const double alpha = 1.0 - exp(-frameMs / kTauMs);
-                g_smoothedFrameMs = g_smoothedFrameMs * (1.0 - alpha) + frameMs * alpha;
-            }
+            g_lastFrameMs = frameMs;
+            // Frames counted over a ~500 ms time-decayed window: decayed
+            // sum of frame times over decayed frame count. Weighting each
+            // sample by its own length (the old alpha = 1-exp(-frameMs/tau))
+            // gave sum(dt^2)/sum(dt) and read FPS low when frames vary
+            // (review F177).
+            constexpr double kTauMs = 500.0;
+            const double d = g_hasValue ? exp(-frameMs / kTauMs) : 0.0;
+            g_decayedSumMs = g_decayedSumMs * d + frameMs;
+            g_decayedCount = g_decayedCount * d + 1.0;
+            g_smoothedFrameMs = g_decayedSumMs / g_decayedCount;
+            g_hasValue = true;
 
             g_rangeSamples[g_rangeSampleNext] = 1000.0 / frameMs;
             g_rangeSampleTimes[g_rangeSampleNext] = now;
@@ -74,6 +75,14 @@ void FrameRate::OnFrameTick()
         }
     }
     g_lastTickTime = now;
+}
+
+bool FrameRate::GetLastFrameMs(double& outMs)
+{
+    if (g_lastFrameMs <= 0.0)
+        return false;
+    outMs = g_lastFrameMs;
+    return true;
 }
 
 bool FrameRate::GetFps(double& outFps)

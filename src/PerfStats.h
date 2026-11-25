@@ -18,6 +18,14 @@ namespace PerfStats
     // AmdGpuPower::Init; Stop before their Shutdown.
     void StartPoller();
     void StopPoller();
+    // True once StopPoller gave up waiting: the poller may still be inside
+    // PDH/ADL, so their Shutdowns must leave them alone (review F231).
+    bool PollerStuck();
+    // rF2's graphics adapter, filled in by Poll: its "luid_0x..._0x..." PDH
+    // instance prefix (empty until known; poller thread only) and its DXGI
+    // VendorId (0 until known; 0x1002 = AMD).
+    const wchar_t* GetCardLuid();
+    unsigned GetCardVendorId();
 
     // Call once a real device/swapchain is bound (see Overlay.cpp's BindTo).
     // Safe to call again on a rebind; re-resolves the VRAM adapter.
@@ -45,6 +53,9 @@ namespace PerfStats
     // CPU%, which is meaningless on a multi-core box when only a couple of
     // threads are doing real work.
     bool GetCpuFrameTimeMs(double& outMs);
+    // This frame's CPU time, unsmoothed (benchmark box). Present thread;
+    // false if OnFrame could not measure this frame.
+    bool GetLastCpuFrameMs(double& outMs);
 
     // Process working-set RAM in MB.
     bool GetProcessRamMB(double& outMB);

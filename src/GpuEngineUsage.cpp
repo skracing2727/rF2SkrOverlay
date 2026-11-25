@@ -1,120 +1,43 @@
 #include "GpuEngineUsage.h"
+#include "PerfStats.h"
 #include "Log.h"
 #include <windows.h>
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <vector>
 #include <string>
-#include <cstring>
+#include <cwchar>
 #include <cstdio>
 
 #pragma comment(lib, "pdh.lib")
 
 namespace
 {
+    // One wildcard counter, "\GPU Engine(*)\Utilization Percentage", added by
+    // its ENGLISH name (PdhAddEnglishCounterW works on every Windows
+    // language) and read with PdhGetFormattedCounterArrayW -- the same
+    // pattern as PerfStats' card VRAM. The old code expanded the English
+    // path with PdhExpandWildCardPathA, which only takes localized names, so
+    // the GPU ms stat never appeared on non-English Windows and the failure
+    // was logged every 5 s (review F178). A wildcard counter picks up engine
+    // instances as they come and go, so no periodic re-expansion is needed.
     PDH_HQUERY g_query = nullptr;
-    std::vector<PDH_HCOUNTER> g_counters;
-    // The instance paths g_counters were added for, so a re-expansion that
-    // finds the same set leaves them alone (see ExpandAndAddCounters).
-    std::string g_counterPaths;
-
-    LARGE_INTEGER g_freq = {};
-    LARGE_INTEGER g_lastExpand = {};
-    constexpr double kReExpandSeconds = 5.0;
+    PDH_HCOUNTER g_counter = nullptr;
+    std::vector<BYTE> g_buf;
 
     double g_busyPercent = 0.0;
     bool g_havePercent = false;
+    bool g_loggedSource = false;
 
-    void ClearCounters()
+    struct Engine { std::wstring key; double percent; };
+
+    bool ContainsNoCase(const wchar_t* hay, const wchar_t* needle)
     {
-        for (PDH_HCOUNTER c : g_counters)
-            PdhRemoveCounter(c);
-        g_counters.clear();
-        g_counterPaths.clear();
-    }
-
-    // Re-expands "\GPU Engine(*)\Utilization Percentage" and (re)adds one
-    // counter per instance whose name contains "engtype_3D" -- the render
-    // engine, same one Task Manager's default GPU graph tracks -- of THIS
-    // process (instance names start "pid_<id>_"). That used to be every
-    // process's instances (~150 counters, collected and summed on every
-    // poll); the readout is the game's GPU time, so other programs' GPU work
-    // does not belong in it anyway. If no instance carries this process's
-    // id (no device yet, or a naming scheme this does not know), it falls
-    // back to every process's, as before. Called periodically since engine
-    // instances appear/disappear; returns true if the counter set changed
-    // (fresh counters need a baseline sample before they read anything).
-    bool ExpandAndAddCounters()
-    {
-        if (!g_query)
-            return false;
-
-        const char* wildcardPath = "\\GPU Engine(*)\\Utilization Percentage";
-        DWORD pathListSize = 0;
-        PDH_STATUS status = PdhExpandWildCardPathA(nullptr, wildcardPath, nullptr, &pathListSize, 0);
-        if (status != PDH_MORE_DATA || pathListSize == 0)
-        {
-            Log::Write("GpuEngineUsage: PdhExpandWildCardPathA (size query) failed, status 0x%08X", status);
-            ClearCounters();
-            return true;
-        }
-
-        std::vector<char> pathList(pathListSize);
-        status = PdhExpandWildCardPathA(nullptr, wildcardPath, pathList.data(), &pathListSize, 0);
-        if (status != ERROR_SUCCESS)
-        {
-            Log::Write("GpuEngineUsage: PdhExpandWildCardPathA (fill) failed, status 0x%08X", status);
-            ClearCounters();
-            return true;
-        }
-
-        // This process's 3D instances, or everyone's if none are tagged with it.
-        char ownPid[32];
-        sprintf_s(ownPid, "(pid_%lu_", GetCurrentProcessId());
-        std::string paths;
-        int found = 0;
-        for (int pass = 0; pass < 2 && found == 0; ++pass)
-        {
-            for (const char* p = pathList.data(); *p != '\0'; p += strlen(p) + 1)
-            {
-                if (strstr(p, "engtype_3D") == nullptr)
-                    continue;
-                if (pass == 0 && strstr(p, ownPid) == nullptr)
-                    continue;
-                paths.append(p);
-                paths.push_back('\0');
-                ++found;
-            }
-        }
-
-        // Same instances as last time (the usual case, every 5 s): keep the
-        // counters, their baselines and the sample cadence as they are. The
-        // first expansion always goes through, so the log says what it found.
-        static bool s_expandedOnce = false;
-        if (s_expandedOnce && paths == g_counterPaths)
-            return false;
-        s_expandedOnce = true;
-
-        ClearCounters();
-        int added = 0;
-        for (const char* p = paths.c_str(); *p != '\0'; p += strlen(p) + 1)
-        {
-            PDH_HCOUNTER counter = nullptr;
-            if (PdhAddEnglishCounterA(g_query, p, 0, &counter) == ERROR_SUCCESS && counter)
-            {
-                g_counters.push_back(counter);
-                ++added;
-            }
-        }
-        g_counterPaths = paths;
-
-        // Fresh counters are difference-based and return no valid value until
-        // a baseline sample exists -- take it now so the next Poll is valid
-        // instead of the readout dropping out for one refresh.
-        PdhCollectQueryData(g_query);
-        Log::Write("GpuEngineUsage: expanded %d engtype_3D counter instance(s)%s", added,
-                   (added > 0 && strstr(g_counterPaths.c_str(), ownPid)) ? " of this process" : " (all processes)");
-        return true;
+        const size_t n = wcslen(needle);
+        for (; *hay; ++hay)
+            if (_wcsnicmp(hay, needle, n) == 0)
+                return true;
+        return false;
     }
 }
 
@@ -123,86 +46,135 @@ void GpuEngineUsage::Init()
     if (g_query)
         return; // already initialized
 
-    if (g_freq.QuadPart == 0)
-        QueryPerformanceFrequency(&g_freq);
-
-    if (PdhOpenQueryA(nullptr, 0, &g_query) != ERROR_SUCCESS || !g_query)
+    if (PdhOpenQueryW(nullptr, 0, &g_query) != ERROR_SUCCESS || !g_query)
     {
         Log::Write("GpuEngineUsage::Init: PdhOpenQuery failed");
         g_query = nullptr;
         return;
     }
+    const PDH_STATUS st = PdhAddEnglishCounterW(g_query, L"\\GPU Engine(*)\\Utilization Percentage", 0, &g_counter);
+    if (st != ERROR_SUCCESS)
+    {
+        // Logged once; the stat just stays unavailable.
+        Log::Write("GpuEngineUsage::Init: no GPU Engine counter (status 0x%08X) -- GPU ms not shown", st);
+        PdhCloseQuery(g_query);
+        g_query = nullptr;
+        g_counter = nullptr;
+        return;
+    }
 
-    ExpandAndAddCounters();
-    QueryPerformanceCounter(&g_lastExpand);
-
-    // First PdhCollectQueryData call establishes the baseline for the
-    // "Utilization Percentage" counter type (it's a difference-based
-    // counter); throw its result away.
+    // First collect is the baseline for this difference-based counter.
     PdhCollectQueryData(g_query);
+}
+
+void GpuEngineUsage::Rebaseline()
+{
+    // Poll is skipped while the GPU ms stat is off; a fresh baseline keeps
+    // the first value after turning it on from averaging the idle stretch
+    // (review F181).
+    if (g_query && g_counter)
+        PdhCollectQueryData(g_query);
 }
 
 void GpuEngineUsage::Shutdown()
 {
+    // The poller did not stop in time and may still be inside PDH: leave the
+    // query alone (the module is pinned, see PerfStats::StopPoller; review F231).
+    if (PerfStats::PollerStuck())
+        return;
     if (g_query)
     {
         PdhCloseQuery(g_query);
         g_query = nullptr;
     }
-    g_counters.clear();
-    g_counterPaths.clear();
+    g_counter = nullptr;
     g_havePercent = false;
 }
 
 void GpuEngineUsage::Poll()
 {
-    if (!g_query)
+    if (!g_query || !g_counter)
         return;
-
-    if (g_freq.QuadPart != 0)
-    {
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        const double sinceExpandSeconds = static_cast<double>(now.QuadPart - g_lastExpand.QuadPart) / static_cast<double>(g_freq.QuadPart);
-        if (sinceExpandSeconds >= kReExpandSeconds)
-        {
-            const bool changed = ExpandAndAddCounters();
-            g_lastExpand = now;
-            // New counters' baseline sample was just taken; sampling again
-            // microseconds later would give a near-zero interval. Keep the
-            // last value. (Unchanged counters just sample as usual.)
-            if (changed)
-                return;
-        }
-    }
 
     // On any transient failure below, keep the last good value rather than
     // clearing it -- a single bad sample must not make the stat vanish.
-    if (g_counters.empty())
-        return;
-
     if (PdhCollectQueryData(g_query) != ERROR_SUCCESS)
         return;
 
-    double sum = 0.0;
-    bool any = false;
-    for (PDH_HCOUNTER counter : g_counters)
-    {
-        PDH_FMT_COUNTERVALUE value;
-        DWORD type = 0;
-        if (PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, &type, &value) == ERROR_SUCCESS
-            && value.CStatus == ERROR_SUCCESS)
-        {
-            sum += value.doubleValue;
-            any = true;
-        }
-    }
+    DWORD size = 0, count = 0;
+    PDH_STATUS st = PdhGetFormattedCounterArrayW(g_counter, PDH_FMT_DOUBLE, &size, &count, nullptr);
+    if (st != PDH_MORE_DATA || size == 0)
+        return;
+    if (g_buf.size() < size)
+        g_buf.resize(size);
+    auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(g_buf.data());
+    if (PdhGetFormattedCounterArrayW(g_counter, PDH_FMT_DOUBLE, &size, &count, items) != ERROR_SUCCESS)
+        return;
 
-    if (any)
+    // Instance names look like
+    //   pid_1234_luid_0x00000000_0x0000D1C2_phys_0_eng_0_engtype_3D
+    // Only 3D engines of rF2's own adapter count (review F411: an iGPU's
+    // engines used to be added to the dGPU's). Per engine, the processes'
+    // shares are summed; the busiest engine is the figure, as Task Manager
+    // does, clamped to 0-100. Own process first, every process if no
+    // instance carries this process's id.
+    wchar_t ownPid[32];
+    swprintf_s(ownPid, L"pid_%lu_", GetCurrentProcessId());
+    const size_t ownPidLen = wcslen(ownPid);
+    const wchar_t* luid = PerfStats::GetCardLuid();   // empty until known
+
+    // Filters, strictest first: own process on rF2's adapter, any process
+    // on it, then the same without the adapter filter (in case the adapter
+    // id is not known yet or names it differently).
+    std::vector<Engine> engines;
+    bool ownFound = false;
+    bool luidUsed = false;
+    for (int pass = 0; pass < 4 && engines.empty(); ++pass)
     {
-        g_busyPercent = sum;
-        g_havePercent = true;
+        const bool needOwn = (pass % 2) == 0;
+        const bool needLuid = pass < 2;
+        if (needLuid && !luid[0])
+            continue;
+        for (DWORD i = 0; i < count; ++i)
+        {
+            const wchar_t* name = items[i].szName;
+            if (!name || !ContainsNoCase(name, L"engtype_3D"))
+                continue;
+            if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA && items[i].FmtValue.CStatus != PDH_CSTATUS_NEW_DATA)
+                continue;
+            if (needLuid && !ContainsNoCase(name, luid))
+                continue;
+            if (needOwn && _wcsnicmp(name, ownPid, ownPidLen) != 0)
+                continue;
+            // Engine key: everything from "luid_" on (drops "pid_<n>_").
+            const wchar_t* key = wcsstr(name, L"luid_");
+            const std::wstring k = key ? key : name;
+            bool merged = false;
+            for (Engine& e : engines)
+                if (e.key == k) { e.percent += items[i].FmtValue.doubleValue; merged = true; break; }
+            if (!merged)
+                engines.push_back({ k, items[i].FmtValue.doubleValue });
+        }
+        ownFound = needOwn;
+        luidUsed = needLuid;
     }
+    if (engines.empty())
+        return;
+
+    double busiest = 0.0;
+    for (const Engine& e : engines)
+        if (e.percent > busiest) busiest = e.percent;
+    if (busiest < 0.0) busiest = 0.0;
+    if (busiest > 100.0) busiest = 100.0;
+
+    if (!g_loggedSource)
+    {
+        g_loggedSource = true;
+        Log::Write("GpuEngineUsage: reading %d engtype_3D engine(s)%s%s", static_cast<int>(engines.size()),
+                   ownFound ? " of this process" : " (all processes)", luidUsed ? " on rF2's adapter" : "");
+    }
+    g_busyPercent = busiest;
+    g_havePercent = true;
 }
 
 bool GpuEngineUsage::GetBusyPercent(double& outPercent)

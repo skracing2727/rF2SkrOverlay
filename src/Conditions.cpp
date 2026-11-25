@@ -5,7 +5,7 @@
 #include "Layout.h"
 #include "Weather.h"
 #include "RenderThrottle.h"
-#include <atomic>
+#include "Log.h"
 #include <deque>
 #include <mutex>
 #include <cmath>
@@ -19,14 +19,6 @@ namespace
     bool s_valid = false;
     Sample s_now = {};
     std::deque<Sample> s_hist;   // one sample every kStep seconds, kKeep seconds kept
-
-    // Wet sections along the lap (see WetBins).
-    const float kBinM = 20.0f;
-    std::atomic<int> s_wetSamples{ 0 }, s_drySamples{ 0 };
-    std::vector<signed char> s_bins;
-    double s_trackLen = 0.0;
-    double s_prevDist = -1.0;
-    bool s_anyWet = false;
 
     const double kStep = 5.0;
     const double kKeep = 660.0;
@@ -49,32 +41,6 @@ void Conditions::Reset()
     std::lock_guard<std::mutex> lk(s_mx);
     s_valid = false;
     s_hist.clear();
-    s_bins.clear();
-    s_trackLen = 0.0;
-    s_prevDist = -1.0;
-    s_anyWet = false;
-}
-
-void Conditions::OnTelemetry(const TelemInfoV01& info)
-{
-    int wet = 0, dry = 0;
-    for (int i = 0; i < 4; ++i)
-    {
-        const unsigned char t = info.mWheel[i].mSurfaceType;
-        if (t == 1) ++wet;
-        else if (t == 0) ++dry;
-    }
-    if (wet) s_wetSamples.fetch_add(wet, std::memory_order_relaxed);
-    if (dry) s_drySamples.fetch_add(dry, std::memory_order_relaxed);
-}
-
-bool Conditions::WetBins(std::vector<signed char>& bins, float& binM)
-{
-    std::lock_guard<std::mutex> lk(s_mx);
-    if (!s_anyWet || s_bins.empty()) return false;
-    bins = s_bins;
-    binM = kBinM;
-    return true;
 }
 
 void Conditions::OnScoring(const ScoringInfoV01& info)
@@ -88,45 +54,7 @@ void Conditions::OnScoring(const ScoringInfoV01& info)
     s.wetMax = static_cast<float>(info.mMaxPathWetness);
     s.wetAvg = static_cast<float>(info.mAvgPathWetness);
 
-    // Player's lap distance, for the wet sections.
-    double dist = -1.0;
-    bool inPits = true;
-    for (long i = 0; i < info.mNumVehicles; ++i)
-        if (info.mVehicle[i].mIsPlayer) { dist = info.mVehicle[i].mLapDist; inPits = info.mVehicle[i].mInPits; break; }
-    const int wetN = s_wetSamples.exchange(0, std::memory_order_relaxed);
-    const int dryN = s_drySamples.exchange(0, std::memory_order_relaxed);
-
     std::lock_guard<std::mutex> lk(s_mx);
-    if (info.mLapDist > 100.0 && fabs(info.mLapDist - s_trackLen) > 1.0)
-    {
-        s_trackLen = info.mLapDist;
-        s_bins.assign(static_cast<size_t>(s_trackLen / kBinM) + 1, -1);
-        s_prevDist = -1.0;
-        s_anyWet = false;
-    }
-    if (!s_bins.empty() && dist >= 0.0 && !inPits && wetN + dryN > 0)
-    {
-        if (s_prevDist >= 0.0)
-        {
-            double from = s_prevDist, to = dist;
-            if (to < from - s_trackLen * 0.5) to += s_trackLen;   // crossed the line
-            if (to > from && to - from < 300.0)
-            {
-                const signed char v = wetN * 2 >= wetN + dryN ? 1 : 0;   // half or more of the wheel samples wet
-                if (v) s_anyWet = true;
-                const size_t n = s_bins.size();
-                for (double d = from; d <= to; d += kBinM * 0.5)
-                {
-                    size_t b = static_cast<size_t>(fmod(d, s_trackLen) / kBinM);
-                    if (b >= n) b = n - 1;
-                    s_bins[b] = v;
-                }
-            }
-        }
-        s_prevDist = dist;
-    }
-    else if (inPits) s_prevDist = -1.0;
-
     // Session restart / time going backwards: the history is no longer valid.
     if (!s_hist.empty() && s.et < s_hist.back().et - 1.0) s_hist.clear();
     s_now = s;
@@ -177,8 +105,22 @@ bool Conditions::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     // pre-set forecast, which the game is not using (e.g. 22C forecast at an
     // 8C track). A first point far from the live air temperature means that:
     // hide the GAME lines rather than show a forecast that is not in force.
-    const bool showGame = !(ng > 0 && valid && fabsf(gp[0].tempC - now.air) > 5.0f);
-    if (!showGame) ng = 0;
+    // Compared with both the node in force and the next one (the game blends
+    // between them), with hysteresis so it does not flicker; when hidden the
+    // title stays with a status line (review F141).
+    static bool s_gameInForce = true;
+    if (ng > 0 && valid)
+    {
+        float d = fabsf(gp[0].tempC - now.air);
+        if (ng > 1) { const float d1 = fabsf(gp[1].tempC - now.air); if (d1 < d) d = d1; }
+        const float lo = ng > 1 ? fminf(gp[0].tempC, gp[1].tempC) : gp[0].tempC;
+        const float hi = ng > 1 ? fmaxf(gp[0].tempC, gp[1].tempC) : gp[0].tempC;
+        if (now.air >= lo && now.air <= hi) d = 0.0f;
+        if (s_gameInForce && d > 6.0f) s_gameInForce = false;
+        else if (!s_gameInForce && d < 4.0f) s_gameInForce = true;
+    }
+    const bool showGame = true;
+    if (ng > 0 && !s_gameInForce) { ng = 0; gStatus = "not in force (real weather?)"; }
     const int nr = Weather::Real(rp, 3, rStatus);
     const bool showReal = cfg.realWeather;
     const int fcLines = (showGame ? 1 + (ng ? ng : 1) : 0) + (showReal ? 1 + (nr ? nr : 1) : 0);
@@ -200,7 +142,11 @@ bool Conditions::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     const float dRain = haveW ? now.rain - w1.rain : 0.0f;
     const char* call; float r, g, b;
     if (wet >= cross) { call = "WETS"; r = 0.3f; g = 0.6f; b = 1.0f; }
-    else if (wet >= cross - cfg.nearMargin) { call = dWet > 0.002f ? "SLICKS - wets soon" : "SLICKS - near crossover"; r = 1.0f; g = 0.75f; b = 0.15f; }
+    // rF2 reports wetness in coarse steps, so the average alone can jump
+    // past the amber band: also amber when the wettest part of the line is
+    // past the crossover (review F139).
+    else if (wet >= cross - cfg.nearMargin || now.wetMax >= cross)
+    { call = (dWet > 0.002f || dRain > 0.005f) ? "SLICKS - wets soon" : "SLICKS - near crossover"; r = 1.0f; g = 0.75f; b = 0.15f; }
     else { call = "SLICKS"; r = 0.35f; g = 0.9f; b = 0.4f; }
 
     float y = cy - halfH + pad;
@@ -219,7 +165,10 @@ bool Conditions::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     renderer.AddText(cx, y, line, textPx, now.rain > 0.0f ? 0.6f : 0.95f, now.rain > 0.0f ? 0.8f : 0.95f, 0.95f, 1.0f, Renderer::HAlign::Center);
     y += textPx + pad;
 
-    if (haveT) sprintf_s(line, "Track %.0fC (%+.1f/10m)  Air %.0fC", now.track, now.track - t10.track, now.air);
+    // Ago may return as little as 5 minutes: scale to a true 10-minute rate (review F145).
+    if (haveT && now.et - t10.et > 1.0)
+        sprintf_s(line, "Track %.0fC (%+.1f/10m)  Air %.0fC", now.track,
+                  (now.track - t10.track) * 600.0 / (now.et - t10.et), now.air);
     else sprintf_s(line, "Track %.0fC  Air %.0fC", now.track, now.air);
     renderer.AddText(cx, y, line, textPx, 0.95f, 0.95f, 0.95f, 1.0f, Renderer::HAlign::Center);
     y += textPx + 2.0f * pad;

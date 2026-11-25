@@ -156,6 +156,11 @@ void CarStateStore::Update(const ScoringInfoV01& info)
             if (e.isPlayer)
                 hasPlayer = true;
 
+            e.inPits = v.mInPits != 0;
+            e.inGarage = v.mInGarageStall != 0;
+            e.lapDist = v.mLapDist;
+            e.speedMps = static_cast<float>(sqrt(v.mLocalVel.x * v.mLocalVel.x + v.mLocalVel.y * v.mLocalVel.y + v.mLocalVel.z * v.mLocalVel.z));
+
             strncpy_s(e.vehicleClass, v.mVehicleClass, _TRUNCATE);
             strncpy_s(e.vehicleName, v.mVehicleName, _TRUNCATE);
 
@@ -177,6 +182,17 @@ void CarStateStore::Update(const ScoringInfoV01& info)
             else
                 e.footprint = MatchFootprint(e.vehicleClass, e.vehicleName);
 
+            // A car that jumped further than any car can drive in one tick
+            // (ESC to garage, tow, reset to track) is shown at its new spot
+            // directly instead of sliding across the radar past the player
+            // (review F358). 40 m is ~150 m/s over a slow 0.25 s tick.
+            if (before)
+            {
+                const double dx = e.x - before->x, dz = e.z - before->z;
+                if (dx * dx + dz * dz > 40.0 * 40.0)
+                    e.prevIndex = -1;
+            }
+
             ++count;
         }
     }
@@ -192,11 +208,48 @@ void CarStateStore::Update(const ScoringInfoV01& info)
     m_prev = m_cur;
     m_prevCount = m_curCount;
     m_prevTime = m_curTime;
+    m_prevET = m_curET;
     m_cur = m_spare;
     m_curCount = count;
     m_curTime = now;
+    m_curET = info.mCurrentET;
     m_hasPlayer = hasPlayer;
     m_spare = oldPrev;
+    LeaveCriticalSection(&m_lock);
+}
+
+void CarStateStore::OnTelemetry(const TelemInfoV01& info)
+{
+    if (!m_ready)
+        return;
+    // Done outside the lock: the few fields the radar uses.
+    const double x = info.mPos.x, z = info.mPos.z;
+    const double heading = atan2(info.mOri[2].x, info.mOri[2].z);   // same row as scoring's
+    const float speed = static_cast<float>(sqrt(info.mLocalVel.x * info.mLocalVel.x
+        + info.mLocalVel.y * info.mLocalVel.y + info.mLocalVel.z * info.mLocalVel.z));
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const LONGLONG staleTicks = m_freq.QuadPart / 2;   // 0.5 s
+
+    EnterCriticalSection(&m_lock);
+    TelemEntry* e = nullptr;
+    int stale = -1;
+    for (int i = 0; i < m_telemCount; ++i)
+    {
+        if (m_telem[i].id == info.mID) { e = &m_telem[i]; break; }
+        if (stale < 0 && now.QuadPart - m_telem[i].t > staleTicks) stale = i;
+    }
+    if (!e)
+    {
+        if (m_telemCount < kMaxCars) e = &m_telem[m_telemCount++];
+        else if (stale >= 0) e = &m_telem[stale];   // a car that left: reuse its slot
+    }
+    if (e)
+    {
+        e->id = info.mID;
+        e->x = x; e->z = z; e->heading = heading; e->speedMps = speed;
+        e->t = now.QuadPart;
+    }
     LeaveCriticalSection(&m_lock);
 }
 
@@ -218,6 +271,13 @@ int CarStateStore::Read(CarPos* out, int maxCars, double& outPlayerHeading, bool
     if (m_freq.QuadPart != 0 && m_prevTime.QuadPart != 0 && m_curTime.QuadPart != 0)
     {
         double tickPeriod = static_cast<double>(m_curTime.QuadPart - m_prevTime.QuadPart) / static_cast<double>(m_freq.QuadPart);
+        // Prefer the sim-time spacing when both samples have it: callbacks
+        // that arrive bunched after a hitch would otherwise snap then freeze
+        // (review F130). Falls back to arrival times if ET went backwards
+        // (session restart) or did not move.
+        const double etPeriod = m_curET - m_prevET;
+        if (m_prevET >= 0.0 && etPeriod > 0.001 && etPeriod < 5.0)
+            tickPeriod = etPeriod;
 
         // A sample pair spanning far longer than the real ~5Hz scoring rate
         // means the stream was INTERRUPTED (pause, load, hitch) -- not that
@@ -253,6 +313,11 @@ int CarStateStore::Read(CarPos* out, int maxCars, double& outPlayerHeading, bool
     outPlayerHeading = 0.0;
     outHasPlayer = m_hasPlayer;
 
+    // Telemetry younger than this replaces the scoring position of a car.
+    LARGE_INTEGER nowQpc;
+    QueryPerformanceCounter(&nowQpc);
+    const LONGLONG telemFresh = m_freq.QuadPart / 2;   // 0.5 s
+
     const CarEntry* curCars = m_cars[m_cur];
     const CarEntry* prevCars = m_cars[m_prev];
     for (int i = 0; i < n; ++i)
@@ -276,9 +341,30 @@ int CarStateStore::Read(CarPos* out, int maxCars, double& outPlayerHeading, bool
             out[i].z = cur.z;
             out[i].heading = cur.heading;
         }
+        // Fresh telemetry for this car: use it as-is (~50 Hz, no 0.2 s lag).
+        float telemSpeed = -1.0f;
+        for (int k = 0; k < m_telemCount; ++k)
+        {
+            const TelemEntry& t = m_telem[k];
+            if (t.id != cur.id) continue;
+            if (nowQpc.QuadPart - t.t <= telemFresh)
+            {
+                out[i].x = t.x;
+                out[i].z = t.z;
+                out[i].heading = t.heading;
+                telemSpeed = t.speedMps;
+            }
+            break;
+        }
         out[i].id = cur.id;
         out[i].isPlayer = cur.isPlayer;
         out[i].footprint = cur.footprint;
+        out[i].inPits = cur.inPits;
+        out[i].inGarage = cur.inGarage;
+        out[i].speedMps = cur.speedMps;
+        out[i].lapDist = cur.lapDist;
+        if (telemSpeed >= 0.0f)
+            out[i].speedMps = telemSpeed;
 
         if (cur.isPlayer)
             outPlayerHeading = out[i].heading;
@@ -297,6 +383,9 @@ void CarStateStore::Clear()
     m_prevCount = 0;
     m_curTime = LARGE_INTEGER{};
     m_prevTime = LARGE_INTEGER{};
+    m_curET = -1.0;
+    m_prevET = -1.0;
     m_hasPlayer = false;
+    m_telemCount = 0;
     LeaveCriticalSection(&m_lock);
 }

@@ -100,7 +100,8 @@ void DrsCueStore::PlayBeep()
         return;
     // The Ctrl+Shift toggle kills the beep as well as the on-screen sign --
     // one switch for the whole feature.
-    if (!Shortcuts::Visible(Shortcuts::Drs))
+    // Toggled, not Visible: no layout-mode override for a sound (review F199).
+    if (!Shortcuts::Toggled(Shortcuts::Drs) || !Shortcuts::OverlayEnabled())
         return;
     // Handed to the sound thread: this runs on the telemetry callback.
     Sound::PlayMemory(m_wavBuffer);
@@ -108,15 +109,34 @@ void DrsCueStore::PlayBeep()
 
 void DrsCueStore::OnTelemetry(const TelemInfoV01& info)
 {
-    if (!m_ready || !g_drsCueConfig.enabled)
+    // [DrsCue] Enabled gates only the beep; the sign state is always kept
+    // current so turning the beep off does not hide the sign (review F51).
+    if (!m_ready)
         return;
 
     const int legalStatus = static_cast<int>(info.mRearFlapLegalStatus);
     const bool open = info.mRearFlapActivated != 0;
 
+    if (legalStatus == 2)
+    {
+        if (m_legalSinceET < 0.0 || info.mElapsedTime < m_legalSinceET)
+            m_legalSinceET = info.mElapsedTime;
+        else if (!m_unrestricted && info.mElapsedTime - m_legalSinceET > 40.0)
+        {
+            m_unrestricted = true;
+            Log::Write("DrsCue: DRS legal for 40 s straight -- treating as unrestricted, sign/beep muted");
+        }
+    }
+    else
+    {
+        m_legalSinceET = -1.0;
+        m_unrestricted = false;
+    }
+
     // Edge-triggered: only the moment it BECOMES allowed (2), not every tick
     // it stays allowed.
-    if (legalStatus == 2 && m_lastLegalStatus != 2 && m_lastLegalStatus != -1)
+    if (legalStatus == 2 && m_lastLegalStatus != 2 && m_lastLegalStatus != -1
+        && g_drsCueConfig.enabled && !m_unrestricted)
     {
         PlayBeep();
         Log::Write("DrsCue: rear flap became legal -- beeped");
@@ -124,7 +144,9 @@ void DrsCueStore::OnTelemetry(const TelemInfoV01& info)
     m_lastLegalStatus = legalStatus;
 
     EnterCriticalSection(&m_lock);
-    m_state.showIndicator = (legalStatus == 2) || open;
+    // Unrestricted: show only "DRS ENGAGED" while actually open, never the
+    // flashing OPEN DRS prompt.
+    m_state.showIndicator = (legalStatus == 2 && !m_unrestricted) || open;
     m_state.drsOpen = open;
     LeaveCriticalSection(&m_lock);
 }
@@ -132,6 +154,8 @@ void DrsCueStore::OnTelemetry(const TelemInfoV01& info)
 void DrsCueStore::Clear()
 {
     m_lastLegalStatus = -1;
+    m_legalSinceET = -1.0;
+    m_unrestricted = false;
     EnterCriticalSection(&m_lock);
     m_state = State{};
     LeaveCriticalSection(&m_lock);

@@ -19,6 +19,26 @@ namespace
     bool g_hasValue = false;
     UINT g_lastSeenPresentCount = 0;
 
+    // Refresh period, measured from successive frame statistics (QPC ticks
+    // per vblank), to correct SyncQPCTime back to the vblank the frame was
+    // actually shown on (review F179).
+    double g_refreshQpc = 0.0;
+    UINT g_lastSyncRefreshCount = 0;
+    LONGLONG g_lastSyncQpc = 0;
+
+    // Forget the shown value and the counts it was based on: after leaving
+    // exclusive fullscreen it would otherwise stay on screen for good, and a
+    // new swapchain restarts its present counts (review F378).
+    void ClearValue()
+    {
+        g_hasValue = false;
+        g_smoothedMs = 0.0;
+        g_lastSeenPresentCount = 0;
+        g_lastSyncRefreshCount = 0;
+        g_lastSyncQpc = 0;
+        g_refreshQpc = 0.0;
+    }
+
     FrameLatency::UnavailableReason g_reason = FrameLatency::UnavailableReason::None;
     // Required run of consecutive INVALID_CALLs before concluding it's the
     // window mode and not just a one-off around a mode switch/focus change.
@@ -55,6 +75,7 @@ void FrameLatency::SetWanted(bool wanted)
         for (Entry& e : g_history)
             e.valid = false;
         g_consecutiveInvalidCall = 0;
+        ClearValue();
     }
     g_wanted = wanted;
 }
@@ -124,7 +145,11 @@ void FrameLatency::OnAfterPresent(IDXGISwapChain* swapChain)
         if (hr == DXGI_ERROR_INVALID_CALL || hr == DXGI_ERROR_UNSUPPORTED)
         {
             if (++g_consecutiveInvalidCall >= kInvalidCallThreshold)
+            {
+                if (g_reason != FrameLatency::UnavailableReason::NotFullscreen)
+                    ClearValue();
                 g_reason = FrameLatency::UnavailableReason::NotFullscreen;
+            }
         }
         else
         {
@@ -138,13 +163,38 @@ void FrameLatency::OnAfterPresent(IDXGISwapChain* swapChain)
         return; // nothing new completed since we last checked
     g_lastSeenPresentCount = stats.PresentCount;
 
+    // QPC ticks per refresh, from this and the previous statistics.
+    if (g_lastSyncQpc != 0 && stats.SyncRefreshCount > g_lastSyncRefreshCount
+        && stats.SyncQPCTime.QuadPart > g_lastSyncQpc)
+    {
+        const double period = static_cast<double>(stats.SyncQPCTime.QuadPart - g_lastSyncQpc)
+                            / static_cast<double>(stats.SyncRefreshCount - g_lastSyncRefreshCount);
+        // Under 1 s per refresh, or it was a gap, not a period.
+        if (period < static_cast<double>(g_freq.QuadPart))
+            g_refreshQpc = g_refreshQpc > 0.0 ? g_refreshQpc * 0.9 + period * 0.1 : period;
+    }
+    g_lastSyncRefreshCount = stats.SyncRefreshCount;
+    g_lastSyncQpc = stats.SyncQPCTime.QuadPart;
+
+    // SyncQPCTime is the time of vblank SyncRefreshCount; PresentCount was
+    // shown (SyncRefreshCount - PresentRefreshCount) vblanks earlier. Without
+    // this, frames below the refresh rate read one or two refreshes too high
+    // (review F179).
+    if (stats.PresentRefreshCount > stats.SyncRefreshCount)
+        return;
+    const UINT refreshesLate = stats.SyncRefreshCount - stats.PresentRefreshCount;
+    if (refreshesLate > 0 && g_refreshQpc <= 0.0)
+        return; // no period measured yet to correct with
+    const LONGLONG displayQpc = stats.SyncQPCTime.QuadPart
+                              - static_cast<LONGLONG>(refreshesLate * g_refreshQpc);
+
     bool matched = false;
     for (int i = 0; i < 16; ++i)
     {
         if (g_history[i].valid && g_history[i].presentCount == stats.PresentCount)
         {
             matched = true;
-            const double latencyMs = static_cast<double>(stats.SyncQPCTime.QuadPart - g_history[i].callTime.QuadPart)
+            const double latencyMs = static_cast<double>(displayQpc - g_history[i].callTime.QuadPart)
                                     / static_cast<double>(g_freq.QuadPart) * 1000.0;
 
             // Sanity bound: a genuine call-to-display latency on this system

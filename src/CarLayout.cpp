@@ -1,10 +1,14 @@
 #include "CarLayout.h"
+#include "EcoThread.h"
 #include "InternalsPlugin.hpp"
 #include "Config.h"
 #include "Shortcuts.h"
 #include "Log.h"
+#include "RealtimeState.h"
 #include <Windows.h>
 #include <cstdio>
+#include <share.h>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -44,6 +48,9 @@ namespace
         { "EngineTemps", "CenterXFraction", &g_engineTempsConfig.centerXFraction },
         { "EngineTemps", "CenterYFraction", &g_engineTempsConfig.centerYFraction },
         { "EngineTemps", "Scale", &g_engineTempsConfig.scale },
+        { "Benchmark", "CenterXFraction", &g_benchmarkConfig.centerXFraction },
+        { "Benchmark", "CenterYFraction", &g_benchmarkConfig.centerYFraction },
+        { "Benchmark", "Scale", &g_benchmarkConfig.scale },
         { "FfbLevel", "CenterXFraction", &g_ffbLevelConfig.centerXFraction },
         { "FfbLevel", "CenterYFraction", &g_ffbLevelConfig.centerYFraction },
         { "FfbLevel", "Scale", &g_ffbLevelConfig.scale },
@@ -132,6 +139,7 @@ namespace
     char g_vehicleClass[32] = {};
     char g_plrFileName[64] = {};
     bool g_carChanged = false;
+    std::string g_lastVehicleKey;   // render thread (Poll)
 
     // The car whose layout is live, and what was last saved for it (both
     // under g_lock: Poll runs on the render thread, FlushIfDirty on the
@@ -142,6 +150,10 @@ namespace
     // out of the way meanwhile: the worker saves the car being left itself,
     // and g_currentKey is about to change.
     bool g_jobBusy = false;
+    // The car just left, when the worker could not save it: retried by
+    // FlushIfDirty (review F422). Under g_lock.
+    std::string g_retryKey;
+    std::vector<float> g_retryVals;
 
     void LayoutsPath(char* out, size_t outSize)
     {
@@ -186,8 +198,9 @@ namespace
         char path[MAX_PATH];
         sprintf_s(path, "%sUserData\\%s\\%s.JSON", root, plr, plr);
 
-        FILE* f = nullptr;
-        if (fopen_s(&f, path, "rb") != 0 || !f)
+        // Shared open, so rF2 can still save its profile meanwhile (review F281).
+        FILE* f = _fsopen(path, "rb", _SH_DENYNO);
+        if (!f)
         {
             Log::Write("CarLayout: could not open '%s'", path);
             return std::string();
@@ -273,11 +286,12 @@ namespace
     // them for a new car. That call replaces the section, so every value is
     // written, and any line already there that this build does not know (a
     // key from another version) is carried over as it was. Caller holds
-    // g_fileLock; never called with g_lock held.
-    void SaveSection(const std::string& key, const std::vector<float>& now)
+    // g_fileLock; never called with g_lock held. False if the write failed,
+    // so the caller keeps the layout dirty and retries (review F422).
+    bool SaveSection(const std::string& key, const std::vector<float>& now)
     {
         if (static_cast<int>(now.size()) != kValueCount)
-            return;
+            return false;
         char path[MAX_PATH];
         LayoutsPath(path, sizeof(path));
         std::vector<std::string> names;
@@ -313,7 +327,11 @@ namespace
         }
         block += '\0';   // the list ends with an empty string
         if (!WritePrivateProfileSectionA(key.c_str(), block.c_str(), path))
-            Log::Write("CarLayout: could not save [%s] (error %lu)", key.c_str(), GetLastError());
+        {
+            Log::Write("CarLayout: could not save [%s] (error %lu) -- will retry", key.c_str(), GetLastError());
+            return false;
+        }
+        return true;
     }
 
     // Reads a car's whole section in ONE file read (GetPrivateProfileSection)
@@ -352,8 +370,17 @@ namespace
         {
             if (!have[i]) continue;
             const float value = vals[i];
+            // Hand-edited or blank entries (atof gives 0): never put a
+            // non-number, a scale of 0 or less, or an out-of-range cover box
+            // value live, nor into the main INI (review F410).
+            if (!std::isfinite(value)) continue;
             if (i < kFloatCount)
             {
+                const char* k = kFloats[i].key;
+                const size_t kl = strlen(k);
+                if (kl >= 5 && strcmp(k + kl - 5, "Scale") == 0 && value <= 0.0f) continue;
+                if (strcmp(kFloats[i].section, "CoverBox") == 0
+                    && (strcmp(k, "Grey") == 0 || strcmp(k, "Alpha") == 0) && (value < 0.0f || value > 1.0f)) continue;
                 if (*kFloats[i].value != value)
                 {
                     *kFloats[i].value = value;
@@ -364,6 +391,7 @@ namespace
             {
                 const IntItem& it = kInts[i - kFloatCount];
                 const int iv = static_cast<int>(value + 0.5f);
+                if (it.value == &g_coverBoxConfig.count && (iv < 1 || iv > CoverBoxConfig::kMaxBoxes)) continue;
                 if (*it.value != iv)
                 {
                     *it.value = iv;
@@ -377,13 +405,27 @@ namespace
         }
     }
 
-    // "car:<model folder>" when the profile can be trusted, else "class:<class>".
+    // When the player profile can't be trusted: the car model rF2's web
+    // interface reported (VehicleKey, the key PB/brake points/fuel use), if
+    // it belongs to this car's class; else "class:<class>" (2026-11-24).
+    std::string FallbackKey(const std::string& cls)
+    {
+        char vk[128] = {}, vkClass[64] = {};
+        VehicleKey::Get(vk, sizeof(vk));
+        VehicleKey::GetClass(vkClass, sizeof(vkClass));
+        const std::string car = Sanitise(vk);
+        if (!car.empty() && Sanitise(vkClass) == cls)
+            return "car:" + car;
+        return "class:" + cls;
+    }
+
+    // "car:<model folder>" when the profile can be trusted, else FallbackKey.
     std::string ResolveKey(const char* vehicleClass, const char* plrFileName)
     {
         const std::string cls = Sanitise(vehicleClass);
         const std::string folder = Sanitise(ReadVehicleFolder(plrFileName));
         if (folder.empty())
-            return "class:" + cls;
+            return FallbackKey(cls);
 
         // Each model folder remembers the class it first came with. A
         // different class now means the profile still names the previous car.
@@ -397,7 +439,7 @@ namespace
         {
             Log::Write("CarLayout: profile names '%s' (class %s) but the car is class %s -- using the class",
                        folder.c_str(), seen, cls.c_str());
-            return "class:" + cls;
+            return FallbackKey(cls);
         }
         return "car:" + folder;
     }
@@ -421,11 +463,21 @@ namespace
         // out
         std::string key;
         bool same = false, known = false;
+        bool prevSaveFailed = false, newSaveOk = false;
         std::vector<float> vals;
         std::vector<char> have;
     } g_job;
 
-    DWORD WINAPI JobProc(LPVOID)
+    // An exception must not leave a thread: std::terminate would take the
+    // game down (review F271). The real body is JobProcBody below.
+    DWORD JobProcBody(LPVOID param);
+    DWORD WINAPI JobProc(LPVOID param)
+    {
+        try { return JobProcBody(param); }
+        catch (...) { return 0; }
+    }
+
+    DWORD JobProcBody(LPVOID)
     {
         AcquireSRWLockExclusive(&g_fileLock);
         g_job.key = ResolveKey(g_job.vehicleClass.c_str(), g_job.plr.c_str());
@@ -434,11 +486,11 @@ namespace
         {
             // The car being left keeps what was on screen for it (unless
             // nothing changed since it was last saved).
-            if (!g_job.prevKey.empty() && g_job.now != g_job.prevSaved)
-                SaveSection(g_job.prevKey, g_job.now);
+            g_job.prevSaveFailed = !g_job.prevKey.empty() && g_job.now != g_job.prevSaved
+                                   && !SaveSection(g_job.prevKey, g_job.now);
             g_job.known = ReadSection(g_job.key, g_job.vals, g_job.have);
             if (!g_job.known)
-                SaveSection(g_job.key, g_job.now); // a new car starts from the current layout
+                g_job.newSaveOk = SaveSection(g_job.key, g_job.now); // a new car starts from the current layout
         }
         ReleaseSRWLockExclusive(&g_fileLock);
         return 0;
@@ -455,8 +507,10 @@ void CarLayout::OnScoring(const ScoringInfoV01& info)
         if (!v.mIsPlayer)
             continue;
         AcquireSRWLockExclusive(&g_lock);
-        if (strncmp(g_vehicleName, v.mVehicleName, sizeof(g_vehicleName)) != 0
-            || strncmp(g_vehicleClass, v.mVehicleClass, sizeof(g_vehicleClass)) != 0)
+        // sizeof-1: strncpy_s keeps at most that many, so a full-length name
+        // compared whole looked "changed" on every tick (review F172).
+        if (strncmp(g_vehicleName, v.mVehicleName, sizeof(g_vehicleName) - 1) != 0
+            || strncmp(g_vehicleClass, v.mVehicleClass, sizeof(g_vehicleClass) - 1) != 0)
         {
             strncpy_s(g_vehicleName, v.mVehicleName, _TRUNCATE);
             strncpy_s(g_vehicleClass, v.mVehicleClass, _TRUNCATE);
@@ -473,21 +527,35 @@ void CarLayout::Poll()
     if (!g_job.thread)
     {
         char vehicleName[64], vehicleClass[32], plrFileName[64];
+        // The web-interface car name can arrive up to ~3 s after the car
+        // change; a layout that fell back to the class then re-resolves.
+        char vk[128] = {};
+        VehicleKey::Get(vk, sizeof(vk));
+        const bool vkChanged = g_lastVehicleKey != vk;
+        if (vkChanged) g_lastVehicleKey = vk;
         AcquireSRWLockExclusive(&g_lock);
-        const bool changed = g_carChanged;
+        const bool changed = g_carChanged
+                             || (vkChanged && g_currentKey.compare(0, 6, "class:") == 0);
         g_carChanged = false;
         strcpy_s(vehicleName, g_vehicleName);
         strcpy_s(vehicleClass, g_vehicleClass);
         strcpy_s(plrFileName, g_plrFileName);
-        if (changed && vehicleClass[0])
+        // A blank class (some mods) falls back to the entry name, as
+        // VehicleKey does; with neither, no layout is live, so edits are not
+        // saved into the previous car's section (review F172).
+        if (changed && !vehicleClass[0] && !vehicleName[0])
+            g_currentKey.clear();
+        if (changed && (vehicleClass[0] || vehicleName[0]))
         {
             g_job.vehicleName = vehicleName;
-            g_job.vehicleClass = vehicleClass;
+            g_job.vehicleClass = vehicleClass[0] ? vehicleClass : vehicleName;
             g_job.plr = plrFileName;
             g_job.prevKey = g_currentKey;
+            g_job.prevSaveFailed = g_job.newSaveOk = false;
             Snapshot(g_job.now);
             g_job.prevSaved = g_saved;
             g_job.thread = CreateThread(nullptr, 0, JobProc, nullptr, 0, nullptr);
+            MakeThreadEfficient(g_job.thread);
             g_jobBusy = g_job.thread != nullptr;
         }
         ReleaseSRWLockExclusive(&g_lock);
@@ -515,18 +583,50 @@ void CarLayout::Poll()
     AcquireSRWLockExclusive(&g_lock);
     const bool firstCar = g_currentKey.empty();
     (void)firstCar;
+    if (g_job.prevSaveFailed)
+    {
+        g_retryKey = g_job.prevKey;
+        g_retryVals = g_job.now;
+    }
+    // Edits made while the worker ran (review F423): g_job.now is what the
+    // worker saw, so any value that differs now was changed meanwhile.
+    std::vector<float> live;
+    Snapshot(live);
+    const int n = static_cast<int>(g_job.now.size()) < kValueCount ? static_cast<int>(g_job.now.size()) : kValueCount;
     if (known)
-        ApplyValues(g_job.vals, g_job.have);
+    {
+        // Keep those edits instead of overwriting them with the saved
+        // layout, and leave them dirty so the next pass saves them.
+        std::vector<char> have = g_job.have;
+        for (int i = 0; i < n; ++i)
+            if (live[i] != g_job.now[i]) have[i] = 0;
+        ApplyValues(g_job.vals, have);
+        Snapshot(g_saved);
+        for (int i = 0; i < n; ++i)
+            if (live[i] != g_job.now[i] && g_job.have[i]) g_saved[i] = g_job.vals[i];
+    }
+    else if (g_job.newSaveOk)
+        g_saved = g_job.now;   // what the file holds; later edits stay dirty
+    else
+        g_saved.clear();       // not saved: dirty, retried by the next pass
     g_currentKey = key;
-    Snapshot(g_saved);
     g_jobBusy = false;
     ReleaseSRWLockExclusive(&g_lock);
 
     Log::Write("CarLayout: '%s' (%s) -> layout [%s]%s", vehicleName, vehicleClass, key.c_str(),
                known ? "" : " (new, from the current layout)");
-    char msg[128];
-    sprintf_s(msg, "HUD layout: %s", key.c_str() + key.find(':') + 1);
-    Shortcuts::ShowMessage(msg, 3.0);
+    // Say so on screen, with a reminder that what is set up now sticks to
+    // this car (review F303, ported from main). _TRUNCATE: a long mod folder
+    // name overflowed sprintf_s, which kills the game (review F171).
+    const size_t colon = key.find(':');
+    const char* carName = key.c_str() + (colon == std::string::npos ? 0 : colon + 1);
+    char msg[160];
+    if (known)
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE, "%s: %s -- its saved HUD layout is loaded (saved per car)",
+                    firstCar ? "Car detected" : "Car changed", carName);
+    else
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE, "New car detected: %s -- HUD layout and settings now save for this car", carName);
+    Shortcuts::ShowMessage(msg, 6.0);
 }
 
 void CarLayout::FlushIfDirty()
@@ -542,7 +642,14 @@ void CarLayout::FlushIfDirty()
     AcquireSRWLockExclusive(&g_fileLock);
     std::string key;
     std::vector<float> now;
+    std::string retryKey;
+    std::vector<float> retryVals;
     AcquireSRWLockExclusive(&g_lock);
+    if (!g_jobBusy && !g_retryKey.empty())
+    {
+        retryKey.swap(g_retryKey);
+        retryVals.swap(g_retryVals);
+    }
     if (!g_currentKey.empty() && !g_jobBusy)
     {
         Snapshot(now);
@@ -550,18 +657,31 @@ void CarLayout::FlushIfDirty()
             key = g_currentKey;
     }
     ReleaseSRWLockExclusive(&g_lock);
+    // The car left earlier whose save failed (review F422). If it fails
+    // again, keep it for the next pass unless a newer failure replaced it.
+    if (!retryKey.empty() && retryKey != key && !SaveSection(retryKey, retryVals))
+    {
+        AcquireSRWLockExclusive(&g_lock);
+        if (g_retryKey.empty())
+        {
+            g_retryKey.swap(retryKey);
+            g_retryVals.swap(retryVals);
+        }
+        ReleaseSRWLockExclusive(&g_lock);
+    }
     if (key.empty())
     {
         ReleaseSRWLockExclusive(&g_fileLock);
         return;
     }
-    SaveSection(key, now);
+    const bool ok = SaveSection(key, now);
     ReleaseSRWLockExclusive(&g_fileLock);
 
-    // Only remember it as saved if that car is still the live one and no
-    // car change has started since (which takes over g_saved itself).
+    // Only remember it as saved if it was written, that car is still the
+    // live one and no car change has started since (which takes over
+    // g_saved itself). A failed save stays dirty and is retried (review F422).
     AcquireSRWLockExclusive(&g_lock);
-    if (!g_jobBusy && g_currentKey == key)
+    if (ok && !g_jobBusy && g_currentKey == key)
         g_saved.swap(now);
     ReleaseSRWLockExclusive(&g_lock);
 }

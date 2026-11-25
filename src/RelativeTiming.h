@@ -146,6 +146,10 @@ public:
         // This car's last lap is the fastest lap of the session so far.
         bool lastLapIsSessionFastest = false;
 
+        // No gap to show (gap box outside a race when either car has no best
+        // lap yet): drawn blank rather than a misleading number.
+        bool gapUnknown = false;
+
         // Gap colour, judged once per sector (see UpdateSectors): +1 the
         // player was faster through the last sector both ran (green), -1
         // this car was (red), 2 this car's sector was the session best
@@ -154,11 +158,11 @@ public:
 
         // Recently changed track position (this car's own mPlace, not the
         // row's place in this table) -- -1 = just gained a place, +1 = just
-        // lost one, 0 = no recent change. placeChangeAlpha fades from 1 down
-        // to 0 over the hold duration so the highlight isn't a hard on/off
-        // flash.
+        // lost one, 0 = no recent change. placeChangeTime is when it was
+        // confirmed (QPC); Draw() fades the highlight from that on its own
+        // clock, so it still fades if the table freezes (review F364).
         int placeChangeSign = 0;
-        float placeChangeAlpha = 0.0f;
+        LARGE_INTEGER placeChangeTime = {};
 
         // The tyre compound (TyreStore) and laps since the last stop
         // (PitStint), looked up when the row is published rather than by
@@ -292,10 +296,23 @@ private:
     State m_state;
     LARGE_INTEGER m_freq = {};
 
-    static const int kMaxTrackedCars = 64;
+    // Sized to the SDK's 128 cars, and trackers of cars gone from scoring
+    // (or whose ID now carries another driver) are freed each tick -- with
+    // 64 and no freeing, the 65th car shared a slot and showed another
+    // car's gap (review F82/F95).
+    static const int kMaxTrackedCars = 128;
     long m_trackerCarId[kMaxTrackedCars] = {};
     TrendTracker m_tracker[kMaxTrackedCars] = {};
+    char m_trackerName[kMaxTrackedCars][32] = {};
+    int m_trackerMissingTicks[kMaxTrackedCars] = {};
     int m_trackerCount = 0;
+    void PruneTrackers(const struct ScoringInfoV01& info);
+
+    // The lap being traced touched the pits or was disturbed (a long pause
+    // between samples, lap distance going backwards): it may not become
+    // the reference lap (review F78).
+    bool m_curLapRejected = false;
+    double m_lastTimeIntoLapForTrace = -1.0;
 
     // Stint tracking (scoring thread only): baseline lap count at the start
     // of the current stint, re-anchored on every PIT EXIT (mInPits true ->
@@ -339,6 +356,9 @@ private:
     static const int kMaxRowCache = 128;
     Row m_rowCache[kMaxRowCache];
     TrendTracker* m_rowCacheTracker[kMaxRowCache] = {};
+    // Nearest-cars candidates (whole field + one wrap row); a member for
+    // the same stack reason.
+    Row m_candidates[kMaxRowCache + 1];
 
     // Session-best time for each sector, by anyone (-1 = none yet).
     double m_sessionBestSector[3] = { -1.0, -1.0, -1.0 };

@@ -13,6 +13,10 @@ namespace FrameRate
     // Smoothed FPS. Returns false if no measurement yet (first frame).
     bool GetFps(double& outFps);
 
+    // The latest single Present-to-Present interval, unsmoothed (the
+    // benchmark box wants every frame). False before the second frame.
+    bool GetLastFrameMs(double& outMs);
+
     // Feeds the frame-cap detector one fresh FPS sample -- call this at a
     // slow, steady cadence (the perf overlay's own [Performance] UpdateHz
     // refresh, not a hardcoded one), not every frame. Real-time-windowed

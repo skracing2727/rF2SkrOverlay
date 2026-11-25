@@ -1,4 +1,5 @@
 #include "FfbLevel.h"
+#include "RenderThrottle.h"
 #include "FfbGraph.h"
 #include "Renderer.h"
 #include "Config.h"
@@ -12,9 +13,19 @@ extern FfbSpectrumStore g_ffbSpectrum;
 
 namespace
 {
-    const float kClip = 0.995f;
+    // Same clip level as the FFB spectrum ([FfbGraph] ClipLevel), review F144.
+    float ClipLevel()
+    {
+        const float c = g_ffbGraphConfig.clipLevel;
+        return c > 0.05f && c <= 2.0f ? c : 0.995f;
+    }
 
     std::atomic<float> s_now{ 0.0f };
+    // Highest |force| since the render thread last read it: written only by
+    // the FFB thread, swapped to 0 by Draw, so short peaks between frames
+    // still show (review F144).
+    std::atomic<float> s_peak{ 0.0f };
+    std::atomic<bool> s_resetReq{ false };
     std::atomic<float> s_lapMax{ 0.0f };
     std::atomic<float> s_prevLapMax{ -1.0f };   // -1 = no lap yet
     std::atomic<float> s_prevLapClip{ 0.0f };   // fraction of samples clipped
@@ -28,6 +39,17 @@ void FfbLevel::OnForce(double value)
     const float a = static_cast<float>(fabs(value));
     s_now.store(a, std::memory_order_relaxed);
     s_valid.store(true, std::memory_order_relaxed);
+    if (a > s_peak.load(std::memory_order_relaxed)) s_peak.store(a, std::memory_order_relaxed);
+
+    if (s_resetReq.exchange(false))
+    {
+        s_lap = -1;
+        s_lapMax.store(0.0f);
+        s_prevLapMax.store(-1.0f);
+        s_prevLapClip.store(0.0f);
+        s_samples = 0;
+        s_clipped = 0;
+    }
 
     const long lap = g_ffbSpectrum.Lap();
     if (lap != s_lap)
@@ -44,7 +66,12 @@ void FfbLevel::OnForce(double value)
     }
     if (a > s_lapMax.load(std::memory_order_relaxed)) s_lapMax.store(a, std::memory_order_relaxed);
     ++s_samples;
-    if (a >= kClip) ++s_clipped;
+    if (a >= ClipLevel()) ++s_clipped;
+}
+
+void FfbLevel::Reset()
+{
+    s_resetReq.store(true);
 }
 
 bool FfbLevel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
@@ -53,6 +80,12 @@ bool FfbLevel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     if (!cfg.enabled) return false;
     const bool placeholder = Layout::Preview();
     if (!s_valid.load() && !placeholder) return false;
+    // 25 Hz rebuild, replayed in between (2026-11-24 throttle pass): the bar
+    // stays smooth, the peak hold below measures its own time step.
+    static RenderThrottle s_throttle(0.04);
+    if (!Layout::Active() && s_throttle.TryReplay(renderer))
+        return true;
+    RenderThrottle::Capture throttleCapture(s_throttle, renderer);
 
     // Peak-hold the live value ~0.3 s, then let it fall, so the number and
     // bar are readable instead of flickering at 400 Hz.
@@ -64,7 +97,8 @@ bool FfbLevel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     float dt = prev.QuadPart ? static_cast<float>(now.QuadPart - prev.QuadPart) / freq.QuadPart : 0.0f;
     prev = now;
     if (dt < 0.0f || dt > 1.0f) dt = 1.0f;
-    const float cur = s_now.load();
+    float cur = s_peak.exchange(0.0f);
+    if (cur <= 0.0f) cur = s_now.load();   // no sample since the last frame
     held = cur > held ? cur : held - (held - cur) * (1.0f - expf(-dt / 0.3f));
 
     const float s = static_cast<float>(screenHeight) / 2160.0f * (cfg.scale > 0.05f ? cfg.scale : 0.05f);
@@ -82,9 +116,10 @@ bool FfbLevel::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     renderer.SetTextBackground(false);
     renderer.AddFilledRoundedRect(cx, cy, halfW, halfH, 8.0f * s, 0.0f, 0.08f, 0.08f, 0.08f, 0.6f);
 
-    auto levelColour = [](float v, float& r, float& g, float& b)
+    const float clipLevel = ClipLevel();
+    auto levelColour = [clipLevel](float v, float& r, float& g, float& b)
     {
-        if (v >= kClip) { r = 1.0f; g = 0.3f; b = 0.25f; }
+        if (v >= clipLevel) { r = 1.0f; g = 0.3f; b = 0.25f; }
         else if (v >= 0.9f) { r = 1.0f; g = 0.75f; b = 0.15f; }
         else { r = 0.35f; g = 0.85f; b = 0.4f; }
     };

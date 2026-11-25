@@ -156,8 +156,10 @@ private:
     bool m_haveRawNames = false;
     std::atomic<bool> m_keysInvalidated{ false };
     bool m_lastSpeedLimiterOn = false;
-    double m_episodeMaxKmh = 0.0;        // running max speed for the CURRENT limiter-engaged episode
-    double m_episodeStartSpeedKmh = 0.0; // speed at the instant this episode's limiter engaged
+    double m_episodeMaxKmh = 0.0;        // highest speed PLATEAU of the current limiter episode, 0 = none (review F32)
+    double m_plateauStartET = -1.0;      // start of the current steady-speed run, -1 = none
+    double m_plateauRefKmh = 0.0;        // speed the run started at (the band is around this)
+    double m_plateauMaxKmh = 0.0;        // highest speed within the run
     // Set instead of saving directly whenever a learned value changes;
     // cleared by FlushIfDirty() once copied out for writing. The key and
     // values to write are copied alongside at that moment (under m_lock), so
@@ -166,7 +168,7 @@ private:
     bool m_shiftPointDirty = false;
     char m_pitSaveKey[160] = {};
     double m_pitSaveKmh = 0.0;
-    char m_shiftSaveKey[96] = {};
+    char m_shiftSaveKey[160] = {};   // class__entry, up to ~130 chars (review F419)
     double m_shiftSaveTarget = 0.0;
     double m_shiftSaveCorr[State::kMaxGears] = {};
 
@@ -237,6 +239,13 @@ private:
     // timeout.
     bool m_shiftCuePending = false;
     double m_shiftCueArmedET = -1.0;
+    // The pending measurement timed out (cue held, e.g. on the limiter): no
+    // re-arm until the cue releases or the gear changes (review F31).
+    bool m_shiftCueExpired = false;
+    // The gear the cue state belongs to; a change clears it (review F37).
+    int m_shiftCueGear = -999;
+    // Resets every mElapsedTime stamp (new session clock, review F248).
+    void ResetTimedStateLocked();
     // The cue LATCHES once shown, and the RPM it first triggered at is kept
     // so it can be released against a fixed point. Re-testing the live
     // trigger every tick does not work: the trigger is
@@ -276,4 +285,8 @@ namespace GearDisplay
     // Draws the gear+speed panel and the pit-limiter box. Returns false if
     // nothing was drawn (no telemetry yet).
     bool Draw(Renderer& renderer, int screenWidth, int screenHeight);
+    // Track-alert lines and the PIT LIMIT reminder above the gear/speed
+    // row. Separate from Draw so they show with the Gear panel hidden
+    // (review F47). Returns false if nothing to draw.
+    bool DrawAlerts(Renderer& renderer, int screenWidth, int screenHeight);
 }

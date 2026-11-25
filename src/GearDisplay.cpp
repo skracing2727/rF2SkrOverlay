@@ -11,6 +11,8 @@
 #include "Log.h"
 #include "RenderThrottle.h"
 #include "StoreFile.h"
+#include "Persist.h"
+#include "TyreWear.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -20,6 +22,27 @@ GearDisplayStore g_gearDisplay;
 
 namespace
 {
+    // review F390: sprintf_s ends the process when the text does not fit, so
+    // an over-long install path or car/track name must fail the read or write
+    // instead. Returns false (and logs) when the path did not fit.
+    bool MakeStorePath(char* out, size_t outSize, const char* dir, const char* key)
+    {
+        if (_snprintf_s(out, outSize, _TRUNCATE, "%s\\%s.txt", dir, key) < 0)
+        {
+            out[0] = '\0';
+            Log::Write("GearDisplay: path too long, file skipped (%s)", key);
+            return false;
+        }
+        return true;
+    }
+
+    // review F269: learned files are hand-editable; only sane values reach
+    // the cue. Same limits as the learner's clamp.
+    constexpr double kCueCorrMin = -0.05;
+    constexpr double kCueCorrMax = 0.10;
+    double SaneTarget(double t) { return (std::isfinite(t) && t >= 0.5 && t <= 1.0) ? t : 0.0; }
+    double SaneCorr(double c) { return (std::isfinite(c) && c >= kCueCorrMin && c <= kCueCorrMax) ? c : 0.0; }
+
     // Same DLL-relative-path resolution used elsewhere (Config.cpp,
     // LapDelta.cpp), so the saved pit-limit files live next to the INI.
     void GetPitLimitDir(char* out, size_t outSize)
@@ -33,7 +56,7 @@ namespace
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) *(lastSlash + 1) = '\0';
 
-        sprintf_s(out, outSize, "%sPitLimits", dllPath);
+        _snprintf_s(out, outSize, _TRUNCATE, "%sPitLimits", dllPath);
     }
 
     void GetShiftPointDir(char* out, size_t outSize)
@@ -47,10 +70,10 @@ namespace
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) *(lastSlash + 1) = '\0';
 
-        sprintf_s(out, outSize, "%sShiftPoints", dllPath);
+        _snprintf_s(out, outSize, _TRUNCATE, "%sShiftPoints", dllPath);
     }
 
-    void GetPitLaneLimitPath(const char* key, char* out, size_t outSize, bool makeDir)
+    bool GetPitLaneLimitPath(const char* key, char* out, size_t outSize, bool makeDir)
     {
         char dllPath[MAX_PATH] = {};
         HMODULE hModule = nullptr;
@@ -60,10 +83,10 @@ namespace
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) *(lastSlash + 1) = '\0';
         char dir[MAX_PATH];
-        sprintf_s(dir, "%sPitLaneLimits", dllPath);
+        _snprintf_s(dir, sizeof(dir), _TRUNCATE, "%sPitLaneLimits", dllPath);
         if (makeDir)
             CreateDirectoryA(dir, nullptr);
-        sprintf_s(out, outSize, "%s\\%s.txt", dir, key);
+        return MakeStorePath(out, outSize, dir, key);
     }
 
     // maxLen bounds the scan to the SDK's own fixed buffer size (see the call
@@ -73,15 +96,7 @@ namespace
     // of the struct.
     std::string Sanitize(const char* s, size_t maxLen)
     {
-        std::string out;
-        for (size_t i = 0; i < maxLen && s[i]; ++i)
-        {
-            const char c = s[i];
-            const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
-            out.push_back(ok ? c : '_');
-        }
-        if (out.empty()) out = "unknown";
-        return out;
+        return StoreFile::SafeName(s, maxLen); // shared rule, review F420
     }
 
     // The saved files, read and written OUTSIDE m_lock: reads from Update()
@@ -90,12 +105,21 @@ namespace
     // the render thread's Read() ever waits behind the disk.
 
     // 0 = nothing saved (or an implausible saved value).
-    double ReadPitLimitFile(const char* key, const char* vehicleName, const char* trackName)
+    // legacyKey: the old per-class name, read once if the car has no file.
+    double ReadPitLimitFile(const char* key, const char* legacyKey, const char* vehicleName, const char* trackName)
     {
         char dir[MAX_PATH];
         GetPitLimitDir(dir, sizeof(dir));
         char path[MAX_PATH];
-        sprintf_s(path, "%s\\%s.txt", dir, key);
+        if (!MakeStorePath(path, sizeof(path), dir, key))
+            return 0.0;
+        char legacy[MAX_PATH];
+        if (!StoreFile::Exists(path) && legacyKey && legacyKey[0] && strcmp(legacyKey, key) != 0
+            && MakeStorePath(legacy, sizeof(legacy), dir, legacyKey) && StoreFile::Exists(legacy))
+        {
+            strcpy_s(path, legacy);
+            Log::Write("GearDisplay: no pit limit yet for %s -- seeding from old class file %s", key, legacyKey);
+        }
 
         FILE* f = nullptr;
         if (fopen_s(&f, path, "r") != 0 || !f)
@@ -112,7 +136,8 @@ namespace
         // Update()) -- no real pit limit is this low, so treat it the same as
         // "nothing saved yet" rather than propagating garbage forever.
         constexpr double kMinPlausiblePitLimitKmh = 20.0;
-        if (loaded < kMinPlausiblePitLimitKmh)
+        // review F269: written so NaN fails too; nothing real is over 400.
+        if (!(loaded >= kMinPlausiblePitLimitKmh && loaded <= 400.0))
         {
             Log::Write("GearDisplay: ignoring implausible saved pit limit %.2f km/h for %s / %s", loaded, vehicleName, trackName);
             return 0.0;
@@ -125,14 +150,15 @@ namespace
     double ReadPitLaneLimitFile(const char* key)
     {
         char path[MAX_PATH];
-        GetPitLaneLimitPath(key, path, sizeof(path), false);
+        if (!GetPitLaneLimitPath(key, path, sizeof(path), false))
+            return 0.0;
         FILE* f = nullptr;
         if (fopen_s(&f, path, "r") != 0 || !f)
             return 0.0;
         char line[64];
         const double kmh = fgets(line, sizeof(line), f) ? atof(line) : 0.0;
         fclose(f);
-        if (kmh < 10.0 || kmh > 400.0)
+        if (!(kmh >= 10.0 && kmh <= 400.0))   // NaN fails too (review F269)
             return 0.0;
         Log::Write("GearDisplay: pit lane limit for %s is %.0f km/h (set)", key, kmh);
         return kmh;
@@ -142,7 +168,8 @@ namespace
     void WritePitLaneLimitFile(const char* key, double kmh)
     {
         char path[MAX_PATH];
-        GetPitLaneLimitPath(key, path, sizeof(path), kmh > 0.0);
+        if (!GetPitLaneLimitPath(key, path, sizeof(path), kmh > 0.0))
+            return;
         if (kmh <= 0.0)
         {
             DeleteFileA(path);
@@ -166,7 +193,8 @@ namespace
         CreateDirectoryA(dir, nullptr); // no-op (ERROR_ALREADY_EXISTS) if it's already there
 
         char path[MAX_PATH];
-        sprintf_s(path, "%s\\%s.txt", dir, key);
+        if (!MakeStorePath(path, sizeof(path), dir, key))
+            return;
 
         char tmp[StoreFile::kTmpPathSize];
         FILE* f = StoreFile::Begin(path, tmp, sizeof(tmp), "w");
@@ -195,35 +223,62 @@ namespace
         GetShiftPointDir(dir, sizeof(dir));
         char* slash = strrchr(dir, '\\');
         if (slash) *(slash + 1) = '\0';
-        sprintf_s(out, outSize, "%sShiftTargets", dir);
+        _snprintf_s(out, outSize, _TRUNCATE, "%sShiftTargets", dir);
     }
 
-    void ReadShiftTargetFile(const char* key, const char* classKey, double& target,
-                             double corr[GearDisplayStore::State::kMaxGears])
+    // One ShiftTargets file; false if it does not exist. Values are range-
+    // checked (review F269): a bad line reads as "not set" (0).
+    bool ReadShiftTargetFileAt(const char* path, double& target,
+                               double corr[GearDisplayStore::State::kMaxGears])
+    {
+        FILE* f = nullptr;
+        if (fopen_s(&f, path, "r") != 0 || !f)
+            return false;
+        char line[64];
+        target = SaneTarget(fgets(line, sizeof(line), f) ? atof(line) : 0.0);
+        for (int g = 1; g < GearDisplayStore::State::kMaxGears; ++g)
+        {
+            if (!fgets(line, sizeof(line), f)) break;
+            corr[g] = SaneCorr(atof(line));
+        }
+        fclose(f);
+        return true;
+    }
+
+    // key = class__car (per car model since 2026-11-24; review F419: names
+    // alone clash across mods). Seeds, in order, read once: entryKey = the
+    // previous class__entry name, legacyKey = the old entry-only name, then
+    // the per-class ShiftPoints file.
+    void ReadShiftTargetFile(const char* key, const char* entryKey, const char* legacyKey, const char* classKey,
+                             double& target, double corr[GearDisplayStore::State::kMaxGears])
     {
         target = 0.0;
         for (int g = 0; g < GearDisplayStore::State::kMaxGears; ++g) corr[g] = 0.0;
         char dir[MAX_PATH], path[MAX_PATH];
         GetShiftTargetDir(dir, sizeof(dir));
-        sprintf_s(path, "%s\\%s.txt", dir, key);
-        FILE* f = nullptr;
-        char line[64];
-        if (fopen_s(&f, path, "r") == 0 && f)
+        if (MakeStorePath(path, sizeof(path), dir, key) && ReadShiftTargetFileAt(path, target, corr))
         {
-            target = fgets(line, sizeof(line), f) ? atof(line) : 0.0;
-            for (int g = 1; g < GearDisplayStore::State::kMaxGears; ++g)
-            {
-                if (!fgets(line, sizeof(line), f)) break;
-                corr[g] = atof(line);
-            }
-            fclose(f);
-            Log::Write("GearDisplay: shift target %.0f%% of max RPM for %s", target * 100.0, key);
+            Log::Write("GearDisplay: shift target %.0f%% of max RPM for %s%s", target * 100.0, key,
+                       target > 0.0 ? "" : " (INI default)");
+            return;
+        }
+        if (entryKey && entryKey[0] && strcmp(entryKey, key) != 0
+            && MakeStorePath(path, sizeof(path), dir, entryKey) && ReadShiftTargetFileAt(path, target, corr))
+        {
+            Log::Write("GearDisplay: shift target for %s seeded from old file %s", key, entryKey);
+            return;
+        }
+        if (legacyKey && legacyKey[0] && strcmp(legacyKey, key) != 0
+            && MakeStorePath(path, sizeof(path), dir, legacyKey) && ReadShiftTargetFileAt(path, target, corr))
+        {
+            Log::Write("GearDisplay: shift target for %s seeded from old file %s", key, legacyKey);
             return;
         }
         // Seed from the old per-class file.
+        FILE* f = nullptr;
+        char line[64];
         GetShiftPointDir(dir, sizeof(dir));
-        sprintf_s(path, "%s\\%s.txt", dir, classKey);
-        if (fopen_s(&f, path, "r") == 0 && f)
+        if (MakeStorePath(path, sizeof(path), dir, classKey) && fopen_s(&f, path, "r") == 0 && f)
         {
             const double old = fgets(line, sizeof(line), f) ? atof(line) : 0.0;
             fclose(f);
@@ -240,7 +295,8 @@ namespace
         GetShiftTargetDir(dir, sizeof(dir));
         CreateDirectoryA(dir, nullptr); // no-op (ERROR_ALREADY_EXISTS) if it's already there
         char path[MAX_PATH];
-        sprintf_s(path, "%s\\%s.txt", dir, key);
+        if (!MakeStorePath(path, sizeof(path), dir, key))
+            return;
         char tmp[StoreFile::kTmpPathSize];
         FILE* f = StoreFile::Begin(path, tmp, sizeof(tmp), "w");
         if (!f)
@@ -270,9 +326,14 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
     if (!m_ready)
         return;
 
-    const double speed = sqrt(info.mLocalVel.x * info.mLocalVel.x +
-                              info.mLocalVel.y * info.mLocalVel.y +
-                              info.mLocalVel.z * info.mLocalVel.z);
+    // review F34: one NaN/inf tick (physics blow-up, loading) must not reach
+    // the text buffers in Draw or the smoothed RPM rate -- 0 and clamped.
+    auto finiteClamp = [](double v, double hi) { return (std::isfinite(v) && v > 0.0) ? (v < hi ? v : hi) : 0.0; };
+    const double speed = finiteClamp(sqrt(info.mLocalVel.x * info.mLocalVel.x +
+                                          info.mLocalVel.y * info.mLocalVel.y +
+                                          info.mLocalVel.z * info.mLocalVel.z), 200.0);
+    const double rpmNow = finiteClamp(info.mEngineRPM, 50000.0);
+    const double maxRpmNow = finiteClamp(info.mEngineMaxRPM, 50000.0);
     const bool limiterOn = info.mSpeedLimiter != 0 && !g_playerAiControl.load(std::memory_order_relaxed);
 
     // Car/track change. The raw names are compared with last tick's copies
@@ -281,7 +342,7 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
     // BEFORE m_lock -- the render thread's Read() takes that lock every frame.
     // m_currentKey/m_shiftKey are only ever written by this thread (under the
     // lock, for FlushIfDirty), so reading them here without it is safe.
-    // Vehicle CLASS, shared from the scoring thread -- see RealtimeState.h.
+    // CAR key, shared from the scoring thread -- see RealtimeState.h.
     char vehKey[64];
     VehicleKey::Get(vehKey, sizeof(vehKey));
     const bool rekeyAfterClear = m_keysInvalidated.exchange(false);
@@ -299,28 +360,47 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
         memcpy(m_rawTrackName, info.mTrackName, sizeof(m_rawTrackName));
         memcpy(m_rawEntryName, info.mVehicleName, sizeof(m_rawEntryName));
         m_haveRawNames = true;
-        // Shift targets are per car ENTRY (asked for 2026-11-24: one class
-        // holds cars with very different engines); the pit limit is per
-        // vehicle class + track.
-        const std::string classKey = Sanitize(vehKey, sizeof(vehKey));
-        newShiftKey = info.mVehicleName[0] ? Sanitize(info.mVehicleName, sizeof(info.mVehicleName)) : classKey;
-        newPitKey = classKey + "__" + Sanitize(info.mTrackName, sizeof(info.mTrackName));
+        // Shift targets and the pit limit are per car MODEL (2026-11-24: one
+        // class holds cars with very different engines); the pit-lane limit
+        // below is the track's. Old per-class/per-entry files seed a car's
+        // first file.
+        char classRaw[64];
+        VehicleKey::GetClass(classRaw, sizeof(classRaw));
+        const std::string classKey = Sanitize(classRaw, sizeof(classRaw));
+        const std::string carKey = Sanitize(vehKey, sizeof(vehKey));
+        const std::string trackKey = Sanitize(info.mTrackName, sizeof(info.mTrackName));
+        // class__car (review F419): names alone let unrelated cars share one
+        // file. With no REST answer the car key is the entry name, so this is
+        // the earlier class__entry file name.
+        const std::string legacyShiftKey = info.mVehicleName[0] ? Sanitize(info.mVehicleName, sizeof(info.mVehicleName)) : std::string();
+        const std::string entryShiftKey = legacyShiftKey.empty() ? classKey : classKey + "__" + legacyShiftKey;
+        newShiftKey = classKey + "__" + carKey;
+        newPitKey = carKey + "__" + trackKey;
         // Clear() forgets the pit-limit key, so the next tick reloads it
         // even for the same car and track.
         pitKeyChanged = rekeyAfterClear || newPitKey != m_currentKey;
         shiftKeyChanged = newShiftKey != m_shiftKey;
         if (pitKeyChanged)
-            loadedPitLimitKmh = ReadPitLimitFile(newPitKey.c_str(), vehKey, info.mTrackName);
+        {
+            const std::string legacyPitKey = classKey + "__" + trackKey;
+            loadedPitLimitKmh = ReadPitLimitFile(newPitKey.c_str(), legacyPitKey.c_str(), vehKey, info.mTrackName);
+        }
         // The set pit-lane limit is the track's, whatever the car.
         newLaneKey = Sanitize(info.mTrackName, sizeof(info.mTrackName));
         laneKeyChanged = rekeyAfterClear || newLaneKey != m_laneKey;
         if (laneKeyChanged)
             loadedLaneLimitKmh = ReadPitLaneLimitFile(newLaneKey.c_str());
         if (shiftKeyChanged)
-            ReadShiftTargetFile(newShiftKey.c_str(), classKey.c_str(), loadedShiftTarget, loadedShiftCorr);
+            ReadShiftTargetFile(newShiftKey.c_str(), entryShiftKey.c_str(), legacyShiftKey.c_str(), classKey.c_str(),
+                                loadedShiftTarget, loadedShiftCorr);
     }
 
     EnterCriticalSection(&m_lock);
+
+    // review F248: the sim clock restarts each session. A stamp from a later
+    // time than now belongs to the old session and would hold its timers.
+    if (m_lastTimeForRate > info.mElapsedTime + 0.5)
+        ResetTimedStateLocked();
 
     if (pitKeyChanged)
     {
@@ -328,6 +408,7 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
         m_state.learnedPitLimitKmh = loadedPitLimitKmh;
         m_lastSpeedLimiterOn = false;
         m_episodeMaxKmh = 0.0;
+        m_plateauStartET = -1.0;
     }
     if (laneKeyChanged)
     {
@@ -350,11 +431,21 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
             m_state.shiftAvgPercentByGear[g] = 0.0;
             m_state.shiftSampleCountByGear[g] = 0;
         }
+        // review F344: the car-wide Avg / 1% are this car's too. Reaction
+        // history is kept on purpose: it is the driver's, not the car's.
+        m_shiftHistoryCount = 0;
+        m_shiftHistoryNext = 0;
+        m_state.shiftAvgPercent = 0.0;
+        m_state.shiftP1Percent = 0.0;
+        m_state.shiftSampleCount = 0;
+        m_shiftCueLatched = false;
+        m_shiftCuePending = false;
+        m_shiftCueExpired = false;
     }
 
-    m_state.gear = static_cast<int>(info.mGear);
-    m_state.rpm = info.mEngineRPM;
-    m_state.maxRpm = info.mEngineMaxRPM;
+    m_state.gear = (info.mGear < -1) ? -1 : (info.mGear > 99 ? 99 : static_cast<int>(info.mGear));   // review F34
+    m_state.rpm = rpmNow;
+    m_state.maxRpm = maxRpmNow;
     m_state.speedMs = speed;
     m_state.speedLimiterOn = limiterOn;
 
@@ -371,13 +462,13 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
         const double dtRate = info.mElapsedTime - m_lastTimeForRate;
         if (dtRate > 0.0001 && dtRate < 1.0)
         {
-            double rawRate = (info.mEngineRPM - m_lastRpmForRate) / dtRate;
+            double rawRate = (rpmNow - m_lastRpmForRate) / dtRate;
             if (rawRate < 0.0) rawRate = 0.0;
             constexpr double kRateSmoothing = 0.2; // ~5 samples of time constant at this callback rate
             m_rpmRateSmoothed = m_rpmRateSmoothed * (1.0 - kRateSmoothing) + rawRate * kRateSmoothing;
         }
     }
-    m_lastRpmForRate = info.mEngineRPM;
+    m_lastRpmForRate = rpmNow;
     m_lastTimeForRate = info.mElapsedTime;
     const double rpmRate = (m_rpmRateSmoothed > 0.0) ? m_rpmRateSmoothed : 0.0;
 
@@ -468,48 +559,49 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
         m_state.slipState = m_slipShown;
     }
 
-    // The limiter caps speed AT the pit-lane limit, so the highest speed
-    // reached during one continuous "limiter engaged" episode converges to
-    // that real value -- PROVIDED it was actually held there rather than
-    // caught mid-transient. Two cases:
-    //  - Leaving the garage/pit box: the episode starts from near-standstill
-    //    (limiter engaged before the car is even moving), so the whole climb
-    //    to the cap is genuine and the peak can be trusted outright -- this
-    //    always resets the saved value, up or down, since it's the cleanest
-    //    possible reading.
-    //  - Any other engagement (mid-pit-lane re-engagement, or a race-time
-    //    late activation already going faster than the limit): the peak
-    //    could just be whatever transient speed the limiter caught the car
-    //    at, so it's only ever allowed to refine the saved value DOWNWARD,
-    //    never raise it -- a late activation simply gets ignored instead of
-    //    corrupting a value already learned cleanly.
+    // Pit-limit learning (review F32). The limiter holds the car AT its cap,
+    // so the value is read from a PLATEAU: limiter on, flat on the throttle,
+    // off the brake, speed steady within kPlateauBandKmh for kPlateauSeconds.
+    // The episode's peak speed is not used any more: it could be the speed
+    // the limiter caught you at while braking in, or a garage exit cut short.
+    // An episode with no plateau teaches nothing; one with a plateau is the
+    // cap itself and is trusted up or down. m_episodeMaxKmh holds the highest
+    // plateau of the current episode (0 = none yet).
     const double speedKmh = speed * 3.6;
+    constexpr double kMinPlausiblePitLimitKmh = 20.0;
     if (limiterOn)
     {
-        if (!m_lastSpeedLimiterOn)
-            m_episodeStartSpeedKmh = speedKmh; // captured once, right as the episode begins
-        if (speedKmh > m_episodeMaxKmh)
-            m_episodeMaxKmh = speedKmh;
-    }
-    else if (m_lastSpeedLimiterOn && m_episodeMaxKmh > 0.0)
-    {
-        // Toggling the limiter on/off while stationary or barely moving (very
-        // common -- most drivers arm it before actually leaving the box)
-        // produces an episode whose peak is just physics noise, near zero.
-        // No real pit limit is ever that low, so such an episode is ignored
-        // outright rather than being accepted as "the cleanest possible
-        // reading" just because it also happens to start under the garage-
-        // exit threshold -- that's exactly the case this was meant to catch,
-        // not this one. This is what previously saved a bogus ~0.01 km/h
-        // "limit" that then never got corrected.
-        constexpr double kMinPlausiblePitLimitKmh = 20.0;
-        if (m_episodeMaxKmh >= kMinPlausiblePitLimitKmh)
+        constexpr double kPlateauBandKmh = 0.3;
+        constexpr double kPlateauSeconds = 0.75;
+        const bool pushing = info.mUnfilteredThrottle >= 0.95 && info.mUnfilteredBrake < 0.01;
+        const double nowET = info.mElapsedTime;
+        if (!pushing || m_plateauStartET < 0.0 || nowET < m_plateauStartET
+            || fabs(speedKmh - m_plateauRefKmh) > kPlateauBandKmh)
         {
-            constexpr double kGarageExitSpeedThresholdKmh = 20.0;
-            const bool wasGarageExit = m_episodeStartSpeedKmh < kGarageExitSpeedThresholdKmh;
-            const bool noBaselineYet = m_state.learnedPitLimitKmh <= 0.0;
-            const bool refinesDownward = m_episodeMaxKmh < m_state.learnedPitLimitKmh - 0.3;
-            if (wasGarageExit || noBaselineYet || refinesDownward)
+            m_plateauStartET = pushing ? nowET : -1.0;
+            m_plateauRefKmh = speedKmh;
+            m_plateauMaxKmh = speedKmh;
+        }
+        else
+        {
+            if (speedKmh > m_plateauMaxKmh) m_plateauMaxKmh = speedKmh;
+            if (nowET - m_plateauStartET >= kPlateauSeconds && m_plateauMaxKmh > m_episodeMaxKmh)
+                m_episodeMaxKmh = m_plateauMaxKmh;
+        }
+    }
+    else
+    {
+        m_plateauStartET = -1.0;
+    }
+    if (!limiterOn && m_lastSpeedLimiterOn && m_episodeMaxKmh > 0.0)
+    {
+        // A plateau near standstill is noise, not a limit (this once saved a
+        // ~0.01 km/h "limit").
+        // Only from your own driving (review F167/F252).
+        if (m_episodeMaxKmh >= kMinPlausiblePitLimitKmh && m_episodeMaxKmh <= 400.0
+            && g_localPlayerDriving.load(std::memory_order_relaxed))
+        {
+            if (fabs(m_episodeMaxKmh - m_state.learnedPitLimitKmh) > 0.05)
             {
                 m_state.learnedPitLimitKmh = m_episodeMaxKmh;
                 // Written later by FlushIfDirty() on the save thread, at the
@@ -526,8 +618,24 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
 
     // Shift-point learning (the vehicle-only key and its file are handled
     // at the top of Update(), with the pit limit's).
-    const int gear = static_cast<int>(info.mGear);
-    if (m_hasLastShiftSample && gear > m_lastGearForShift && m_lastGearForShift >= 1 && m_state.maxRpm > 100.0)
+    const int gear = m_state.gear;
+    // review F30/F258: learn only from shifts the local driver made -- not
+    // with the AI driving the car (ESC offline), not on the pit limiter (a
+    // short-shift out of the box), and only in realtime. Also not while
+    // riding along, in the pit lane, or with the auto-upshift aid on.
+    const int autoShift = g_autoShift.load(std::memory_order_relaxed);
+    const bool learnFromShift = !g_playerAiControl.load(std::memory_order_relaxed)
+                             && g_localPlayerDriving.load(std::memory_order_relaxed)
+                             && autoShift != 1 && autoShift != 3
+                             && !g_tyreWear.PlayerInPits()
+                             && info.mSpeedLimiter == 0
+                             && g_inRealtime.load(std::memory_order_relaxed);
+    const bool isUpshift = m_hasLastShiftSample && gear > m_lastGearForShift && m_lastGearForShift >= 1 && m_state.maxRpm > 100.0;
+    if (isUpshift && !learnFromShift)
+    {
+        m_shiftCuePending = false;
+    }
+    else if (isUpshift)
     {
         // m_lastRpmForShift is the RPM from the sample just BEFORE the gear
         // change registered -- i.e. the RPM you actually changed gear at.
@@ -546,8 +654,10 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
         // cue's timing: shifting before it lit up is your own choice. Also
         // counts a shift just after the cue went out -- lifting to shift
         // drops it (wantsToAccelerate) a moment before the gear changes.
+        // Not if the cue timed out first (review F31): a shift after holding
+        // the limiter is not a reaction to it.
         const bool wasCued = m_shiftCuePending
-            || (m_shiftCueArmedET > 0.0 && info.mElapsedTime - m_shiftCueArmedET >= 0.0
+            || (!m_shiftCueExpired && m_shiftCueArmedET > 0.0 && info.mElapsedTime - m_shiftCueArmedET >= 0.0
                 && info.mElapsedTime - m_shiftCueArmedET <= g_gearDisplayConfig.shiftReactionMaxSeconds);
 
         // If the "shift now" cue was armed and waiting, this upshift IS the
@@ -614,10 +724,14 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
                 if (fabs(gearError) > kToleranceFraction)
                 {
                     corr += kLearnRate * gearError;
-                    if (corr < -0.05) corr = -0.05;
-                    if (corr > 0.10) corr = 0.10;
+                    // Written so a NaN is caught too (review F269).
+                    if (!(corr >= kCueCorrMin)) corr = kCueCorrMin;
+                    if (!(corr <= kCueCorrMax)) corr = kCueCorrMax;
                     strncpy_s(m_shiftSaveKey, m_shiftKey.c_str(), _TRUNCATE);
-                    m_shiftSaveTarget = target;
+                    // The target as SET (0 = INI default), not the resolved
+                    // one -- else the INI default froze into the car's file
+                    // and later INI changes never reached it (review F391).
+                    m_shiftSaveTarget = m_state.shiftTargetFraction;
                     memcpy(m_shiftSaveCorr, m_state.cueCorrectionByGear, sizeof(m_shiftSaveCorr));
                     m_shiftPointDirty = true;
                 }
@@ -678,8 +792,29 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
         // Nothing to shift into in top gear (mMaxGears = the car's forward
         // gears; 0 = not reported, then no limit). Asked for 2026-11-23.
         const bool topGear = info.mMaxGears > 0 && gear >= static_cast<int>(info.mMaxGears);
+
+        // review F37: a gear change ends the old gear's cue. Its latch was
+        // held against the OLD gear's arm RPM, so it could light all of the
+        // next gear and pair its upshift with a stale arm time.
+        if (gear != 0 && gear != m_shiftCueGear)   // neutral mid-shift is not a gear change
+        {
+            m_shiftCueGear = gear;
+            m_shiftCueLatched = false;
+            m_shiftCuePending = false;
+            m_shiftCueExpired = false;
+        }
+        // Nor re-arm in the first ticks after a shift, before rF2's RPM has
+        // dropped to the new gear.
+        constexpr double kCueHoldOffAfterShiftSeconds = 0.15;
+        const bool justShifted = m_lastGearChangeET >= 0.0
+                              && info.mElapsedTime - m_lastGearChangeET < kCueHoldOffAfterShiftSeconds;
+        // review F35: no arming during wheelspin -- the RPM climb rate is the
+        // tyres, not the engine, and would drag the cue far below target.
+        const bool spinning = m_slipCandidate == 2 || m_slipShown == 2;
+
         bool cueActive = false;
-        if (gear >= 1 && !topGear && m_state.maxRpm > 1.0 && wantsToAccelerate)
+        // Not on the pit limiter (review F258).
+        if (gear >= 1 && !topGear && m_state.maxRpm > 1.0 && wantsToAccelerate && info.mSpeedLimiter == 0)
         {
             if (m_shiftCueLatched)
             {
@@ -692,10 +827,14 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
                 const double releaseRpm = m_shiftCueArmRpm - m_state.maxRpm * kReleaseHysteresisFraction;
                 cueActive = m_state.rpm >= releaseRpm;
             }
-            else
+            else if (!justShifted && !spinning)
             {
                 const double targetRpm = m_state.maxRpm * targetFraction;
-                const double leadRpm = ShiftReactionLeadTimeSeconds() * rpmRate;
+                // Capped (review F35): a lead past ~6% of max RPM is a rate
+                // spike, not the engine.
+                constexpr double kMaxLeadFraction = 0.06;
+                double leadRpm = ShiftReactionLeadTimeSeconds() * rpmRate;
+                if (leadRpm > m_state.maxRpm * kMaxLeadFraction) leadRpm = m_state.maxRpm * kMaxLeadFraction;
                 // Reaction-time lead, plus this gear's learned correction so
                 // the shift actually lands on the target.
                 double cueRpm = targetRpm - leadRpm - gearCorr * m_state.maxRpm;
@@ -707,7 +846,10 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
         }
         m_shiftCueLatched = cueActive;
 
-        if (cueActive && !m_shiftCuePending)
+        // Once timed out, it stays un-armed until the cue releases or the
+        // gear changes (review F31): re-arming every tick restarted the
+        // measurement each ~2 s and learned a fake reaction.
+        if (cueActive && !m_shiftCuePending && !m_shiftCueExpired)
         {
             m_shiftCuePending = true;
             m_shiftCueArmedET = info.mElapsedTime;
@@ -715,6 +857,7 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
         else if (!cueActive)
         {
             m_shiftCuePending = false;
+            m_shiftCueExpired = false;
         }
         // Still active but nothing has happened for a long time (e.g.
         // deliberately holding it against the limiter) -- abandon the
@@ -723,6 +866,7 @@ void GearDisplayStore::Update(const TelemInfoV01& info)
         if (m_shiftCuePending && (info.mElapsedTime - m_shiftCueArmedET) > g_gearDisplayConfig.shiftReactionTimeoutSeconds)
         {
             m_shiftCuePending = false;
+            m_shiftCueExpired = true;
         }
 
         m_state.shiftCueActive = cueActive;
@@ -785,6 +929,27 @@ void GearDisplayStore::RecordShiftReaction(double reactionSeconds)
                m_shiftReactionHistoryCount, ShiftReactionLeadTimeSeconds() * 1000.0);
 }
 
+void GearDisplayStore::ResetTimedStateLocked()
+{
+    // review F248: everything stamped with mElapsedTime. That clock restarts
+    // near 0 each session, so old stamps would hold e.g. the slip colour
+    // until the new clock caught up. Called with m_lock held.
+    m_slipCandidate = 0;
+    m_slipCandidateSince = -1.0;
+    m_slipShown = 0;
+    m_slipShownSince = -1.0;
+    m_state.slipState = 0;
+    m_lastGearForTcCut = -999;
+    m_lastGearChangeET = -1.0;
+    m_shiftCuePending = false;
+    m_shiftCueExpired = false;
+    m_shiftCueLatched = false;
+    m_shiftCueArmedET = -1.0;
+    m_lastTimeForRate = -1.0;
+    m_rpmRateSmoothed = 0.0;
+    m_plateauStartET = -1.0;
+}
+
 void GearDisplayStore::Clear()
 {
     if (!m_ready)
@@ -797,6 +962,7 @@ void GearDisplayStore::Clear()
     // used to be dropped here.
     m_lastSpeedLimiterOn = false;
     m_episodeMaxKmh = 0.0;
+    ResetTimedStateLocked();
     LeaveCriticalSection(&m_lock);
     // The pit-limit key is forgotten, so the next session reloads it from
     // disk even for the same car and track. Only Update() (telemetry) touches
@@ -907,29 +1073,27 @@ GearDisplayStore::State GearDisplayStore::Read()
 
 namespace
 {
-    // Shared blink timer (wall-clock, render-thread-local) for the gear
-    // flash -- same reasoning as the pedal trace's idle fade.
-    float TickBlink(double periodSeconds)
+    // Wall-clock seconds (QPC), render thread.
+    double BlinkNowSeconds()
     {
-        static float s_phase = 0.0f;
-        static LARGE_INTEGER s_lastTime = {};
         static LARGE_INTEGER s_freq = {};
         if (s_freq.QuadPart == 0)
             QueryPerformanceFrequency(&s_freq);
-
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
-        double dt = 0.0;
-        if (s_lastTime.QuadPart != 0 && s_freq.QuadPart != 0)
-        {
-            dt = static_cast<double>(now.QuadPart - s_lastTime.QuadPart) / static_cast<double>(s_freq.QuadPart);
-            if (dt < 0.0 || dt > 1.0) dt = 0.0;
-        }
-        s_lastTime = now;
+        return s_freq.QuadPart ? static_cast<double>(now.QuadPart) / static_cast<double>(s_freq.QuadPart) : 0.0;
+    }
 
+    // Blink phase 0..1 (< 0.5 = on), worked out from an absolute clock so
+    // each caller's period really applies (review F39/F46: one shared
+    // accumulated phase made every caller blink at the first one's rate).
+    // sinceSeconds starts the cycle at a given moment, "on" half first.
+    float TickBlink(double periodSeconds, double sinceSeconds = 0.0)
+    {
         const double period = (periodSeconds > 0.02) ? periodSeconds : 0.02;
-        s_phase = fmodf(s_phase + static_cast<float>(dt / period), 1.0f);
-        return s_phase;
+        double t = BlinkNowSeconds() - sinceSeconds;
+        if (t < 0.0) t = 0.0;
+        return static_cast<float>(fmod(t / period, 1.0));
     }
 }
 
@@ -941,8 +1105,30 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     // while layout mode is active so dragging/resizing this panel stays at
     // full responsiveness.
     static RenderThrottle s_throttle(0.04);
-    if (!Layout::Active() && s_throttle.TryReplay(renderer))
-        return true;
+    // review F42/F285: the shift cue is timing-critical. Its blink restarts
+    // ("on" first) the moment it arms, and a replayed frame is only allowed
+    // while nothing that matters changed -- gear, cue, limiter, ABS/TC, slip
+    // and every blink edge force a fresh frame at once.
+    static double s_cueOnSince = -1.0;
+    bool cueBlinkOn = false;
+    {
+        const GearDisplayStore::State ks = g_gearDisplay.Read();
+        if (ks.shiftCueActive) { if (s_cueOnSince < 0.0) s_cueOnSince = BlinkNowSeconds(); }
+        else s_cueOnSince = -1.0;
+        const double period = g_gearDisplayConfig.blinkPeriodSeconds;
+        cueBlinkOn = s_cueOnSince >= 0.0 && TickBlink(period, s_cueOnSince) < 0.5f;
+        const unsigned key = static_cast<unsigned>(ks.gear + 2)
+            | (ks.shiftCueActive ? 1u << 8 : 0u) | (cueBlinkOn ? 1u << 9 : 0u)
+            | (ks.speedLimiterOn ? 1u << 10 : 0u) | (ks.absActive ? 1u << 11 : 0u)
+            | (ks.tcActive ? 1u << 12 : 0u) | (static_cast<unsigned>(ks.slipState & 3) << 13)
+            | (TickBlink(period) < 0.5f ? 1u << 15 : 0u) | (TickBlink(period * 0.5) < 0.5f ? 1u << 16 : 0u)
+            | (ks.valid ? 1u << 17 : 0u);
+        static unsigned s_lastKey = 0xFFFFFFFFu;
+        const bool changed = key != s_lastKey;
+        s_lastKey = key;
+        if (!changed && !Layout::Active() && s_throttle.TryReplay(renderer))
+            return true;
+    }
     RenderThrottle::Capture throttleCapture(s_throttle, renderer);
 
     // This widget paints its own background panel, so the renderer's
@@ -1056,21 +1242,28 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
             s_neutralSince.QuadPart = 0;
         }
     }
+    // Order (review F41/F33): neutral, then the purple limiter warning and
+    // the blue cue, and only then the first-gear tint -- the tint used to
+    // hide both in 1st while the cue was still armed and learned from.
+    // In 1st the off half of the blink shows the tint, not the plain plate.
+    const bool firstGearTint = cfg.firstGearWarnEnabled && state.gear == 1;
     if (cfg.neutralWarnEnabled && state.gear == 0 && neutralHeld)
     {
         gearBgR = cfg.neutralWarnR; gearBgG = cfg.neutralWarnG; gearBgB = cfg.neutralWarnB;
     }
-    else if (cfg.firstGearWarnEnabled && state.gear == 1)
-    {
-        gearBgR = cfg.firstGearWarnR; gearBgG = cfg.firstGearWarnG; gearBgB = cfg.firstGearWarnB;
-    }
     else if (state.maxRpm > 1.0 && state.rpm >= state.maxRpm * cfg.trueLimiterWarnFraction)
     {
         if (blinkOn) { gearBgR = cfg.trueLimiterR; gearBgG = cfg.trueLimiterG; gearBgB = cfg.trueLimiterB; }
+        else if (firstGearTint) { gearBgR = cfg.firstGearWarnR; gearBgG = cfg.firstGearWarnG; gearBgB = cfg.firstGearWarnB; }
     }
     else if (state.shiftCueActive)
     {
-        if (blinkOn) { gearBgR = cfg.revLimiterR; gearBgG = cfg.revLimiterG; gearBgB = cfg.revLimiterB; }
+        if (cueBlinkOn) { gearBgR = cfg.revLimiterR; gearBgG = cfg.revLimiterG; gearBgB = cfg.revLimiterB; }
+        else if (firstGearTint) { gearBgR = cfg.firstGearWarnR; gearBgG = cfg.firstGearWarnG; gearBgB = cfg.firstGearWarnB; }
+    }
+    else if (firstGearTint)
+    {
+        gearBgR = cfg.firstGearWarnR; gearBgG = cfg.firstGearWarnG; gearBgB = cfg.firstGearWarnB;
     }
     // The solid-red "getting close, nothing urgent yet" state that used to
     // sit here (cfg.shiftRpmFraction/cfg.shiftR) has been removed by
@@ -1089,15 +1282,19 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     if (state.slipState == 1)      { speedBgR = cfg.lockSlipR; speedBgG = cfg.lockSlipG; speedBgB = cfg.lockSlipB; }
     else if (state.slipState == 2) { speedBgR = cfg.spinSlipR; speedBgG = cfg.spinSlipG; speedBgB = cfg.spinSlipB; }
 
-    char gearBuf[4];
+    // Sized and clamped so no value can overflow (review F34/F43: an
+    // overflowing sprintf_s ends the game).
+    char gearBuf[16];
     if (state.gear < 0) strcpy_s(gearBuf, "R");
     else if (state.gear == 0) strcpy_s(gearBuf, "N");
-    else sprintf_s(gearBuf, "%d", state.gear);
+    else sprintf_s(gearBuf, "%d", (std::min)(state.gear, 99));
 
-    char speedBuf[8] = "";
+    char speedBuf[16] = "";
     if (cfg.speedEnabled)
     {
-        const double speedDisplay = cfg.speedUnitsKmh ? (state.speedMs * 3.6) : (state.speedMs * 2.23694);
+        double speedDisplay = cfg.speedUnitsKmh ? (state.speedMs * 3.6) : (state.speedMs * 2.23694);
+        if (!std::isfinite(speedDisplay) || speedDisplay < 0.0) speedDisplay = 0.0;
+        if (speedDisplay > 999.0) speedDisplay = 999.0;
         sprintf_s(speedBuf, "%d", static_cast<int>(speedDisplay + 0.5));
     }
 
@@ -1123,7 +1320,12 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     const float plPaddingPx = g_pitLimiterConfig.paddingPx * uiScale;
 
     const float gearW = renderer.MeasureText(gearBuf, gearTextHeightPx);
-    const float speedW = cfg.speedEnabled ? renderer.MeasureText(speedBuf, speedTextHeightPx) : 0.0f;
+    // At least three digits wide (review F40), so the box -- and everything
+    // anchored to its right edge (tyre lockup box, PIT box, alert line) -- does
+    // not move as the speed goes from 9 to 10 to 100.
+    const float speedW = cfg.speedEnabled
+        ? (std::max)(renderer.MeasureText(speedBuf, speedTextHeightPx), renderer.MeasureText("000", speedTextHeightPx))
+        : 0.0f;
 
     // Gear and speed each get their own panel, same height, side by side with
     // a gap -- matching the reference HUD's two separate segment displays
@@ -1159,8 +1361,13 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     // by speed vs the pit-lane limit, see below), not only during a cut.
     // The pit-lane limit: the one set for this track, else the learned one.
     const double pitLimitKmh = state.pitLaneLimitKmh > 0.0 ? state.pitLaneLimitKmh : state.learnedPitLimitKmh;
-    const bool pitOverSpeed = state.speedLimiterOn && pitLimitKmh > 0.0 && state.speedMs * 3.6 > pitLimitKmh + 0.5;
-    if (state.speedLimiterOn) strcpy_s(absTcBuf, pitOverSpeed ? "OVER SPEED" : "PIT");
+    // OVER SPEED also in the pit lane with the limiter off (review F48). The
+    // player's mInPits, not speed alone, so the pit-entry road before the lane
+    // proper does not flash it.
+    const bool inPitLane = g_tyreWear.PlayerInPits();
+    const bool pitOverSpeed = (state.speedLimiterOn || inPitLane) && pitLimitKmh > 0.0 && state.speedMs * 3.6 > pitLimitKmh + 0.5;
+    const bool pitBox = state.speedLimiterOn || pitOverSpeed;
+    if (pitBox) strcpy_s(absTcBuf, pitOverSpeed ? "OVER SPEED" : "PIT");
 
     // Forced visible (with a placeholder) in layout mode -- otherwise a box
     // that only ever appears while ABS/TC is actively cutting could never be
@@ -1205,6 +1412,26 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
     if (pitSquare) {}
     else if (showAbsTc)
     {
+        // The lit colour of this box, kept for the text when backgrounds are
+        // off (review F47: dark text with no plate under it was unreadable).
+        float litR = 1.0f, litG = 1.0f, litB = 1.0f;
+        {
+            if (absTcPlaceholder) {}
+            else if (pitBox)
+            {
+                if (pitOverSpeed) { litR = 0.95f; litG = 0.12f; litB = 0.10f; }
+                else if (pitLimitKmh > 0.0) { litR = 0.15f; litG = 0.85f; litB = 0.25f; }
+                else { litR = 1.0f; litG = 0.65f; litB = 0.1f; }
+            }
+            else
+            {
+                const PedalConfig& pc = g_pedalConfig;
+                const bool useAbs = absOn && (!tcOn || blinkOn);
+                litR = useAbs ? pc.brakeRawR : pc.throttleRawR;
+                litG = useAbs ? pc.brakeRawG : pc.throttleRawG;
+                litB = useAbs ? pc.brakeRawB : pc.throttleRawB;
+            }
+        }
         if (cfg.backgroundEnabled)
         {
             // The placeholder shown for positioning in layout mode gets the
@@ -1213,7 +1440,7 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
             if (absTcPlaceholder)
                 renderer.AddFilledRoundedRect(absTcCenterX, panelCenterY, absTcPanelW * 0.5f, panelH * 0.5f,
                                               bgCornerRadiusPx, 0.0f, gearBgR, gearBgG, gearBgB, cfg.bgA * fade);
-            else if (state.speedLimiterOn)
+            else if (pitBox)
             {
                 // Pit limiter on: green at or under the pit-lane limit, red
                 // reading OVER SPEED above it. The limit is the one set for
@@ -1254,9 +1481,12 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         if (absTcPlaceholder)
             renderer.AddText(absTcCenterX, panelCenterY - absTcTextHeightPx * 0.5f, absTcBuf, absTcTextHeightPx,
                              0.5f, 0.5f, 0.5f, fade, Renderer::HAlign::Center);
-        else
+        else if (cfg.backgroundEnabled)
             renderer.AddText(absTcCenterX, panelCenterY - absTcTextHeightPx * 0.5f, absTcBuf, absTcTextHeightPx,
                              0.05f, 0.05f, 0.05f, fade, Renderer::HAlign::Center);
+        else
+            renderer.AddText(absTcCenterX, panelCenterY - absTcTextHeightPx * 0.5f, absTcBuf, absTcTextHeightPx,
+                             litR, litG, litB, fade, Renderer::HAlign::Center);
     }
 
     // While the PIT LIMITER bar sits over this row, the gear and speed
@@ -1315,83 +1545,8 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
 
     } // !hideRowForPitBar
 
-    // --- Warning lines above the dashboard (TrackAlerts.h) ---
-    // Nearest the speed box: the pit-lane limit once a pit stop is
-    // requested, until the limiter is on (the PIT box takes over then).
-    // Above that, centred on gear + speed: a stopped/slow car ahead, yellow
-    // sectors, or a full-course yellow.
-    {
-        const TrackAlertConfig& ta = g_trackAlertConfig;
-        const TrackAlertStore::State al = g_trackAlerts.Read();
-        const float taTextPx = ta.textHeightPx * uiScale;
-        const float taGapPx = ta.gapPx * uiScale;
-        const float rowTop = panelCenterY - panelH * 0.5f;
-        float lineBottom = rowTop - taGapPx;   // bottom edge of the next line up
-        const double unitDiv = cfg.speedUnitsKmh ? 1.0 : 1.60934;
-        const char* unitName = cfg.speedUnitsKmh ? "km/h" : "mph";
-        auto drawLine = [&](float cx, const char* text, bool visible)
-        {
-            const float w = renderer.MeasureText(text, taTextPx);
-            const float cy = lineBottom - bgPaddingPx * 0.5f - taTextPx * 0.5f;
-            if (visible)
-            {
-                if (cfg.backgroundEnabled)
-                    renderer.AddFilledRoundedRect(cx, cy, w * 0.5f + bgPaddingPx * 0.5f, taTextPx * 0.5f + bgPaddingPx * 0.5f,
-                                                  bgCornerRadiusPx, 0.0f, cfg.bgR, cfg.bgG, cfg.bgB, cfg.bgA * fade);
-                renderer.AddText(cx, cy - taTextPx * 0.5f, text, taTextPx, ta.r, ta.g, ta.b, fade, Renderer::HAlign::Center);
-            }
-            lineBottom = cy - taTextPx * 0.5f - bgPaddingPx * 0.5f - taGapPx;
-        };
-
-        if (ta.enabled && ta.showPitLimitReminder && al.valid && al.pitRequested && !state.speedLimiterOn)
-        {
-            char pitBuf[48];
-            if (state.pitLaneLimitKmh > 0.0)
-                sprintf_s(pitBuf, "PIT LIMIT %.0f %s", state.pitLaneLimitKmh / unitDiv, unitName);
-            else if (state.learnedPitLimitKmh > 0.0)
-                sprintf_s(pitBuf, "PIT LIMIT ~%.0f %s", state.learnedPitLimitKmh / unitDiv, unitName);
-            else
-                strcpy_s(pitBuf, "PIT LIMIT");
-            drawLine(cfg.speedEnabled ? speedPanelCenterX : gearPanelCenterX, pitBuf, true);
-        }
-
-        if (ta.enabled && al.valid)
-        {
-            char alertBuf[128] = "";
-            bool flash = false;
-            if (ta.showSectorYellow)
-            {
-                for (int i = 0; i < 3; ++i)
-                {
-                    if (!al.sectorYellow[i]) continue;
-                    char part[16];   // "YELLOW S1" is 9 characters + the terminator
-                    sprintf_s(part, alertBuf[0] ? " S%d" : "YELLOW S%d", i + 1);
-                    strcat_s(alertBuf, part);
-                }
-            }
-            if (al.haveCar)
-            {
-                const double d = TrackAlertStore::DistanceNow(al);
-                char part[64], count[16] = "";
-                if (al.carCount > 1)
-                    sprintf_s(count, " (%d cars)", al.carCount);
-                sprintf_s(part, "%sSTOPPED %.0f m%s%s", alertBuf[0] ? "   " : "",
-                          d, count, al.carOffTrack ? " OFF TRACK" : "");
-                strcat_s(alertBuf, part);
-                flash = d <= ta.flashWithinMeters;
-            }
-            else if (al.fullCourseYellow && !alertBuf[0])
-            {
-                strcpy_s(alertBuf, "FULL COURSE YELLOW");
-            }
-            if (alertBuf[0])
-            {
-                const float left = gearPanelCenterX - gearPanelW * 0.5f;
-                const float right = cfg.speedEnabled ? (speedPanelCenterX + speedPanelW * 0.5f) : (gearPanelCenterX + gearPanelW * 0.5f);
-                drawLine((left + right) * 0.5f, alertBuf, !flash || blinkOn);
-            }
-        }
-    }
+    // Warning lines above the dashboard: GearDisplay::DrawAlerts, called on
+    // its own so they show with this panel hidden (review F47).
 
     // Pit limiter engaged: one red-orange bar laid across the whole
     // ABS/TC + gear + speed row (in the line of sight, unlike a side box),
@@ -1516,8 +1671,11 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
 
         for (int w = 0; w < 4; ++w)
         {
+            // From the lock threshold, not from zero (review F44): normal
+            // peak-grip slip (~0.1) is not a lock and no longer lights a cell.
             const double range = cfg.tyreLockupFullScale;
-            float intensity = (range > 0.0001) ? static_cast<float>(s_wheelPeak[w] / range) : 0.0f;
+            float intensity = (range > 0.0001)
+                ? static_cast<float>((s_wheelPeak[w] - cfg.lockSlipThreshold) / range) : 0.0f;
             if (intensity > 1.0f) intensity = 1.0f;
             if (intensity < 0.0f) intensity = 0.0f;
 
@@ -1558,7 +1716,8 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         // GearDisplayStore) once available -- persisted across sessions, and
         // only falls back to the configured default before one's been
         // learned or loaded for this car+track.
-        const double effectiveLimitKmh = (state.learnedPitLimitKmh > 0.0) ? state.learnedPitLimitKmh : plCfg.speedLimitKmh;
+        // The set per-track limit first, as in the ABS/TC box (review F301).
+        const double effectiveLimitKmh = pitLimitKmh > 0.0 ? pitLimitKmh : plCfg.speedLimitKmh;
         const double speedKmh = state.speedMs * 3.6;
         const double overKmh = speedKmh - effectiveLimitKmh;
 
@@ -1667,6 +1826,14 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         // gear with no shifts on record yet shows "--".
         char statsBuf[128];
         static char s_gearPart[32] = "";
+        // Width only ever grows (reset when the box is resized), so it does
+        // not twitch as the numbers change; the text is left-aligned in it.
+        static float s_statsW = 0.0f, s_statsPx = 0.0f;
+        // Stats reset (new car): drop the old gear figure and the old width
+        // too (review F355/F357).
+        static int s_lastSampleCount = 0;
+        if (state.shiftSampleCount < s_lastSampleCount) { s_gearPart[0] = '\0'; s_statsW = 0.0f; }
+        s_lastSampleCount = state.shiftSampleCount;
         if (state.gear >= 1 && state.gear < GearDisplayStore::State::kMaxGears)
         {
             if (state.shiftSampleCountByGear[state.gear] > 0)
@@ -1711,9 +1878,6 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
         const float shiftStatsBgCornerRadiusPxScaled = cfg.shiftStatsBgCornerRadiusPx * shiftStatsUiScale;
         const float statsX = screenWidth * cfg.shiftStatsPosXFraction;
         const float statsY = screenHeight * cfg.shiftStatsPosYFraction;
-        // Width only ever grows (reset when the box is resized), so it does
-        // not twitch as the numbers change; the text is left-aligned in it.
-        static float s_statsW = 0.0f, s_statsPx = 0.0f;
         if (s_statsPx != shiftStatsTextHeightPxScaled) { s_statsPx = shiftStatsTextHeightPxScaled; s_statsW = 0.0f; }
         const float statsTextW = renderer.MeasureText(statsBuf, shiftStatsTextHeightPxScaled);
         if (statsTextW > s_statsW) s_statsW = statsTextW;
@@ -1739,5 +1903,186 @@ bool GearDisplay::Draw(Renderer& renderer, int screenWidth, int screenHeight)
                          cfg.shiftStatsR, cfg.shiftStatsG, cfg.shiftStatsB, fade, Renderer::HAlign::Left);
     }
 
+    return true;
+}
+
+// Warning lines above the gear/speed boxes (TrackAlerts.h), drawn on their
+// own so they still show with the Gear panel hidden or idle-faded (review
+// F47). The row geometry is worked out the same way as in Draw() above, so
+// the lines sit exactly where they did; keep the two in step.
+// Bottom up: the pit-lane limit (over the speed box), then centred on gear +
+// speed: stopped car / sector yellows, the full-course yellow stage (amber),
+// blue flag (blue), penalty (red).
+bool GearDisplay::DrawAlerts(Renderer& renderer, int screenWidth, int screenHeight)
+{
+    const GearDisplayConfig& cfg = g_gearDisplayConfig;
+    const TrackAlertConfig& ta = g_trackAlertConfig;
+    if (!ta.enabled)
+        return false;
+    const TrackAlertStore::State al = g_trackAlerts.Read();
+    if (!al.valid)
+        return false;
+    // 10 Hz rebuild, replayed in between (2026-11-24 throttle pass); the
+    // blink period is far longer than 0.1 s.
+    static RenderThrottle s_alertThrottle(0.1);
+    if (!Layout::Active() && s_alertThrottle.TryReplay(renderer))
+        return true;
+    RenderThrottle::Capture throttleCapture(s_alertThrottle, renderer);
+    const GearDisplayStore::State state = g_gearDisplay.Read();
+
+    struct TextBgGuard
+    {
+        Renderer& r; bool prev;
+        explicit TextBgGuard(Renderer& rr) : r(rr), prev(rr.TextBackgroundEnabled()) { r.SetTextBackground(false); }
+        ~TextBgGuard() { r.SetTextBackground(prev); }
+    } textBgGuard(renderer);
+
+    // --- Row geometry, as in Draw() ---
+    char gearBuf[16];
+    if (!state.valid || state.gear == 0) strcpy_s(gearBuf, "N");
+    else if (state.gear < 0) strcpy_s(gearBuf, "R");
+    else sprintf_s(gearBuf, "%d", (std::min)(state.gear, 99));
+    const float uiScale = static_cast<float>(screenHeight) / 2160.0f * cfg.scale;
+    const float gearTextHeightPx = cfg.gearTextHeightPx * uiScale;
+    const float speedTextHeightPx = cfg.speedTextHeightPx * uiScale;
+    const float bgPaddingPx = cfg.bgPaddingPx * uiScale;
+    const float bgCornerRadiusPx = cfg.bgCornerRadiusPx * uiScale;
+    const float gapPx = cfg.gapPx * uiScale;
+    const float gearPanelW = renderer.MeasureText(gearBuf, gearTextHeightPx) + bgPaddingPx * 2.0f;
+    const float speedPanelW = cfg.speedEnabled ? (renderer.MeasureText("000", speedTextHeightPx) + bgPaddingPx * 2.0f) : 0.0f;
+    const float tallestTextH = (cfg.speedEnabled && speedTextHeightPx > gearTextHeightPx) ? speedTextHeightPx : gearTextHeightPx;
+    const float panelH = tallestTextH + bgPaddingPx * 2.0f;
+    const float gearPanelCenterX = screenWidth * cfg.centerXFraction;
+    const float panelCenterY = screenHeight * cfg.centerYFraction;
+    const float speedPanelCenterX = gearPanelCenterX + gearPanelW * 0.5f + gapPx + speedPanelW * 0.5f;
+
+    const bool blinkOn = TickBlink(cfg.blinkPeriodSeconds) < 0.5f;
+    const float taTextPx = ta.textHeightPx * uiScale;
+    const float taGapPx = ta.gapPx * uiScale;
+    float lineBottom = panelCenterY - panelH * 0.5f - taGapPx;   // bottom edge of the next line up
+    const double unitDiv = cfg.speedUnitsKmh ? 1.0 : 1.60934;
+    const char* unitName = cfg.speedUnitsKmh ? "km/h" : "mph";
+    auto drawLine = [&](float cx, const char* text, bool visible, float r, float g, float b)
+    {
+        const float w = renderer.MeasureText(text, taTextPx);
+        const float cy = lineBottom - bgPaddingPx * 0.5f - taTextPx * 0.5f;
+        if (visible)
+        {
+            if (cfg.backgroundEnabled)
+                renderer.AddFilledRoundedRect(cx, cy, w * 0.5f + bgPaddingPx * 0.5f, taTextPx * 0.5f + bgPaddingPx * 0.5f,
+                                              bgCornerRadiusPx, 0.0f, cfg.bgR, cfg.bgG, cfg.bgB, cfg.bgA);
+            renderer.AddText(cx, cy - taTextPx * 0.5f, text, taTextPx, r, g, b, 1.0f, Renderer::HAlign::Center);
+        }
+        lineBottom = cy - taTextPx * 0.5f - bgPaddingPx * 0.5f - taGapPx;
+    };
+    const float left = gearPanelCenterX - gearPanelW * 0.5f;
+    const float right = cfg.speedEnabled ? (speedPanelCenterX + speedPanelW * 0.5f) : (gearPanelCenterX + gearPanelW * 0.5f);
+    const float midX = (left + right) * 0.5f;
+
+    // The PIT box takes over once the limiter is on.
+    if (ta.showPitLimitReminder && al.pitRequested && !state.speedLimiterOn)
+    {
+        char pitBuf[48];
+        if (state.pitLaneLimitKmh > 0.0)
+            sprintf_s(pitBuf, "PIT LIMIT %.0f %s", state.pitLaneLimitKmh / unitDiv, unitName);
+        else if (state.learnedPitLimitKmh > 0.0)
+            sprintf_s(pitBuf, "PIT LIMIT ~%.0f %s", state.learnedPitLimitKmh / unitDiv, unitName);
+        else
+            strcpy_s(pitBuf, "PIT LIMIT");
+        drawLine(cfg.speedEnabled ? speedPanelCenterX : gearPanelCenterX, pitBuf, true, ta.r, ta.g, ta.b);
+    }
+
+    {
+        char alertBuf[128] = "";
+        bool flash = false;
+        if (ta.showSectorYellow)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                if (!al.sectorYellow[i]) continue;
+                char part[16];   // "YELLOW S1" is 9 characters + the terminator
+                sprintf_s(part, alertBuf[0] ? " S%d" : "YELLOW S%d", i + 1);
+                strcat_s(alertBuf, part);
+            }
+        }
+        if (al.haveCar)
+        {
+            const double d = TrackAlertStore::DistanceNow(al);
+            char part[64], count[16] = "";
+            if (al.carCount > 1)
+                sprintf_s(count, " (%d cars)", al.carCount);
+            sprintf_s(part, "%sSTOPPED %.0f m%s%s", alertBuf[0] ? "   " : "",
+                      d, count, al.carOffTrack ? " OFF TRACK" : "");
+            strcat_s(alertBuf, part);
+            flash = d <= ta.flashWithinMeters;
+        }
+        if (alertBuf[0])
+            drawLine(midX, alertBuf, !flash || blinkOn, ta.r, ta.g, ta.b);
+    }
+
+    // Full-course yellow, by stage (ScoringInfoV01::mYellowFlagState).
+    // 1 is FCY called with the safety car not out yet; 2 is named "pits
+    // closed" in the SDK but CrewChief treats it as pits open under standard
+    // rules, so it only says the safety car is out; 6 (resume) is already
+    // green and TrackAlerts ends the FCY there (CrewChief review 2026-11-24).
+    if (al.fullCourseYellow && al.yellowStage != 6)
+    {
+        const char* fcy = "FULL COURSE YELLOW";
+        switch (al.yellowStage)
+        {
+        case 1: fcy = "FCY  PENDING"; break;
+        case 2: fcy = "FCY  SC OUT"; break;
+        case 3: fcy = "FCY  PITS OPEN (LEAD LAP)"; break;
+        case 4: fcy = "FCY  PITS OPEN"; break;
+        case 5: fcy = "FCY  LAST LAP"; break;
+        case 7: fcy = "RACE HALTED"; break;
+        default: break;
+        }
+        drawLine(midX, fcy, true, 1.0f, 0.6f, 0.0f);
+    }
+
+    if (al.blueFlag)
+        drawLine(midX, "BLUE FLAG", true, 0.25f, 0.55f, 1.0f);
+
+    // Penalty (user, 2026-11-24: the full line sat in the view for laps):
+    // the PENALTY line shows for 5 s when the count first appears or rises,
+    // then shrinks to a small red "P" / "P2" tag on the gear box's top-right
+    // corner until it is served. Render thread only, so plain statics.
+    {
+        static int s_lastPenalties = 0;
+        static ULONGLONG s_penaltyShownMs = 0;
+        const ULONGLONG nowMs = GetTickCount64();
+        if (al.penalties > s_lastPenalties)
+            s_penaltyShownMs = nowMs;
+        s_lastPenalties = al.penalties;
+        if (al.penalties > 0)
+        {
+            // rF2 gives only the count, not the kind (drive-through, stop-go):
+            // CrewChief also only reads mNumPenalties for rF2.
+            if (nowMs - s_penaltyShownMs < 5000)
+            {
+                char penBuf[32];
+                if (al.penalties > 1)
+                    sprintf_s(penBuf, "PENALTY x%d", (std::min)(al.penalties, 99));
+                else
+                    strcpy_s(penBuf, "PENALTY");
+                drawLine(midX, penBuf, true, 1.0f, 0.15f, 0.1f);
+            }
+            else
+            {
+                char tag[8];
+                if (al.penalties > 1) sprintf_s(tag, "P%d", (std::min)(al.penalties, 99));
+                else strcpy_s(tag, "P");
+                const float tagPx = taTextPx * 0.6f;
+                const float tw = renderer.MeasureText(tag, tagPx);
+                const float pad = bgPaddingPx * 0.25f;
+                const float tcx = gearPanelCenterX + gearPanelW * 0.5f - tw * 0.5f - pad;
+                const float tcy = panelCenterY - panelH * 0.5f + tagPx * 0.5f + pad;
+                renderer.AddFilledRoundedRect(tcx, tcy, tw * 0.5f + pad, tagPx * 0.5f + pad * 0.5f,
+                                              bgCornerRadiusPx * 0.5f, 0.0f, 0.75f, 0.08f, 0.05f, 0.9f);
+                renderer.AddText(tcx, tcy - tagPx * 0.5f, tag, tagPx, 1.0f, 1.0f, 1.0f, 1.0f, Renderer::HAlign::Center);
+            }
+        }
+    }
     return true;
 }

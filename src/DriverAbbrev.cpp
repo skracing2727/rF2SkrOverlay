@@ -144,7 +144,16 @@ namespace
     // sequence is decoded as such, and anything else is read as a single
     // Windows-1252 byte. A name that is pure ASCII -- the overwhelming
     // majority -- takes the same path either way.
-    int FoldOne(const unsigned char* p, size_t avail, char* out, int outCap, int& outLen)
+    // Lower-case letter in Latin-1 / Latin Extended-A? (FoldToAscii keeps case.)
+    bool IsLowerCodepoint(unsigned int cp)
+    {
+        if (cp >= 0xDF && cp <= 0xFF) return cp != 0xF7;
+        if ((cp >= 0x139 && cp <= 0x148) || (cp >= 0x179 && cp <= 0x17E)) return (cp & 1u) == 0;
+        if (cp >= 0x100 && cp <= 0x177) return (cp & 1u) == 1;
+        return false;
+    }
+
+    int FoldOne(const unsigned char* p, size_t avail, char* out, int outCap, int& outLen, bool upper = true)
     {
         outLen = 0;
         const unsigned char b0 = p[0];
@@ -154,7 +163,7 @@ namespace
             if (outCap > 0)
             {
                 char c = static_cast<char>(b0);
-                if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+                if (upper && c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
                 out[0] = c;
                 outLen = 1;
             }
@@ -175,6 +184,23 @@ namespace
             cp = ((b0 & 0x0Fu) << 12) | ((p[1] & 0x3Fu) << 6) | (p[2] & 0x3Fu);
             consumed = 3;
         }
+        else if (b0 >= 0xF0 && b0 <= 0xF4 && avail >= 4 && (p[1] & 0xC0) == 0x80
+                 && (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80)
+        {
+            // 4-byte UTF-8 (emoji): no letter form, one separator (review F416).
+            cp = 0x10000;
+            consumed = 4;
+        }
+        else if (b0 >= 0xE0 && b0 <= 0xF4 && avail >= 2 && (p[1] & 0xC0) == 0x80)
+        {
+            // A multi-byte lead cut short (the name field is only 32 bytes):
+            // swallow its continuation bytes rather than reading each as a
+            // cp1252 letter, which turned emoji into fake letters (F416).
+            consumed = 1;
+            while (consumed < 4 && static_cast<size_t>(consumed) < avail && (p[consumed] & 0xC0) == 0x80)
+                ++consumed;
+            cp = 0x10000;
+        }
         else
         {
             cp = Cp1252ToCodepoint(b0);
@@ -184,8 +210,14 @@ namespace
         const char* fold = FoldCodepoint(cp);
         if (fold)
         {
+            const bool lower = !upper && IsLowerCodepoint(cp);
             int n = 0;
-            while (fold[n] && n < outCap) { out[n] = fold[n]; ++n; }
+            while (fold[n] && n < outCap)
+            {
+                char c = fold[n];
+                if (lower && c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                out[n++] = c;
+            }
             outLen = n;
         }
         return consumed;
@@ -692,4 +724,33 @@ void DriverAbbrev::Clear()
     EnterCriticalSection(&g_lock);
     g_count = 0;
     LeaveCriticalSection(&g_lock);
+}
+
+void DriverAbbrev::FoldToAscii(const char* src, char* out, size_t outSize)
+{
+    if (!out || outSize == 0) return;
+    out[0] = 0;
+    if (!src) return;
+    // Case kept, accents folded, symbols/emoji dropped (review F89): the
+    // font atlas only has ASCII 32..126 and skips anything else.
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(src);
+    const size_t srcLen = strnlen(src, kNameLen);
+    size_t w = 0;
+    size_t i = 0;
+    while (i < srcLen && w + 1 < outSize)
+    {
+        char folded[4];
+        int foldedLen = 0;
+        i += static_cast<size_t>(FoldOne(p + i, srcLen - i, folded, 4, foldedLen, false));
+        for (int k = 0; k < foldedLen && w + 1 < outSize; ++k)
+        {
+            const char c = folded[k];
+            if (c < 32 || c > 126) continue;
+            if (c == ' ' && (w == 0 || out[w - 1] == ' ')) continue;
+            out[w++] = c;
+        }
+    }
+    while (w > 0 && out[w - 1] == ' ')
+        --w;
+    out[w] = 0;
 }

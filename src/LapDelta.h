@@ -72,6 +72,12 @@ public:
         int countLapFlag = -1;      // this tick's raw mCountLapFlag; -1 = no scoring data yet
         int lapValidityLatch = 2;   // minimum seen so far THIS lap -- what decides at lap end
         int pitState = -1;          // this tick's raw mPitState; -1 = no scoring data yet
+
+        // Bumped whenever the value shown jumps for a reason other than
+        // driving (lap completed, SB/PB changed, reset) so the bar's trend
+        // colour can drop its history instead of reading the jump as a
+        // gain/loss (review F104).
+        unsigned refEpoch = 0;
     };
     State Read();
 
@@ -114,6 +120,9 @@ public:
     // the folder they live in -- for other stores that save per car+track.
     // Scoring thread only (the key is set in OnScoring).
     const std::string& CurrentKey() const { return m_currentKey; }
+    // The same car+track under the old per-CLASS key: read once to seed a
+    // car that has no file of its own yet (scoring thread, like CurrentKey).
+    const std::string& LegacyKey() const { return m_legacyKey; }
     static void SaveDir(char* out, size_t outSize);
 
 private:
@@ -144,14 +153,23 @@ private:
     // The lap currently being driven, accumulated as it happens.
     std::vector<std::pair<double, double>> m_currentTrace;
 
-    std::string m_currentKey;  // sanitized "vehicle__track", identifies which save file applies
+    std::string m_currentKey;  // sanitized "car__track", identifies which save file applies
+    std::string m_legacyKey;   // sanitized "class__track" (pre-2026-11-24 files)
     short m_lastTotalLaps = -1;
     double m_lastLapDist = -1.0;
-    // Latch the minimum mCountLapFlag seen across the current lap, not a
-    // snapshot at lap completion -- the flag resets to a new lap before being
-    // read here, so single-point reads would miss valid laps. Use the latch
-    // instead: if it ever hits 2 during the lap, the lap counts.
+    // Latch the MINIMUM mCountLapFlag seen across the current lap: one
+    // "don't count" moment (a cut) rules the whole lap out. Reset to 2 at
+    // each lap start, in Clear() and on a car/track change (review F101).
     short m_lapValidityLatch = 2;
+    // Set if, at any point during the lap, the player was not the one
+    // driving (AI / not realtime), was in the pits or garage, or the session
+    // clock jumped back -- such a lap never becomes a reference (F252, F97).
+    bool m_lapTainted = false;
+    double m_lastET = -1.0;
+    // Key the last car/track had before Clear() emptied m_currentKey, so a
+    // PB reset applied before the next key is known still deletes the file
+    // m_best was loaded from (review F101).
+    std::string m_lastKey;
     // Auto-sizing delta bar window (see LapDeltaConfig::autoBarWindowEnabled)
     // -- reset to the floor at each lap's completion, grown live during the
     // lap if needed. Scoring-thread-only; published to callers via
@@ -181,7 +199,7 @@ private:
     State m_state;
     LARGE_INTEGER m_freq = {};
 
-    void LoadBestLap(const char* vehicleName, const char* trackName);
+    void LoadBestLap(const char* vehicleName, const char* trackName, double trackLength);
 };
 
 extern LapDeltaStore g_lapDelta;
@@ -193,6 +211,10 @@ namespace LapDelta
     // Draws both delta bars + numbers, stacked. Returns false if nothing was
     // drawn (no reference lap yet for either, or the widget is disabled).
     bool Draw(Renderer& renderer, int screenWidth, int screenHeight);
+
+    // The OPEN DRS / DRS ENGAGED sign, its own panel (review F51). Drawn
+    // independently of Draw, only while DRS is relevant (or in layout mode).
+    bool DrawDrs(Renderer& renderer, int screenWidth, int screenHeight);
 
     // Height-to-width ratio shared with MiniSector's delta-speed strip, so
     // the two bars -- independently positioned, independently resized --

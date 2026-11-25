@@ -1,4 +1,5 @@
 #include "Overlay.h"
+#include "Persist.h"
 #include <Windows.h>
 #include <malloc.h>
 #include "Renderer.h"
@@ -20,6 +21,7 @@
 #include "FuelSave.h"
 #include "TyreSave.h"
 #include "EngineTemps.h"
+#include "Benchmark.h"
 #include "FfbLevel.h"
 #include "Conditions.h"
 #include "BrakeCue.h"
@@ -71,7 +73,12 @@ namespace
 
     // Saved device state, so the game's rendering is left exactly as we found it.
     //
-    // Releases whatever it's still holding when an instance goes out of
+    // Review F163: the backup is now ONE global (g_stateBackup) with no
+    // destructor, so OnPresent's __except can restore the game's state after
+    // a fault, and the old local's destructor only released, never restored.
+    // The build now uses /EHa (build.bat), so destructors of locals (lock
+    // guards) do run when a __try handler catches an SEH fault.
+    // (Old note, kept for history:) Releases whatever it's still holding when an instance goes out of
     // scope. RestoreState (the normal path) already releases every field
     // itself and nulls each pointer right after, so the destructor is a
     // no-op there -- it exists for the ABNORMAL path instead: a fault caught
@@ -103,22 +110,15 @@ namespace
         ID3D11VertexShader* vs;
         ID3D11PixelShader* ps;
         ID3D11GeometryShader* gs;
-
-        ~D3DStateBackup()
-        {
-            if (rasterState) rasterState->Release();
-            if (blendState) blendState->Release();
-            if (depthState) depthState->Release();
-            for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
-                if (renderTargets[i]) renderTargets[i]->Release();
-            if (depthStencilView) depthStencilView->Release();
-            if (inputLayout) inputLayout->Release();
-            if (vertexBuffer) vertexBuffer->Release();
-            if (vs) vs->Release();
-            if (ps) ps->Release();
-            if (gs) gs->Release();
-        }
+        // The renderer rebinds PS t0/s0 (glyph atlas) and relies on no
+        // HS/DS being active, so those are saved too (review F164).
+        ID3D11ShaderResourceView* psSrv0;
+        ID3D11SamplerState* psSampler0;
+        ID3D11HullShader* hs;
+        ID3D11DomainShader* ds;
     };
+    D3DStateBackup g_stateBackup;
+    bool g_stateSaved = false;   // true between SaveState and RestoreState
 
     void SaveState(ID3D11DeviceContext* ctx, D3DStateBackup& s)
     {
@@ -135,6 +135,10 @@ namespace
         ctx->VSGetShader(&s.vs, nullptr, nullptr);
         ctx->PSGetShader(&s.ps, nullptr, nullptr);
         ctx->GSGetShader(&s.gs, nullptr, nullptr);
+        ctx->PSGetShaderResources(0, 1, &s.psSrv0);
+        ctx->PSGetSamplers(0, 1, &s.psSampler0);
+        ctx->HSGetShader(&s.hs, nullptr, nullptr);
+        ctx->DSGetShader(&s.ds, nullptr, nullptr);
     }
 
     void RestoreState(ID3D11DeviceContext* ctx, D3DStateBackup& s)
@@ -150,6 +154,10 @@ namespace
         ctx->VSSetShader(s.vs, nullptr, 0);
         ctx->PSSetShader(s.ps, nullptr, 0);
         ctx->GSSetShader(s.gs, nullptr, 0);
+        ctx->PSSetShaderResources(0, 1, &s.psSrv0);
+        ctx->PSSetSamplers(0, 1, &s.psSampler0);
+        ctx->HSSetShader(s.hs, nullptr, 0);
+        ctx->DSSetShader(s.ds, nullptr, 0);
 
         // Nulled right after releasing -- ~D3DStateBackup() releases whatever
         // it still finds non-null once 's' goes out of scope, so clearing
@@ -166,7 +174,19 @@ namespace
         if (s.vs) { s.vs->Release(); s.vs = nullptr; }
         if (s.ps) { s.ps->Release(); s.ps = nullptr; }
         if (s.gs) { s.gs->Release(); s.gs = nullptr; }
+        if (s.psSrv0) { s.psSrv0->Release(); s.psSrv0 = nullptr; }
+        if (s.psSampler0) { s.psSampler0->Release(); s.psSampler0 = nullptr; }
+        if (s.hs) { s.hs->Release(); s.hs = nullptr; }
+        if (s.ds) { s.ds->Release(); s.ds = nullptr; }
     }
+
+    // Renderer::Init failure backoff (review F336): a failed Init costs
+    // ~14 ms, so it is retried with a growing delay and given up after a
+    // few tries on the same device, instead of on every frame.
+    int g_initFailCount = 0;
+    ULONGLONG g_initRetryAt = 0;
+    ID3D11Device* g_initFailDevice = nullptr;   // compared only, never dereferenced
+    const int kMaxInitTries = 5;
 
     void ReleaseBinding()
     {
@@ -176,6 +196,7 @@ namespace
             g_rendererReady = false;
         }
         if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
+        Benchmark::ReleaseGpu();   // its queries belong to this device
         if (g_context) { g_context->Release(); g_context = nullptr; }
         if (g_device) { g_device->Release(); g_device = nullptr; }
         g_boundSwapChain = nullptr;
@@ -221,6 +242,13 @@ namespace
             return true;
         }
 
+        if (device == g_initFailDevice &&
+            (g_initFailCount >= kMaxInitTries || GetTickCount64() < g_initRetryAt))
+        {
+            device->Release();
+            return false;
+        }
+
         ReleaseBinding();
 
         device->GetImmediateContext(&g_context);
@@ -230,11 +258,19 @@ namespace
         g_renderer.SetFont(g_textFontConfig.font, g_textFontConfig.weight);
         if (!g_renderer.Init(g_device))
         {
-            Log::Write("BindTo: Renderer::Init FAILED");
+            if (device != g_initFailDevice) { g_initFailDevice = device; g_initFailCount = 0; }
+            ++g_initFailCount;
+            g_initRetryAt = GetTickCount64() + 2000ULL * g_initFailCount;
+            if (g_initFailCount >= kMaxInitTries)
+                Log::Write("BindTo: Renderer::Init FAILED %d times -- giving up on this device", g_initFailCount);
+            else
+                Log::Write("BindTo: Renderer::Init FAILED (try %d) -- retrying later", g_initFailCount);
             ReleaseBinding();
             return false;
         }
 
+        g_initFailCount = 0;
+        g_initFailDevice = nullptr;
         g_rendererReady = true;
         PerfStats::Init(swapChain);
         Log::Write("BindTo: bound to swapchain %p (device %p) OK", swapChain, g_device);
@@ -336,6 +372,8 @@ namespace
         struct Blip { float x, y, rot, alpha; bool danger; float halfWm, halfLm, cornerRm; };
         Blip blips[128];
         int blipCount = 0;
+        // Parked in the garage / pit box: no red blips or flash (review F129).
+        const bool playerParked = player->inGarage || (player->inPits && player->speedMps < 1.0f);
         float strongestAlpha = 0.0f;
 
         // Diagnostic: dumps ground-truth numbers once a second so the icon
@@ -365,6 +403,14 @@ namespace
         {
             if (cars[i].isPlayer)
                 continue;
+            // Garage cars are not on track (review F129). A negative lap
+            // distance means the game has no real position for the car yet
+            // (CrewChief review 2026-11-24).
+            if (cars[i].inGarage || cars[i].lapDist < 0.0)
+                continue;
+            // A pit-lane car not moving with you is no threat: drawn faint,
+            // never red, so the radar agrees with the side bars (review F129).
+            const bool pitTraffic = cars[i].inPits && fabsf(cars[i].speedMps - player->speedMps) >= 8.0f;
 
             const double dx = cars[i].x - player->x;
             const double dz = cars[i].z - player->z;
@@ -430,8 +476,19 @@ namespace
             // (and better-supported, but riskier) transform rewrite noted
             // in OrientDebug's investigation.
             blips[blipCount].rot = static_cast<float>(playerHeading - cars[i].heading);
-            blips[blipCount].alpha = static_cast<float>(alpha);
-            blips[blipCount].danger = inLongitudinalWindow && lateralOverlap;
+            blips[blipCount].alpha = static_cast<float>(pitTraffic ? alpha * 0.4 : alpha);
+            bool danger = inLongitudinalWindow && lateralOverlap && !pitTraffic && !playerParked;
+            // Same heading filter as the side bars (review F131): a moving
+            // car more than ~75 degrees off your heading is oncoming or
+            // crossing, not alongside.
+            if (danger && cars[i].speedMps > 5.0f)
+            {
+                double dh = fmod(fabs(cars[i].heading - playerHeading), 6.283185307179586);
+                if (dh > 3.141592653589793) dh = 6.283185307179586 - dh;
+                if (dh > 1.309)
+                    danger = false;
+            }
+            blips[blipCount].danger = danger;
             LookupCarFootprint(cfg, cars[i].footprint,
                                blips[blipCount].halfWm, blips[blipCount].halfLm, blips[blipCount].cornerRm);
 
@@ -579,11 +636,25 @@ namespace
     // the panel, so the position fractions (and therefore the drag) take
     // effect. Persisted immediately -- otherwise the panel would snap back to
     // its aligned corner on the next restart, silently undoing the drag.
+    // Where the perf stats box was last drawn: centre X and bottom Y in
+    // pixels, plus the screen it was drawn on (review F160).
+    float g_perfDrawnCx = 0.0f, g_perfDrawnBottom = 0.0f;
+    int g_perfScreenW = 0, g_perfScreenH = 0;
+
     void ReleasePerfStatsAlignment()
     {
         FrameLatencyConfig& cfg = g_frameLatencyConfig;
         if (!cfg.alignBottomRightCorner && !cfg.alignTop && !cfg.alignRightToPedalTrace)
             return;
+        // Put the free-floating fractions where the aligned box actually is,
+        // so the grab doesn't jump to a stale position (review F160).
+        if (g_perfScreenW > 0 && g_perfScreenH > 0)
+        {
+            cfg.cpuGpuPosXFraction = g_perfDrawnCx / g_perfScreenW;
+            cfg.cpuGpuPosYFraction = g_perfDrawnBottom / g_perfScreenH;
+            Config::WriteFloat("FrameLatency", "CpuGpuPosXFraction", cfg.cpuGpuPosXFraction);
+            Config::WriteFloat("FrameLatency", "CpuGpuPosYFraction", cfg.cpuGpuPosYFraction);
+        }
         cfg.alignBottomRightCorner = false;
         cfg.alignTop = false;
         cfg.alignRightToPedalTrace = false;
@@ -597,8 +668,12 @@ namespace
                                 float boxX, float boxBottomY, float uiScale, bool anchorRight = false, bool alignTop = false,
                                 bool registerForLayout = false)
     {
-        if (count == 0)
+        if (count <= 0)
             return;
+        // segs[] holds up to 16; clamped once so separators match what is
+        // drawn (review F158 -- the replay warning used to be cut at 8).
+        const int kMaxSegs = 16;
+        if (count > kMaxSegs) count = kMaxSegs;
 
         const float textHeightPx = cfg.textHeightPx * uiScale;
         // Floored to a fraction of the text size itself rather than trusting
@@ -619,9 +694,9 @@ namespace
         // Sized from each segment's fixed widthRef (falling back to its own
         // text when none is given), never from the live text directly --
         // see StatSegment's comment for why.
-        float segW[8] = {};
+        float segW[kMaxSegs] = {};
         float totalW = 0.0f;
-        for (int i = 0; i < count && i < 8; ++i)
+        for (int i = 0; i < count; ++i)
         {
             segW[i] = g_renderer.MeasureText(segments[i].widthRef ? segments[i].widthRef : segments[i].text, textHeightPx);
             totalW += segW[i];
@@ -645,6 +720,8 @@ namespace
         // position; grabbing it settles the argument in favour of the drag.
         if (registerForLayout)
         {
+            g_perfDrawnCx = boxCenterX;           // F160
+            g_perfDrawnBottom = centerY + halfH;
             Layout::Register("Perf stats", "FrameLatency", "CpuGpuPosXFraction", "CpuGpuPosYFraction",
                              &g_frameLatencyConfig.cpuGpuPosXFraction, &g_frameLatencyConfig.cpuGpuPosYFraction,
                              boxCenterX, centerY, halfW, halfH,
@@ -671,7 +748,7 @@ namespace
 
         const float textY = centerY - textHeightPx * 0.5f;
         float x = boxCenterX - totalW * 0.5f;
-        for (int i = 0; i < count && i < 8; ++i)
+        for (int i = 0; i < count; ++i)
         {
             g_renderer.AddText(x, textY, segments[i].text, textHeightPx,
                                segments[i].r, segments[i].g, segments[i].b, 1.0f, Renderer::HAlign::Left);
@@ -702,7 +779,9 @@ namespace
     void ShowUpdateNotice()
     {
         static bool s_shown = false;
-        if (s_shown || g_inRealtime.load(std::memory_order_relaxed))
+        // Waits for any other message (e.g. the 6 s car-layout notice) to go,
+        // so the two do not replace each other (review F303).
+        if (s_shown || g_inRealtime.load(std::memory_order_relaxed) || Shortcuts::MessageShowing())
             return;
         char latest[32];
         if (!UpdateCheck::NewerAvailable(latest, sizeof(latest)))
@@ -1112,6 +1191,8 @@ namespace
         // HERE rather than applied to the drawn box, so every pixel value
         // downstream scales with it in exact proportion.
         const float uiScale = static_cast<float>(screenHeight) / 2160.0f * cfg.scale;
+        g_perfScreenW = screenWidth;    // F160
+        g_perfScreenH = screenHeight;
         if (cfg.alignBottomRightCorner)
         {
             // Flush against the screen's own bottom-right corner, padding
@@ -1130,7 +1211,7 @@ namespace
             // PedalTrace expose it, since it's one line of arithmetic from
             // config already visible to this file.
             const PedalConfig& pedalCfg = g_pedalConfig;
-            const float pedalRightEdgeX = screenWidth * pedalCfg.centerXFraction + screenWidth * pedalCfg.widthFraction * 0.5f;
+            const float pedalRightEdgeX = screenWidth * pedalCfg.centerXFraction + screenWidth * pedalCfg.widthFraction * pedalCfg.scale * 0.5f;   // scaled like PedalTrace (F160)
             DrawSegmentedStatLine(cfg, segs, segCount, pedalRightEdgeX, screenHeight * cfg.cpuGpuPosYFraction, uiScale, true, false, true);
         }
         else
@@ -1179,7 +1260,84 @@ namespace
     }
 
 // A panel's draw: timed (PROF) and its vertices counted (VertexTally).
-#define DRAWN(name) PROF(name); VertexTally PROF_CONCAT(prof_verts_, __LINE__)(name)
+// Box-stats labels (user, 2026-11-24): per drawn box, how often it really
+// rebuilds (a RenderThrottle replay does not count) and what it costs per
+// frame, shown in the corner of the rectangles it registers with Layout.
+namespace BoxStats
+{
+    const int kMax = 48;
+    struct Entry { const char* name; unsigned frames, rebuilds; double ms; float shownHz, shownMs; bool drawnThisFrame; };
+    Entry g_e[kMax] = {};
+    int g_count = 0;
+    LARGE_INTEGER g_freq = {}, g_windowStart = {};
+    int Tag(const char* name)
+    {
+        for (int i = 0; i < g_count; ++i) if (strcmp(g_e[i].name, name) == 0) return i;
+        if (g_count >= kMax) return -1;
+        g_e[g_count].name = name;
+        return g_count++;
+    }
+    struct Scope
+    {
+        int tag; LARGE_INTEGER t0; unsigned replays0;
+        explicit Scope(int t) : tag(t), replays0(RenderThrottleReplayCount())
+        {
+            if (g_freq.QuadPart == 0) QueryPerformanceFrequency(&g_freq);
+            QueryPerformanceCounter(&t0);
+            Layout::SetOwnerTag(tag);
+        }
+        ~Scope()
+        {
+            Layout::SetOwnerTag(-1);
+            if (tag < 0) return;
+            LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
+            Entry& e = g_e[tag];
+            e.ms += static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(g_freq.QuadPart);
+            ++e.frames;
+            if (RenderThrottleReplayCount() == replays0) ++e.rebuilds;
+            e.drawnThisFrame = true;
+        }
+    };
+    // Once a second: rates and averages for the labels.
+    void Tick()
+    {
+        if (g_freq.QuadPart == 0) return;
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        if (g_windowStart.QuadPart == 0) { g_windowStart = now; return; }
+        const double sec = static_cast<double>(now.QuadPart - g_windowStart.QuadPart) / static_cast<double>(g_freq.QuadPart);
+        if (sec < 1.0) return;
+        for (int i = 0; i < g_count; ++i)
+        {
+            Entry& e = g_e[i];
+            e.shownHz = static_cast<float>(e.rebuilds / sec);
+            e.shownMs = e.frames ? static_cast<float>(e.ms / e.frames) : 0.0f;
+            e.frames = 0; e.rebuilds = 0; e.ms = 0.0;
+        }
+        g_windowStart = now;
+    }
+    void Draw(Renderer& r, int screenHeight)
+    {
+        Tick();
+        const float px = 18.0f * static_cast<float>(screenHeight) / 2160.0f;
+        const int n = Layout::RegisteredCount();
+        for (int i = 0; i < n; ++i)
+        {
+            const int tag = Layout::OwnerTagOf(i);
+            if (tag < 0 || tag >= g_count || !g_e[tag].drawnThisFrame) continue;
+            const char* name; float cx, cy, hw, hh; bool seen;
+            if (!Layout::GetRegistered(i, &name, &cx, &cy, &hw, &hh, &seen)) continue;
+            char buf[48];
+            sprintf_s(buf, "%.0f Hz  %.3f ms", g_e[tag].shownHz, g_e[tag].shownMs);
+            const float w = r.MeasureText(buf, px);
+            const float x1 = cx + hw, y0 = cy - hh;
+            r.AddFilledRect(x1 - w * 0.5f - 3.0f, y0 + px * 0.5f + 1.0f, w * 0.5f + 3.0f, px * 0.5f + 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.7f);
+            r.AddText(x1 - 3.0f, y0 + 1.0f, buf, px, 0.6f, 1.0f, 0.6f, 1.0f, Renderer::HAlign::Right);
+        }
+        for (int i = 0; i < g_count; ++i) g_e[i].drawnThisFrame = false;
+    }
+}
+#define DRAWN(name) PROF(name); VertexTally PROF_CONCAT(prof_verts_, __LINE__)(name); \
+    static const int PROF_CONCAT(bs_tag_, __LINE__) = BoxStats::Tag(name); BoxStats::Scope PROF_CONCAT(bs_scope_, __LINE__)(PROF_CONCAT(bs_tag_, __LINE__))
 
     void PresentBody(IDXGISwapChain* swapChain)
     {
@@ -1227,8 +1385,13 @@ namespace
         }
         if (trace) Log::Write("  step 4: RTV created");
 
-        D3DStateBackup state;
-        SaveState(g_context, state);
+        SaveState(g_context, g_stateBackup);
+        g_stateSaved = true;
+        // Nothing we draw uses these stages; a game-bound GS/HS/DS would
+        // swallow or warp the HUD draws (review F164). Restored afterwards.
+        g_context->GSSetShader(nullptr, nullptr, 0);
+        g_context->HSSetShader(nullptr, nullptr, 0);
+        g_context->DSSetShader(nullptr, nullptr, 0);
         if (trace) Log::Write("  step 5: state saved");
 
         // One frame, both widgets. EndFrame is a no-op if neither drew anything.
@@ -1274,10 +1437,10 @@ namespace
         // own text and switch it back.
         {
             const TextBackgroundConfig& tb = g_textBackgroundConfig;
-            const float uiScale = static_cast<float>(sh) / 2160.0f;
+            // Unscaled: AddText already scales the plate with the text size,
+            // so scaling here too made plates smaller below 4K (review F154).
             g_renderer.SetTextBackgroundStyle(tb.r, tb.g, tb.b, tb.alpha,
-                                              tb.paddingPx * uiScale,
-                                              tb.cornerRadiusPx * uiScale);
+                                              tb.paddingPx, tb.cornerRadiusPx);
             g_renderer.SetTextBackground(tb.enabled);
         }
 
@@ -1309,11 +1472,16 @@ namespace
                     { DRAWN("Pedal trace"); PedalTrace::Draw(g_renderer, sw, sh); }
                 if (Shortcuts::Visible(Shortcuts::Gear))
                     { DRAWN("Gear + speed"); GearDisplay::Draw(g_renderer, sw, sh); }
+                // Track alerts + PIT LIMIT reminder: own entry point, so they
+                // show with the Gear panel hidden (review F47).
+                { DRAWN("Track alerts"); GearDisplay::DrawAlerts(g_renderer, sw, sh); }
                 // Drawn if EITHER delta row is on -- LapDelta::Draw gates the two
-                // rows individually (and the DRS indicator inside it is not tied
-                // to either).
+                // rows individually.
                 if (Shortcuts::Visible(Shortcuts::LapDelta) || Shortcuts::Visible(Shortcuts::BestDelta))
                     { DRAWN("Lap delta"); LapDelta::Draw(g_renderer, sw, sh); }
+                // DRS sign: its own panel, not tied to the delta bars (review F51).
+                if (Shortcuts::Visible(Shortcuts::Drs))
+                    { DRAWN("DRS"); LapDelta::DrawDrs(g_renderer, sw, sh); }
                 if (Shortcuts::Visible(Shortcuts::MiniSector))
                     { DRAWN("Mini-sectors"); MiniSector::Draw(g_renderer, sw, sh); }
                 if (Shortcuts::Visible(Shortcuts::TyreTemps))
@@ -1344,6 +1512,9 @@ namespace
             // Frametime stats deliberately draw everywhere, menus included.
             if (Shortcuts::Visible(Shortcuts::Perf))
                 { DRAWN("Frametime stats"); DrawPerfOverlay(sw, sh); }
+            // Benchmark box: like the perf line, everywhere (it only samples
+            // while the player's telemetry is live).
+            { DRAWN("Benchmark"); Benchmark::Draw(g_renderer, sw, sh, desc.OutputWindow); }
             if (Shortcuts::Visible(Shortcuts::Clock))
                 { DRAWN("Clock"); DrawClock(sw, sh); }
             // Not timed: it only hands one message to the toast, once.
@@ -1351,6 +1522,11 @@ namespace
             // Times itself (as "DLL cost panel").
             if (Shortcuts::Visible(Shortcuts::DllCost))
                 Profiler::Draw(g_renderer, sw, sh);
+            // Rate + cost labels on every box (option), after all boxes drew.
+            if (g_dllCostConfig.showBoxStats)
+                BoxStats::Draw(g_renderer, sh);
+            else
+                for (int i = 0; i < BoxStats::g_count; ++i) BoxStats::g_e[i].drawnThisFrame = false;
         }
         // After every panel has drawn (and registered), so the hit-test uses
         // this frame's real rectangles rather than the previous frame's.
@@ -1368,10 +1544,14 @@ namespace
         // uploaded and drawn (timed inside, upload and draw separately).
         LogPanelVertices();
         g_renderer.EndFrame();
+        // GPU timestamp for the benchmark box: after the HUD's own draws, on
+        // the immediate context, on this (Present) thread only.
+        Benchmark::OnGpuMark(g_device, g_context);
         if (trace) Log::Write("  step 6: draw done");
 
         PROF("D3D setup"); // restore + release, to the end of the frame
-        RestoreState(g_context, state);
+        RestoreState(g_context, g_stateBackup);
+        g_stateSaved = false;
         if (trace) Log::Write("  step 7: state restored");
 
         g_rtv->Release();
@@ -1418,17 +1598,33 @@ void Overlay::OnPresent(IDXGISwapChain* swapChain)
 
         ++g_faultCount;
         Log::Write("OnPresent: EXCEPTION #%d (code 0x%08X)", g_faultCount, exceptionCode);
-        // Force this out to disk right now regardless of g_inRealtime --
-        // losing the one diagnostic line that actually explains a crash to
-        // an unflushed buffer would defeat the entire point of logging it.
-        Log::FlushBuffered();
+        // Out to disk soon regardless of g_inRealtime -- by the save thread,
+        // not here: no disk write on the render thread (review F280). The
+        // learned pass also writes the log; RequestAll would write the INI too.
+        Persist::RequestLearned();
 
         // The normal path releases g_rtv itself once it's done drawing (see
         // the end of PresentBody) -- a fault caught between that RTV being
         // created and that release running would otherwise leak the COM
         // reference every time this handler fires.
+        // Give the game back its own pipeline and render target (review
+        // F163): otherwise our RTV stays bound and its next ResizeBuffers
+        // can fail. Guarded, since the context may be what faulted.
+        if (g_stateSaved && g_context)
+        {
+            __try { RestoreState(g_context, g_stateBackup); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        g_stateSaved = false;
         if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
         g_boundSwapChain = nullptr;
+        // Free the renderer's objects before forgetting them, so the next
+        // Init doesn't leak the old set (F163).
+        if (g_rendererReady)
+        {
+            __try { g_renderer.Shutdown(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
         g_rendererReady = false;
 
         if (g_faultCount >= 3)
