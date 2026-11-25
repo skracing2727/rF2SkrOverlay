@@ -1,5 +1,10 @@
 # Changelog
 
+## 26.11.25.4
+
+### Changed
+- **Guide**: pictures of where every panel sits, the rotary menus, the advanced fuel box, the Benchmark box and the alert lines; how INI keys are named and when data is saved; a table of each panel's tuning keys.
+
 ## 26.11.25.3
 
 ### Added
